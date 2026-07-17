@@ -13,8 +13,7 @@
       "mountPoints": [
         {
           "sourceVolume": "nginx-conf",
-          "containerPath": "/etc/nginx/conf.d",
-          "readOnly": true
+          "containerPath": "/etc/nginx/conf.d"
         }
       ]
     },
@@ -51,8 +50,7 @@
       "mountPoints": [
         {
           "sourceVolume": "prometheus-conf",
-          "containerPath": "/etc/prometheus",
-          "readOnly": true
+          "containerPath": "/etc/prometheus"
         }
       ],
       "command": [
@@ -74,13 +72,11 @@
       "mountPoints": [
         {
           "sourceVolume": "grafana-provisioning",
-          "containerPath": "/etc/grafana/provisioning",
-          "readOnly": true
+          "containerPath": "/etc/grafana/provisioning"
         },
         {
           "sourceVolume": "grafana-dashboards",
-          "containerPath": "/etc/grafana/provisioning/dashboards/domain",
-          "readOnly": true
+          "containerPath": "/etc/grafana/provisioning/dashboards/domain"
         }
       ]
     },
@@ -95,13 +91,11 @@
       "mountPoints": [
         {
           "sourceVolume": "host-proc",
-          "containerPath": "/host/proc",
-          "readOnly": true
+          "containerPath": "/host/proc"
         },
         {
           "sourceVolume": "host-sys",
-          "containerPath": "/host/sys",
-          "readOnly": true
+          "containerPath": "/host/sys"
         }
       ],
       "command": [

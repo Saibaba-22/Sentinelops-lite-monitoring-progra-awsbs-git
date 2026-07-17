@@ -10,6 +10,7 @@ providers:
     updateIntervalSeconds: 30
     allowUiUpdates: true
     options:
-      # Dashboards are mounted here by Docker / Elastic Beanstalk.
-      path: /etc/grafana/provisioning/dashboards
+      # Dashboards are mounted here by Docker / Elastic Beanstalk
+      # (Dockerrun.aws.json mounts monitoring/grafana/dashboards -> .../dashboards/domain).
+      path: /etc/grafana/provisioning/dashboards/domain
       foldersFromFilesStructure: false
