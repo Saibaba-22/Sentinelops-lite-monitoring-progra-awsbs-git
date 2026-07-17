@@ -53,7 +53,15 @@ def discover_deploy_url():
         try:
             out = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
             cname = (out.stdout or "").strip()
-            if cname and cname.lower() != "none" and "amazonaws" in cname:
+            # An EB environment CNAME looks like:
+            #     agent.us-east-1.elasticbeanstalk.com
+            # It does NOT contain "amazonaws", so we accept both the
+            # elasticbeanstalk.com form (EB env CNAME) and any amazonaws.com
+            # form (e.g. ELB/ALB endpoints) to avoid a false "not discoverable".
+            looks_like_host = (
+                "elasticbeanstalk.com" in cname or "amazonaws" in cname
+            )
+            if cname and cname.lower() != "none" and looks_like_host:
                 return "http://" + cname
         except Exception:
             continue
