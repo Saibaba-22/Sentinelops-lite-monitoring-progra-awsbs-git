@@ -28,7 +28,7 @@ IMAGE_NAME="${IMAGE_NAME:-sentinelops-lite}"
 IMAGE_TAG="${IMAGE_TAG:-latest}"
 DOCKERHUB_USERNAME="${DOCKERHUB_USERNAME:?Set DOCKERHUB_USERNAME}"
 DOCKERHUB_TOKEN="${DOCKERHUB_TOKEN:?Set DOCKERHUB_TOKEN}"
-PLATFORM="${PLATFORM:-Docker running on 64bit Amazon Linux 2023}"
+PLATFORM="${PLATFORM:-Multi-container Docker running on 64bit Amazon Linux 2023}"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DOCKERRUN="${ROOT_DIR}/deployment/Dockerrun.aws.json"
@@ -63,6 +63,10 @@ mkdir -p "${ROOT_DIR}/deployment/.bundle"
     --exclude "*.pyc" --exclude "__pycache__/*" --exclude "*.md" \
     --exclude "logs/*" --exclude "docs/*" --exclude ".git/*"
 )
+
+echo "==> Initialising EB CLI in this directory"
+# Non-interactive init: sets platform + region + application.
+eb init -p "${PLATFORM}" -r "${AWS_REGION}" "${APP_NAME}"
 
 echo "==> Deploying to Elastic Beanstalk (${APP_NAME}/${ENV_NAME})"
 if command -v eb >/dev/null 2>&1; then
