@@ -67,7 +67,6 @@ YAML_FILES = [
     "monitoring/prometheus/recording.rules.yml",
     "monitoring/grafana/provisioning/datasources/datasource.yml",
     "monitoring/grafana/provisioning/dashboards/dashboard.yml",
-    "docker/docker-compose.yml",
     "docker-compose.yml",
 ]
 JSON_FILES = [
