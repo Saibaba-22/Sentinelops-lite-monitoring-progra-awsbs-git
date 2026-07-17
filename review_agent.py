@@ -42,8 +42,8 @@ os.chdir(ROOT)
 REQUIRED_FILES = [
     "app.py", "agent.py", "agent_monitor.py", "requirements.txt", "test_app.py",
     "docker/Dockerfile", "docker/docker-compose.yml", "docker/nginx/nginx.conf",
-    "deployment/Dockerrun.aws.json", "deployment/Procfile", "deployment/deploy.sh",
-    "deployment/.ebextensions/01-nginx.config", "deployment/.ebextensions/02-logging.config",
+    "Dockerrun.aws.json", "deployment/Procfile", "deployment/deploy.sh",
+    ".ebextensions/01-nginx.config", ".ebextensions/02-logging.config",
     "monitoring/__init__.py", "monitoring/metrics.py", "monitoring/collectors.py",
     "monitoring/agent_state.py",
     "monitoring/prometheus/prometheus.yml", "monitoring/prometheus/alert.rules.yml",
@@ -70,7 +70,7 @@ YAML_FILES = [
     "docker/docker-compose.yml",
 ]
 JSON_FILES = [
-    "deployment/Dockerrun.aws.json",
+    "Dockerrun.aws.json",
     "monitoring/grafana/dashboards/system-dashboard.json",
     "monitoring/grafana/dashboards/application-dashboard.json",
     "monitoring/grafana/dashboards/ai-agent-dashboard.json",
@@ -235,7 +235,7 @@ def check_app_endpoints():
 # 6. Dockerrun placeholder check
 # --------------------------------------------------------------------------
 def check_dockerrun():
-    f = "deployment/Dockerrun.aws.json"
+    f = "Dockerrun.aws.json"
     if not os.path.exists(f):
         return
     try:
