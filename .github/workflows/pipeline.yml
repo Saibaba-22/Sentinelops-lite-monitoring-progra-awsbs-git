@@ -2,17 +2,22 @@
 # pipeline.yml — SentinelOps-Lite CI/CD pipeline (GitHub Actions)
 # Move to .github/workflows/pipeline.yml to activate.
 #
-# ONLY FOUR INPUTS ARE REQUIRED:
-#   1. APP_NAME              (env)        Elastic Beanstalk application name
-#   2. ENV_NAME              (env)        Elastic Beanstalk environment name
-#   3. AWS_ACCESS_KEY_ID     (secret)     AWS access key
-#   4. AWS_SECRET_ACCESS_KEY (secret)     AWS secret key
+# REQUIRED INPUTS:
+#   Variables (env):
+#     1. APP_NAME           Elastic Beanstalk application name
+#     2. ENV_NAME           Elastic Beanstalk environment name
+#     3. DOCKERHUB_USERNAME Docker Hub username (image push)
+#   Secrets:
+#     4. AWS_ACCESS_KEY_ID     AWS access key (deploy + URL auto-discovery)
+#     5. AWS_SECRET_ACCESS_KEY AWS secret key
+#     6. DOCKERHUB_TOKEN       Docker Hub password / access token
 #
-# (AWS_REGION defaults to us-east-1; override in env: if needed.
-#  GEMINI_API_KEY is an OPTIONAL secret for the LLM summaries only.)
+# (AWS_REGION defaults to us-east-1; GEMINI_API_KEY is an OPTIONAL secret.)
 #
-# The Beanstalk URL is NOT required — final_agent.py auto-discovers it from
-# the environment CNAME using the AWS credentials above.
+# Registry: Docker Hub (NOT AWS ECR). The image is pushed to
+#   docker.io/<DOCKERHUB_USERNAME>/sentinelops-lite:latest
+# and Dockerrun.aws.json is rewritten to reference it.
+# The Beanstalk URL is NOT required — final_agent.py auto-discovers it.
 # =============================================================================
 
 name: SentinelOps-Lite Pipeline
@@ -25,6 +30,7 @@ on:
 env:
   APP_NAME: sentinelops-lite
   ENV_NAME: sentinelops-lite-prod
+  DOCKERHUB_USERNAME: your-dockerhub-user
   AWS_REGION: us-east-1
   PYTHON_VERSION: "3.11"
 
@@ -45,7 +51,7 @@ jobs:
           python-version: "${{ env.PYTHON_VERSION }}"
 
       - name: Install dependencies
-        run: pip install -r requirements.txt pytest pyyaml
+        run: pip install -r requirements.txt
 
       - name: Run review agent
         run: python review_agent.py
@@ -58,10 +64,10 @@ jobs:
           path: review_report.txt
 
   # --------------------------------------------------------------------------
-  # 2) DEPLOY (uses APP_NAME / ENV_NAME / AWS keys)
+  # 2) BUILD + PUSH TO DOCKER HUB + DEPLOY TO ELASTIC BEANSTALK
   # --------------------------------------------------------------------------
   deploy:
-    name: Deploy to Elastic Beanstalk
+    name: Build, push to Docker Hub, deploy to EB
     needs: review
     runs-on: ubuntu-latest
     steps:
@@ -73,6 +79,9 @@ jobs:
         with:
           python-version: "${{ env.PYTHON_VERSION }}"
 
+      - name: Set up Docker
+        uses: docker/setup-buildx-action@v3
+
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -80,14 +89,19 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
+      - name: Log in to Docker Hub
+        run: echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u "${{ env.DOCKERHUB_USERNAME }}" --password-stdin
+
       - name: Install EB CLI
         run: pip install awsebcli
 
-      - name: Deploy (build -> ECR -> EB)
+      - name: Deploy (build -> Docker Hub -> EB)
         env:
           APP_NAME: ${{ env.APP_NAME }}
           ENV_NAME: ${{ env.ENV_NAME }}
           AWS_REGION: ${{ env.AWS_REGION }}
+          DOCKERHUB_USERNAME: ${{ env.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: bash deployment/deploy.sh
 
