@@ -1,23 +1,17 @@
 # =============================================================================
 # pipeline.yml — SentinelOps-Lite CI/CD pipeline (GitHub Actions)
-# Move to .github/workflows/pipeline.yml to activate.
+# Place at .github/workflows/pipeline.yml
 #
-# REQUIRED INPUTS:
-#   Variables (env):
-#     1. APP_NAME           Elastic Beanstalk application name
-#     2. ENV_NAME           Elastic Beanstalk environment name
-#     3. DOCKERHUB_USERNAME Docker Hub username (image push)
-#   Secrets:
-#     4. AWS_ACCESS_KEY_ID     AWS access key (deploy + URL auto-discovery)
-#     5. AWS_SECRET_ACCESS_KEY AWS secret key
-#     6. DOCKERHUB_TOKEN       Docker Hub password / access token
+# ALL values are read from GitHub Settings:
+#   Variables (Settings -> Secrets and variables -> Actions -> Variables):
+#     APP_NAME, ENV_NAME, DOCKERHUB_USERNAME, AWS_REGION, PYTHON_VERSION
+#   Secrets (same page -> Secrets):
+#     AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, DOCKERHUB_TOKEN, GEMINI_API_KEY
 #
-# (AWS_REGION defaults to us-east-1; GEMINI_API_KEY is an OPTIONAL secret.)
-#
-# Registry: Docker Hub (NOT AWS ECR). The image is pushed to
+# Registry: Docker Hub. The image is pushed to
 #   docker.io/<DOCKERHUB_USERNAME>/sentinelops-lite:latest
-# and Dockerrun.aws.json is rewritten to reference it.
-# The Beanstalk URL is NOT required — final_agent.py auto-discovers it.
+# and Dockerrun.aws.json references it. The Beanstalk URL is auto-discovered.
+# Nothing is hard-coded here.
 # =============================================================================
 
 name: SentinelOps-Lite Pipeline
@@ -28,11 +22,11 @@ on:
   workflow_dispatch: {}
 
 env:
-  APP_NAME: agent
-  ENV_NAME: agent
-  DOCKERHUB_USERNAME: saibaba22
-  AWS_REGION: ap-south-1
-  PYTHON_VERSION: "3.11"
+  APP_NAME: ${{ vars.APP_NAME }}
+  ENV_NAME: ${{ vars.ENV_NAME }}
+  DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  PYTHON_VERSION: ${{ vars.PYTHON_VERSION }}
 
 jobs:
   # --------------------------------------------------------------------------
