@@ -70,8 +70,7 @@ if ! command -v aws >/dev/null 2>&1; then
   pip install -q awscli || pip install -q aws-cli
 fi
 
-# Detect the EXACT Multi-container Docker platform name for this region.
-# (Hardcoding it fails because the string differs per region / AL version.)
+# Detect the EXACT Multi-container Docker platform for this region and USE it.
 if [ -z "${PLATFORM}" ]; then
   echo "==> Detecting Multi-container Docker platform in ${AWS_REGION}"
   PLATFORM=$(aws elasticbeanstalk list-available-solution-stacks \
@@ -79,15 +78,14 @@ if [ -z "${PLATFORM}" ]; then
     --query "SolutionStacks[?contains(@, 'Multi-container Docker')] | [0]" \
     --output text 2>/dev/null)
   if [ -z "${PLATFORM}" ] || [ "${PLATFORM}" = "None" ]; then
-    echo "   auto-detect failed. Available Docker platforms in ${AWS_REGION}:"
+    echo "ERROR: could not auto-detect a Multi-container Docker platform in ${AWS_REGION}."
+    echo "Available Docker platforms in this region:"
     aws elasticbeanstalk list-available-solution-stacks \
       --region "${AWS_REGION}" \
       --query "SolutionStacks[?contains(@, 'Docker')]" --output text 2>/dev/null || true
-    PLATFORM="Multi-container Docker running on 64bit Amazon Linux 2"
-    echo "   using fallback: ${PLATFORM}"
-  else
-    echo "   using: ${PLATFORM}"
+    exit 1
   fi
+  echo "   detected and using: ${PLATFORM}"
 fi
 
 echo "==> Initialising EB CLI in this directory"
