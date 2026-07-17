@@ -1,45 +1,39 @@
-# SentinelOps-Lite — local multi-container stack
-# Brings up the Python app, Prometheus, Grafana, Node Exporter and an Nginx reverse proxy.
-# Usage:  docker compose -f docker/docker-compose.yml up --build
-version: "3.8"
+# SentinelOps-Lite — multi-container stack for the Elastic Beanstalk
+# "running ECS" (Docker Compose) platform.
+#
+# This file REPLACES the old Dockerrun.aws.json v2. The ECS platform reads
+# docker-compose.yml from the source-bundle root. Relative volume paths
+# (./...) resolve to /var/app/current/ on the EB instance.
+#
+# The app image is built by deployment/deploy.sh and pushed to Docker Hub as
+# <DOCKERHUB_USERNAME>/sentinelops-lite:latest; deploy.sh substitutes the
+# REPLACE_WITH_ECR_IMAGE_URI placeholder below at deploy time.
+version: "2.4"
 
 services:
-  # ---- Reverse proxy (public entry point) ----
   nginx:
     image: nginx:1.27-alpine
     ports:
       - "80:80"
     volumes:
       - ./docker/nginx:/etc/nginx/conf.d:ro
-    depends_on:
+    links:
       - app
-    networks:
-      - monitor
-    restart: unless-stopped
 
-  # ---- Python Flask application ----
   app:
-    build:
-      context: .
-      dockerfile: docker/Dockerfile
+    image: REPLACE_WITH_ECR_IMAGE_URI
+    ports:
+      - "5000:5000"
     environment:
       - PORT=5000
-      - APP_VERSION=${APP_VERSION:-1.0.0}
-      - BUILD_NUMBER=${BUILD_NUMBER:-local}
-      - ENVIRONMENT=${ENVIRONMENT:-development}
-      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - APP_VERSION=1.0.0
+      - BUILD_NUMBER=local
+      - ENVIRONMENT=production
       - METRICS_INTERVAL=5
-    expose:
-      - "5000"
     volumes:
       - ./logs:/app/logs
-    depends_on:
-      - prometheus
-    networks:
-      - monitor
-    restart: unless-stopped
+    mem_limit: 384m
 
-  # ---- Prometheus ----
   prometheus:
     image: prom/prometheus:v2.53.0
     ports:
@@ -47,51 +41,30 @@ services:
     volumes:
       - ./monitoring/prometheus:/etc/prometheus:ro
     command:
-      - "--config.file=/etc/prometheus/prometheus.yml"
-      - "--storage.tsdb.path=/prometheus"
-      - "--web.enable-lifecycle"
-    networks:
-      - monitor
-    restart: unless-stopped
+      - --config.file=/etc/prometheus/prometheus.yml
+    mem_limit: 256m
 
-  # ---- Grafana ----
   grafana:
     image: grafana/grafana:11.1.0
     ports:
       - "3000:3000"
     environment:
-      - GF_SECURITY_ADMIN_USER=${GRAFANA_USER:-admin}
-      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin}
+      - GF_SECURITY_ADMIN_USER=admin
       - GF_USERS_ALLOW_SIGN_UP=false
-      - GF_INSTALL_PLUGINS=
     volumes:
-      - ./monitoring/grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
-      - ./monitoring/grafana/provisioning/dashboards/dashboard.yml:/etc/grafana/provisioning/dashboards/dashboard.yml:ro
-      - ./monitoring/grafana/provisioning/dashboards/dashboards.json:/etc/grafana/provisioning/dashboards/overview.json:ro
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
       - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards/domain:ro
-    depends_on:
-      - prometheus
-    networks:
-      - monitor
-    restart: unless-stopped
+    mem_limit: 256m
 
-  # ---- Node Exporter ----
   node-exporter:
     image: prom/node-exporter:v1.8.0
+    ports:
+      - "9100:9100"
     volumes:
       - /proc:/host/proc:ro
       - /sys:/host/sys:ro
-      - /:/rootfs:ro
     command:
-      - "--path.procfs=/host/proc"
-      - "--path.sysfs=/host/sys"
-      - "--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc|rootfs)($$|/)"
-    expose:
-      - "9100"
-    networks:
-      - monitor
-    restart: unless-stopped
-
-networks:
-  monitor:
-    driver: bridge
+      - --path.procfs=/host/proc
+      - --path.sysfs=/host/sys
+      - --collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc|rootfs)($|/)
+    mem_limit: 64m

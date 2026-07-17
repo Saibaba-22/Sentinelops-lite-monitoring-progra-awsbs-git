@@ -42,7 +42,7 @@ os.chdir(ROOT)
 REQUIRED_FILES = [
     "app.py", "agent.py", "agent_monitor.py", "requirements.txt", "test_app.py",
     "docker/Dockerfile", "docker/docker-compose.yml", "docker/nginx/nginx.conf",
-    "Dockerrun.aws.json", "deployment/Procfile", "deployment/deploy.sh",
+    "Dockerrun.aws.json", "docker-compose.yml", "deployment/Procfile", "deployment/deploy.sh",
     ".ebextensions/01-nginx.config", ".ebextensions/02-logging.config",
     "monitoring/__init__.py", "monitoring/metrics.py", "monitoring/collectors.py",
     "monitoring/agent_state.py",
@@ -68,6 +68,7 @@ YAML_FILES = [
     "monitoring/grafana/provisioning/datasources/datasource.yml",
     "monitoring/grafana/provisioning/dashboards/dashboard.yml",
     "docker/docker-compose.yml",
+    "docker-compose.yml",
 ]
 JSON_FILES = [
     "Dockerrun.aws.json",
