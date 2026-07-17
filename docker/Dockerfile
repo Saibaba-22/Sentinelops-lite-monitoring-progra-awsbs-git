@@ -8,6 +8,10 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
+# Ensure the app module is always importable regardless of the container's
+# launch working directory (guards against "No module named 'application'").
+ENV PYTHONPATH=/app
+
 # Install dependencies first for better layer caching.
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
