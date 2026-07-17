@@ -1,3 +1,13 @@
+# SentinelOps-Lite — multi-container stack for the Elastic Beanstalk
+# "running ECS" (Docker Compose) platform.
+#
+# This file REPLACES the old Dockerrun.aws.json v2. The ECS platform reads
+# docker-compose.yml from the source-bundle root. Relative volume paths
+# (./...) resolve to /var/app/current/ on the EB instance.
+#
+# The app image is built by deployment/deploy.sh and pushed to Docker Hub as
+# <DOCKERHUB_USERNAME>/sentinelops-lite:latest; deploy.sh substitutes the
+# REPLACE_WITH_ECR_IMAGE_URI placeholder below at deploy time.
 version: "2.4"
 
 services:
@@ -7,8 +17,9 @@ services:
       - "80:80"
     volumes:
       - ./docker/nginx:/etc/nginx/conf.d:ro
-    links:
-      - app
+    # NOTE: no `links:` — the ECS (running ECS) platform puts all services on a
+    # shared network where they resolve each other by service name (nginx ->
+    # http://app:5000). `links` is legacy v2 syntax and is ignored/rejected here.
 
   app:
     image: REPLACE_WITH_ECR_IMAGE_URI
@@ -43,7 +54,7 @@ services:
       - GF_USERS_ALLOW_SIGN_UP=false
     volumes:
       - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
-      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards/domain:ro
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
     mem_limit: 256m
 
   node-exporter:

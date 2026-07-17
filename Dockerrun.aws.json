@@ -21,7 +21,7 @@
       "name": "app",
       "image": "REPLACE_WITH_ECR_IMAGE_URI",
       "essential": true,
-      "memory": 384,
+      "memory": 256,
       "portMappings": [
         { "hostPort": 5000, "containerPort": 5000 }
       ],
@@ -43,7 +43,7 @@
       "name": "prometheus",
       "image": "prom/prometheus:v2.53.0",
       "essential": true,
-      "memory": 256,
+      "memory": 128,
       "portMappings": [
         { "hostPort": 9090, "containerPort": 9090 }
       ],
@@ -61,7 +61,7 @@
       "name": "grafana",
       "image": "grafana/grafana:11.1.0",
       "essential": true,
-      "memory": 256,
+      "memory": 128,
       "portMappings": [
         { "hostPort": 3000, "containerPort": 3000 }
       ],
@@ -76,7 +76,7 @@
         },
         {
           "sourceVolume": "grafana-dashboards",
-          "containerPath": "/etc/grafana/provisioning/dashboards/domain"
+          "containerPath": "/var/lib/grafana/dashboards"
         }
       ]
     },
