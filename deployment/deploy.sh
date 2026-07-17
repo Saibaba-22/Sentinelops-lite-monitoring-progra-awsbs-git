@@ -70,16 +70,36 @@ if ! command -v aws >/dev/null 2>&1; then
   pip install -q awscli || pip install -q aws-cli
 fi
 
-# Detect the EXACT Multi-container Docker platform for this region and USE it.
+# Detect the EXACT multi-container Docker (ECS) platform for this region and USE it.
+# NOTE: AWS rebranded "Multi-container Docker" to "running ECS" on newer regions
+# (e.g. us-east-1). Dockerrun.aws.json v2 works on BOTH, but the literal string
+# "Multi-container Docker" no longer exists there, so a naive match returns empty.
+# We match "running ECS" first (preferring Amazon Linux 2023), then fall back to
+# the legacy "Multi-container Docker" name. No hardcoded platform anywhere.
 if [ -z "${PLATFORM}" ]; then
-  echo "==> Detecting Multi-container Docker platform in ${AWS_REGION}"
-  PLATFORM=$(aws elasticbeanstalk list-available-solution-stacks \
-    --region "${AWS_REGION}" \
-    --query "SolutionStacks[?contains(@, 'Multi-container Docker')] | [0]" \
-    --output text 2>/dev/null)
+  detect_platform() {
+    local region="$1"
+    local candidates=(
+      "SolutionStacks[?contains(@, 'running ECS') && contains(@, 'Amazon Linux 2023')] | [0]"
+      "SolutionStacks[?contains(@, 'running ECS')] | [0]"
+      "SolutionStacks[?contains(@, 'Multi-container Docker')] | [0]"
+    )
+    for q in "${candidates[@]}"; do
+      local p
+      p=$(aws elasticbeanstalk list-available-solution-stacks \
+            --region "${region}" --query "${q}" --output text 2>/dev/null)
+      if [ -n "${p}" ] && [ "${p}" != "None" ]; then
+        echo "${p}"
+        return 0
+      fi
+    done
+    return 1
+  }
+  echo "==> Detecting multi-container Docker (ECS) platform in ${AWS_REGION}"
+  PLATFORM=$(detect_platform "${AWS_REGION}") || true
   if [ -z "${PLATFORM}" ] || [ "${PLATFORM}" = "None" ]; then
-    echo "ERROR: could not auto-detect a Multi-container Docker platform in ${AWS_REGION}."
-    echo "Available Docker platforms in this region:"
+    echo "ERROR: could not auto-detect a multi-container Docker (ECS) platform in ${AWS_REGION}."
+    echo "This region has no multi-container Docker platform. Available Docker platforms:"
     aws elasticbeanstalk list-available-solution-stacks \
       --region "${AWS_REGION}" \
       --query "SolutionStacks[?contains(@, 'Docker')]" --output text 2>/dev/null || true
