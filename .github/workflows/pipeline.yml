@@ -1,0 +1,134 @@
+# =============================================================================
+# pipeline.yml — SentinelOps-Lite CI/CD pipeline (GitHub Actions)
+# Move to .github/workflows/pipeline.yml to activate.
+#
+# ONLY FOUR INPUTS ARE REQUIRED:
+#   1. APP_NAME              (env)        Elastic Beanstalk application name
+#   2. ENV_NAME              (env)        Elastic Beanstalk environment name
+#   3. AWS_ACCESS_KEY_ID     (secret)     AWS access key
+#   4. AWS_SECRET_ACCESS_KEY (secret)     AWS secret key
+#
+# (AWS_REGION defaults to us-east-1; override in env: if needed.
+#  GEMINI_API_KEY is an OPTIONAL secret for the LLM summaries only.)
+#
+# The Beanstalk URL is NOT required — final_agent.py auto-discovers it from
+# the environment CNAME using the AWS credentials above.
+# =============================================================================
+
+name: SentinelOps-Lite Pipeline
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+env:
+  APP_NAME: sentinelops-lite
+  ENV_NAME: sentinelops-lite-prod
+  AWS_REGION: us-east-1
+  PYTHON_VERSION: "3.11"
+
+jobs:
+  # --------------------------------------------------------------------------
+  # 1) PRE-DEPLOY REVIEW GATE
+  # --------------------------------------------------------------------------
+  review:
+    name: Pre-deploy review (review_agent.py)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "${{ env.PYTHON_VERSION }}"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt pytest pyyaml
+
+      - name: Run review agent
+        run: python review_agent.py
+
+      - name: Upload review report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: review-report
+          path: review_report.txt
+
+  # --------------------------------------------------------------------------
+  # 2) DEPLOY (uses APP_NAME / ENV_NAME / AWS keys)
+  # --------------------------------------------------------------------------
+  deploy:
+    name: Deploy to Elastic Beanstalk
+    needs: review
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "${{ env.PYTHON_VERSION }}"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install EB CLI
+        run: pip install awsebcli
+
+      - name: Deploy (build -> ECR -> EB)
+        env:
+          APP_NAME: ${{ env.APP_NAME }}
+          ENV_NAME: ${{ env.ENV_NAME }}
+          AWS_REGION: ${{ env.AWS_REGION }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: bash deployment/deploy.sh
+
+  # --------------------------------------------------------------------------
+  # 3) POST-DEPLOY VERIFICATION  ->  final_review.txt
+  #    (auto-discovers the Beanstalk URL from the AWS credentials)
+  # --------------------------------------------------------------------------
+  verify:
+    name: Post-deploy verification (final_agent.py)
+    needs: deploy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "${{ env.PYTHON_VERSION }}"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run final verification agent
+        env:
+          APP_NAME: ${{ env.APP_NAME }}
+          ENV_NAME: ${{ env.ENV_NAME }}
+          AWS_REGION: ${{ env.AWS_REGION }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: python final_agent.py
+
+      - name: Upload final review
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: final-review
+          path: final_review.txt

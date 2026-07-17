@@ -1,0 +1,126 @@
+# SentinelOps-Lite — Prometheus alerting rules
+groups:
+  - name: infrastructure
+    rules:
+      - alert: InstanceDown
+        expr: up == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Instance {{ $labels.instance }} down"
+          description: "{{ $labels.instance }} of job {{ $labels.job }} has been down for more than 1 minute."
+
+      - alert: HighCpuUsage
+        expr: 100 - (avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 80
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High CPU on {{ $labels.instance }}"
+          description: "CPU usage is above 80% for 5 minutes."
+
+      - alert: HighMemoryUsage
+        expr: (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes) * 100 < 10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High memory on {{ $labels.instance }}"
+          description: "Less than 10% memory available."
+
+      - alert: HighDiskUsage
+        expr: (node_filesystem_avail_bytes{fstype!~"tmpfs|overlay"} / node_filesystem_size_bytes) * 100 < 10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Low disk on {{ $labels.instance }} ({{ $labels.mountpoint }})"
+          description: "Less than 10% disk space remaining."
+
+      - alert: HighLoadAverage
+        expr: node_load1 > 2 * count by (instance) (node_cpu_seconds_total{mode="idle"})
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High load average on {{ $labels.instance }}"
+          description: "1m load average exceeds twice the CPU core count."
+
+  - name: application
+    rules:
+      - alert: AppDown
+        expr: up{job="flask-app"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "SentinelOps-Lite application is down"
+          description: "The Flask application has not been reachable for 1 minute."
+
+      - alert: AppHighErrorRate
+        expr: sum(rate(app_errors_total[5m])) / sum(rate(app_requests_total[5m])) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High application error rate"
+          description: "Error rate is above 5% over the last 5 minutes."
+
+      - alert: AppHighLatency
+        expr: histogram_quantile(0.95, sum(rate(app_request_duration_seconds_bucket[5m])) by (le)) > 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High application latency (p95 > 1s)"
+          description: "95th percentile request duration exceeds 1 second."
+
+      - alert: AppHighMemory
+        expr: python_process_resident_memory_bytes > 1073741824
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Python process using > 1GiB RSS"
+          description: "The application process RSS exceeded 1 GiB."
+
+  - name: ai-agent
+    rules:
+      - alert: AgentFailed
+        expr: agent_state{state="failed"} == 1
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "AI Agent is in FAILED state"
+          description: "The AI agent reported a failed state."
+
+      - alert: AgentRejected
+        expr: agent_state{state="rejected"} == 1
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "AI Agent REJECTED the release"
+          description: "The release-approval agent rejected the deployment."
+
+      - alert: AgentNoDecision
+        expr: increase(agent_total_decisions[1h]) == 0
+        for: 5m
+        labels:
+          severity: info
+        annotations:
+          summary: "No AI agent decisions in the last hour"
+          description: "The agent has not produced any decisions recently."
+
+  - name: deployment
+    rules:
+      - alert: ContainerUnhealthy
+        expr: container_status == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Container reported unhealthy"
+          description: "container_status gauge dropped to 0."

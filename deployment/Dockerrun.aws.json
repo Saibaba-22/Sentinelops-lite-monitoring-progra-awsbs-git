@@ -1,0 +1,87 @@
+{
+  "AWSEBDockerrunVersion": 2,
+  "volumes": [
+    {
+      "name": "app-logs",
+      "host": { "sourcePath": "/var/app/current/logs" }
+    },
+    {
+      "name": "nginx-config",
+      "host": { "sourcePath": "/var/app/current/docker/nginx" }
+    },
+    {
+      "name": "prometheus-config",
+      "host": { "sourcePath": "/var/app/current/monitoring/prometheus" }
+    },
+    {
+      "name": "grafana-provisioning",
+      "host": { "sourcePath": "/var/app/current/monitoring/grafana/provisioning" }
+    },
+    {
+      "name": "grafana-dashboards",
+      "host": { "sourcePath": "/var/app/current/monitoring/grafana/dashboards" }
+    }
+  ],
+  "containerDefinitions": [
+    {
+      "name": "nginx",
+      "image": "nginx:1.27-alpine",
+      "essential": true,
+      "memory": 128,
+      "portMappings": [ { "hostPort": 80, "containerPort": 80 } ],
+      "mountPoints": [ { "sourceVolume": "nginx-config", "containerPath": "/etc/nginx/conf.d" } ],
+      "links": [ "app" ]
+    },
+    {
+      "name": "app",
+      "image": "REPLACE_WITH_ECR_IMAGE_URI",
+      "essential": true,
+      "memory": 512,
+      "portMappings": [ { "hostPort": 5000, "containerPort": 5000 } ],
+      "environment": [
+        { "name": "PORT", "value": "5000" },
+        { "name": "APP_VERSION", "value": "1.0.0" },
+        { "name": "BUILD_NUMBER", "value": "local" },
+        { "name": "ENVIRONMENT", "value": "production" },
+        { "name": "METRICS_INTERVAL", "value": "5" }
+      ],
+      "mountPoints": [ { "sourceVolume": "app-logs", "containerPath": "/app/logs" } ]
+    },
+    {
+      "name": "prometheus",
+      "image": "prom/prometheus:v2.53.0",
+      "essential": true,
+      "memory": 256,
+      "portMappings": [ { "hostPort": 9090, "containerPort": 9090 } ],
+      "mountPoints": [ { "sourceVolume": "prometheus-config", "containerPath": "/etc/prometheus" } ],
+      "command": [ "--config.file=/etc/prometheus/prometheus.yml" ]
+    },
+    {
+      "name": "grafana",
+      "image": "grafana/grafana:11.1.0",
+      "essential": true,
+      "memory": 256,
+      "portMappings": [ { "hostPort": 3000, "containerPort": 3000 } ],
+      "environment": [
+        { "name": "GF_SECURITY_ADMIN_USER", "value": "admin" },
+        { "name": "GF_USERS_ALLOW_SIGN_UP", "value": "false" }
+      ],
+      "mountPoints": [
+        { "sourceVolume": "grafana-provisioning", "containerPath": "/etc/grafana/provisioning" },
+        { "sourceVolume": "grafana-dashboards", "containerPath": "/etc/grafana/provisioning/dashboards/domain" }
+      ]
+    },
+    {
+      "name": "node-exporter",
+      "image": "prom/node-exporter:v1.8.0",
+      "essential": false,
+      "memory": 128,
+      "portMappings": [ { "hostPort": 9100, "containerPort": 9100 } ],
+      "command": [
+        "--path.procfs=/host/proc",
+        "--path.sysfs=/host/sys",
+        "--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc|rootfs)($$|/)"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,41 @@
+# SentinelOps-Lite — Prometheus recording rules
+# Pre-computed series keep dashboard queries fast and consistent.
+groups:
+  - name: recording
+    rules:
+      - record: job:app_requests_per_second:rate5m
+        expr: sum(rate(app_requests_total[5m]))
+
+      - record: job:app_error_rate:rate5m
+        expr: |
+          sum(rate(app_errors_total[5m]))
+          /
+          sum(rate(app_requests_total[5m]))
+
+      - record: job:app_request_duration:p95_5m
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum(rate(app_request_duration_seconds_bucket[5m])) by (le)
+          )
+
+      - record: job:app_request_duration:p99_5m
+        expr: |
+          histogram_quantile(
+            0.99,
+            sum(rate(app_request_duration_seconds_bucket[5m])) by (le)
+          )
+
+      - record: instance:node_cpu:ratio_rate5m
+        expr: |
+          1 - avg(rate(node_cpu_seconds_total{mode="idle"}[5m])) by (instance)
+
+      - record: instance:node_memory:available_percent
+        expr: |
+          (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes) * 100
+
+      - record: job:agent_api_success_rate:rate5m
+        expr: |
+          sum(rate(agent_api_calls_total{status="success"}[5m]))
+          /
+          sum(rate(agent_api_calls_total[5m]))

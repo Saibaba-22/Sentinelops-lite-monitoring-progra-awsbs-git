@@ -1,0 +1,120 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "graphTooltip": 0,
+  "schemaVersion": 39,
+  "tags": ["sentinelops-lite", "application"],
+  "templating": { "list": [] },
+  "time": { "from": "now-1h", "to": "now" },
+  "timezone": "",
+  "title": "Application",
+  "uid": "application",
+  "version": 1,
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Requests / second",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "reqps", "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "showPoints": "never" } }, "overrides": [] },
+      "targets": [ { "refId": "A", "expr": "sum(rate(app_requests_total[1m]))", "legendFormat": "rps" } ]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Error Rate %",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "percent", "min": 0, "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "showPoints": "never" } }, "overrides": [] },
+      "targets": [ { "refId": "A", "expr": "(sum(rate(app_errors_total[1m])) / sum(rate(app_requests_total[1m]))) * 100", "legendFormat": "error %" } ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Request Duration (p95 / p99)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "fieldConfig": { "defaults": { "unit": "s", "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "showPoints": "never" } }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "histogram_quantile(0.95, sum(rate(app_request_duration_seconds_bucket[5m])) by (le))", "legendFormat": "p95" },
+        { "refId": "B", "expr": "histogram_quantile(0.99, sum(rate(app_request_duration_seconds_bucket[5m])) by (le))", "legendFormat": "p99" }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "barchart",
+      "title": "HTTP Status Codes",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "fieldConfig": { "defaults": { "unit": "short", "custom": {} }, "overrides": [] },
+      "targets": [ { "refId": "A", "expr": "sum(rate(http_status_codes_total[1m])) by (code)", "legendFormat": "{{code}}" } ]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Active Sessions / Users",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "showPoints": "never" } }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "app_active_sessions", "legendFormat": "sessions" },
+        { "refId": "B", "expr": "app_active_users", "legendFormat": "users" }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Python Process Memory",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "fieldConfig": { "defaults": { "unit": "bytes", "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "showPoints": "never" } }, "overrides": [] },
+      "targets": [ { "refId": "A", "expr": "python_process_resident_memory_bytes", "legendFormat": "rss" } ]
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Python Process CPU %",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 24 },
+      "fieldConfig": { "defaults": { "unit": "percent", "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "showPoints": "never" } }, "overrides": [] },
+      "targets": [ { "refId": "A", "expr": "python_process_cpu_percent", "legendFormat": "cpu" } ]
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Thread Count",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 24 },
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "showPoints": "never" } }, "overrides": [] },
+      "targets": [ { "refId": "A", "expr": "python_thread_count", "legendFormat": "threads" } ]
+    },
+    {
+      "id": 9,
+      "type": "stat",
+      "title": "Total Exceptions",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 6, "w": 6, "x": 0, "y": 32 },
+      "fieldConfig": { "defaults": { "unit": "short", "custom": {}, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 1 } ] } }, "overrides": [] },
+      "targets": [ { "refId": "A", "expr": "app_exceptions_total" } ]
+    },
+    {
+      "id": 10,
+      "type": "stat",
+      "title": "Restart Count",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 6, "w": 6, "x": 6, "y": 32 },
+      "fieldConfig": { "defaults": { "unit": "short", "custom": {} }, "overrides": [] },
+      "targets": [ { "refId": "A", "expr": "app_restart_total" } ]
+    },
+    {
+      "id": 11,
+      "type": "stat",
+      "title": "Application Uptime",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 32 },
+      "fieldConfig": { "defaults": { "unit": "dthms", "custom": {} }, "overrides": [] },
+      "targets": [ { "refId": "A", "expr": "app_uptime_seconds" } ]
+    }
+  ]
+}

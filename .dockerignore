@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Version control & env
+.git/
+.env
+.env.*
+
+# Runtime / logs
+logs/
+*.log
+
+# Docs & local artifacts
+docs/
+*.md
+agent_stats.json
+agent_decision.txt
+test_results.txt
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store

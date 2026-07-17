@@ -1,0 +1,139 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "graphTooltip": 0,
+  "schemaVersion": 39,
+  "tags": ["sentinelops-lite", "infrastructure"],
+  "templating": { "list": [] },
+  "time": { "from": "now-1h", "to": "now" },
+  "timezone": "",
+  "title": "Infrastructure",
+  "uid": "infrastructure",
+  "version": 1,
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "CPU Usage %",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "percent", "min": 0, "max": 100, "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "showPoints": "never" } }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "100 - (avg by (instance) (rate(node_cpu_seconds_total{mode=\"idle\"}[5m])) * 100)", "legendFormat": "{{instance}}" }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Memory Usage %",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "percent", "min": 0, "max": 100, "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "showPoints": "never" } }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "(1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes) * 100", "legendFormat": "{{instance}}" }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Disk Usage %",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "fieldConfig": { "defaults": { "unit": "percent", "min": 0, "max": 100, "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "showPoints": "never" } }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "(1 - node_filesystem_avail_bytes{fstype!~\"tmpfs|overlay\"} / node_filesystem_size_bytes) * 100", "legendFormat": "{{instance}} / {{mountpoint}}" }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Network (bytes/sec)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "fieldConfig": { "defaults": { "unit": "Bps", "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "showPoints": "never" } }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "rate(node_network_receive_bytes_total[1m])", "legendFormat": "recv {{device}}" },
+        { "refId": "B", "expr": "rate(node_network_transmit_bytes_total[1m])", "legendFormat": "sent {{device}}" }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Load Average",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "showPoints": "never" } }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "node_load1", "legendFormat": "1m" },
+        { "refId": "B", "expr": "node_load5", "legendFormat": "5m" },
+        { "refId": "C", "expr": "node_load15", "legendFormat": "15m" }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Disk I/O (bytes/sec)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "fieldConfig": { "defaults": { "unit": "Bps", "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "showPoints": "never" } }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "rate(node_disk_read_bytes_total[1m])", "legendFormat": "read {{device}}" },
+        { "refId": "B", "expr": "rate(node_disk_write_bytes_total[1m])", "legendFormat": "write {{device}}" }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "stat",
+      "title": "System Uptime",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 6, "w": 6, "x": 0, "y": 24 },
+      "fieldConfig": { "defaults": { "unit": "dthms", "custom": {} }, "overrides": [] },
+      "targets": [ { "refId": "A", "expr": "time() - node_boot_time_seconds" } ]
+    },
+    {
+      "id": 8,
+      "type": "stat",
+      "title": "Running Processes",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 6, "w": 6, "x": 6, "y": 24 },
+      "fieldConfig": { "defaults": { "unit": "short", "custom": {} }, "overrides": [] },
+      "targets": [ { "refId": "A", "expr": "node_procs_running" } ]
+    },
+    {
+      "id": 9,
+      "type": "stat",
+      "title": "Open File Descriptors",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 6, "w": 6, "x": 12, "y": 24 },
+      "fieldConfig": { "defaults": { "unit": "short", "custom": {} }, "overrides": [] },
+      "targets": [ { "refId": "A", "expr": "node_filefd_allocated" } ]
+    },
+    {
+      "id": 10,
+      "type": "stat",
+      "title": "Logged-in Users (app host)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 6, "w": 6, "x": 18, "y": 24 },
+      "fieldConfig": { "defaults": { "unit": "short", "custom": {} }, "overrides": [] },
+      "targets": [ { "refId": "A", "expr": "system_logged_in_users" } ]
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "App-exposed CPU %",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 30 },
+      "fieldConfig": { "defaults": { "unit": "percent", "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "showPoints": "never" } }, "overrides": [] },
+      "targets": [ { "refId": "A", "expr": "system_cpu_usage_percent", "legendFormat": "cpu" } ]
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "App-exposed Memory %",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 30 },
+      "fieldConfig": { "defaults": { "unit": "percent", "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "showPoints": "never" } }, "overrides": [] },
+      "targets": [ { "refId": "A", "expr": "system_memory_usage_percent", "legendFormat": "mem" } ]
+    }
+  ]
+}

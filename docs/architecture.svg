@@ -1,0 +1,82 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="640" viewBox="0 0 960 640" font-family="Segoe UI, Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L8,3 L0,6 Z" fill="#94a3b8"/>
+    </marker>
+    <style>
+      .box { fill:#0b1220; stroke:#3b82f6; stroke-width:1.5; rx:10; }
+      .box2 { fill:#0b1220; stroke:#10b981; stroke-width:1.5; }
+      .box3 { fill:#0b1220; stroke:#f59e0b; stroke-width:1.5; }
+      .title { fill:#e5e7eb; font-size:15px; font-weight:700; }
+      .lbl { fill:#cbd5e1; font-size:13px; font-weight:600; }
+      .sub { fill:#94a3b8; font-size:11px; }
+      .edge { stroke:#94a3b8; stroke-width:1.5; fill:none; marker-end:url(#arrow); }
+      .edgeDash { stroke:#64748b; stroke-width:1.5; stroke-dasharray:5 4; fill:none; marker-end:url(#arrow); }
+    </style>
+  </defs>
+
+  <rect x="0" y="0" width="960" height="640" fill="#030712"/>
+  <text x="30" y="34" class="title">SentinelOps-Lite — Architecture</text>
+
+  <!-- EB boundary -->
+  <rect x="24" y="120" width="912" height="496" fill="none" stroke="#475569" stroke-width="1.5" stroke-dasharray="6 5" rx="14"/>
+  <text x="40" y="142" class="sub">AWS Elastic Beanstalk · Multi-container Docker</text>
+
+  <!-- Browser -->
+  <rect x="400" y="40" width="160" height="60" rx="10" class="box2"/>
+  <text x="480" y="68" text-anchor="middle" class="lbl">Browser / User</text>
+  <text x="480" y="86" text-anchor="middle" class="sub">dashboard + app UI</text>
+
+  <!-- Nginx -->
+  <rect x="400" y="160" width="160" height="60" rx="10" class="box"/>
+  <text x="480" y="188" text-anchor="middle" class="lbl">Nginx (80)</text>
+  <text x="480" y="206" text-anchor="middle" class="sub">reverse proxy</text>
+
+  <!-- Flask App -->
+  <rect x="390" y="300" width="180" height="76" rx="10" class="box"/>
+  <text x="480" y="328" text-anchor="middle" class="lbl">Flask App (5000)</text>
+  <text x="480" y="346" text-anchor="middle" class="sub">/metrics · /api/status</text>
+  <text x="480" y="363" text-anchor="middle" class="sub">/monitor/status · /dashboard</text>
+
+  <!-- AI Agent -->
+  <rect x="700" y="300" width="190" height="76" rx="10" class="box3"/>
+  <text x="795" y="328" text-anchor="middle" class="lbl">AI Agent (agent.py)</text>
+  <text x="795" y="346" text-anchor="middle" class="sub">CI release-gate</text>
+  <text x="795" y="363" text-anchor="middle" class="sub">Gemini approve/reject</text>
+
+  <!-- Node Exporter -->
+  <rect x="80" y="430" width="180" height="64" rx="10" class="box"/>
+  <text x="170" y="458" text-anchor="middle" class="lbl">Node Exporter</text>
+  <text x="170" y="476" text-anchor="middle" class="sub">host metrics :9100</text>
+
+  <!-- Prometheus -->
+  <rect x="320" y="440" width="190" height="76" rx="10" class="box"/>
+  <text x="415" y="468" text-anchor="middle" class="lbl">Prometheus</text>
+  <text x="415" y="486" text-anchor="middle" class="sub">scrape 15s · TSDB</text>
+  <text x="415" y="503" text-anchor="middle" class="sub">rules + alerts</text>
+
+  <!-- Grafana -->
+  <rect x="620" y="440" width="180" height="76" rx="10" class="box2"/>
+  <text x="710" y="468" text-anchor="middle" class="lbl">Grafana</text>
+  <text x="710" y="486" text-anchor="middle" class="sub">:3000 dashboards</text>
+  <text x="710" y="503" text-anchor="middle" class="sub">auto-provisioned</text>
+
+  <!-- Logs -->
+  <rect x="400" y="560" width="170" height="44" rx="10" fill="#0b1220" stroke="#64748b" stroke-width="1.2"/>
+  <text x="485" y="586" text-anchor="middle" class="sub">Centralised logs (/var/log)</text>
+
+  <!-- Edges -->
+  <line x1="480" y1="100" x2="480" y2="160" class="edge"/>
+  <line x1="480" y1="220" x2="480" y2="300" class="edge"/>
+  <path d="M420,338 C380,400 400,420 415,440" class="edge"/>
+  <text x="350" y="395" class="sub">scrape /metrics</text>
+  <line x1="260" y1="462" x2="320" y2="462" class="edge"/>
+  <text x="240" y="452" class="sub">scrape</text>
+  <line x1="605" y1="478" x2="620" y2="478" class="edge"/>
+  <text x="612" y="468" class="sub">query</text>
+  <path d="M700,338 C740,300 770,300 795,300" class="edge"/>
+  <text x="735" y="320" class="sub">POST /monitor/status</text>
+  <path d="M710,440 C620,300 560,180 510,100" class="edgeDash"/>
+  <text x="640" y="250" class="sub">view dashboards</text>
+  <line x1="480" y1="376" x2="485" y2="560" class="edge"/>
+</svg>

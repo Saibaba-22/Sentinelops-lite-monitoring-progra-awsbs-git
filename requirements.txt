@@ -1,0 +1,9 @@
+flask==3.0.3
+gunicorn==22.0.0
+pytest==8.2.0
+psutil==6.0.0
+google-genai
+requests
+tzdata
+prometheus_client==0.20.0
+pyyaml==6.0.1
