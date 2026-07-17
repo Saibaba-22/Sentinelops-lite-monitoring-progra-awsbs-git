@@ -28,7 +28,7 @@ IMAGE_NAME="${IMAGE_NAME:-sentinelops-lite}"
 IMAGE_TAG="${IMAGE_TAG:-latest}"
 DOCKERHUB_USERNAME="${DOCKERHUB_USERNAME:?Set DOCKERHUB_USERNAME}"
 DOCKERHUB_TOKEN="${DOCKERHUB_TOKEN:?Set DOCKERHUB_TOKEN}"
-PLATFORM="${PLATFORM:-Multi-container Docker running on 64bit Amazon Linux 2023}"
+PLATFORM="${PLATFORM:-}"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DOCKERRUN="${ROOT_DIR}/deployment/Dockerrun.aws.json"
@@ -64,15 +64,32 @@ mkdir -p "${ROOT_DIR}/deployment/.bundle"
     --exclude "logs/*" --exclude "docs/*" --exclude ".git/*"
 )
 
+# Detect the EXACT Multi-container Docker platform name for this region.
+# (Hardcoding it fails because the string differs per region / AL version.)
+if [ -z "${PLATFORM}" ]; then
+  echo "==> Detecting Multi-container Docker platform in ${AWS_REGION}"
+  PLATFORM=$(aws elasticbeanstalk list-available-solution-stacks \
+    --region "${AWS_REGION}" \
+    --query "SolutionStacks[?contains(@, 'Multi-container Docker')] | [0]" \
+    --output text 2>/dev/null)
+  if [ -z "${PLATFORM}" ] || [ "${PLATFORM}" = "None" ]; then
+    PLATFORM="Multi-container Docker running on 64bit Amazon Linux 2"
+    echo "   (auto-detect failed; using fallback: ${PLATFORM})"
+  else
+    echo "   using: ${PLATFORM}"
+  fi
+fi
+
 echo "==> Initialising EB CLI in this directory"
-# Non-interactive init: sets platform + region + application.
 eb init -p "${PLATFORM}" -r "${AWS_REGION}" "${APP_NAME}"
 
-echo "==> Deploying to Elastic Beanstalk (${APP_NAME}/${ENV_NAME})"
-if command -v eb >/dev/null 2>&1; then
-  eb deploy "${ENV_NAME}" --label "build-$(date +%Y%m%d-%H%M%S)"
-else
-  echo "EB CLI not found. Upload '${BUNDLE}' manually via the EB Console."
+echo "==> Ensuring environment '${ENV_NAME}' exists"
+if ! eb status "${ENV_NAME}" >/dev/null 2>&1; then
+  echo "   environment not found — creating (single-instance, free-tier friendly)"
+  eb create "${ENV_NAME}" --platform "${PLATFORM}" --region "${AWS_REGION}" --single --instance-type t3.micro
 fi
+
+echo "==> Deploying to Elastic Beanstalk (${APP_NAME}/${ENV_NAME})"
+eb deploy "${ENV_NAME}" --label "build-$(date +%Y%m%d-%H%M%S)"
 
 echo "==> Done."
