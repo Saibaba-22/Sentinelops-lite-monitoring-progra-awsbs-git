@@ -28,10 +28,10 @@ on:
   workflow_dispatch: {}
 
 env:
-  APP_NAME: sentinelops-lite
-  ENV_NAME: sentinelops-lite-prod
-  DOCKERHUB_USERNAME: your-dockerhub-user
-  AWS_REGION: us-east-1
+  APP_NAME: agent
+  ENV_NAME: agent
+  DOCKERHUB_USERNAME: saibaba22
+  AWS_REGION: ap-south-1
   PYTHON_VERSION: "3.11"
 
 jobs:
