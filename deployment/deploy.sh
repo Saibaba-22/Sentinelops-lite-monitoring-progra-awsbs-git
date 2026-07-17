@@ -64,6 +64,12 @@ mkdir -p "${ROOT_DIR}/deployment/.bundle"
     --exclude "logs/*" --exclude "docs/*" --exclude ".git/*"
 )
 
+# Ensure the AWS CLI is available (used to query the exact platform name).
+if ! command -v aws >/dev/null 2>&1; then
+  echo "==> AWS CLI not found — installing"
+  pip install -q awscli || pip install -q aws-cli
+fi
+
 # Detect the EXACT Multi-container Docker platform name for this region.
 # (Hardcoding it fails because the string differs per region / AL version.)
 if [ -z "${PLATFORM}" ]; then
@@ -73,8 +79,12 @@ if [ -z "${PLATFORM}" ]; then
     --query "SolutionStacks[?contains(@, 'Multi-container Docker')] | [0]" \
     --output text 2>/dev/null)
   if [ -z "${PLATFORM}" ] || [ "${PLATFORM}" = "None" ]; then
+    echo "   auto-detect failed. Available Docker platforms in ${AWS_REGION}:"
+    aws elasticbeanstalk list-available-solution-stacks \
+      --region "${AWS_REGION}" \
+      --query "SolutionStacks[?contains(@, 'Docker')]" --output text 2>/dev/null || true
     PLATFORM="Multi-container Docker running on 64bit Amazon Linux 2"
-    echo "   (auto-detect failed; using fallback: ${PLATFORM})"
+    echo "   using fallback: ${PLATFORM}"
   else
     echo "   using: ${PLATFORM}"
   fi
