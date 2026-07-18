@@ -24,8 +24,9 @@ on:
 env:
   APP_NAME: ${{ vars.APP_NAME }}
   ENV_NAME: ${{ vars.ENV_NAME }}
-  DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
   AWS_REGION: ${{ vars.AWS_REGION }}
+  DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
+  DOCKERHUB_REPOSITORY: ${{ vars.DOCKERHUB_REPOSITORY }}
   PYTHON_VERSION: ${{ vars.PYTHON_VERSION }}
   REPOSITORY: ${{ github.repository }}
   GITHUB_SHA: ${{ github.sha }}

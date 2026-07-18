@@ -24,7 +24,7 @@ set -euo pipefail
 APP_NAME="${APP_NAME:-sentinelops-lite}"
 ENV_NAME="${ENV_NAME:-sentinelops-lite-prod}"
 AWS_REGION="${AWS_REGION:-us-east-1}"
-IMAGE_NAME=$(basename "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
+IMAGE_NAME="${DOCKERHUB_REPOSITORY:?Set DOCKERHUB_REPOSITORY}"
 IMAGE_TAG="${GITHUB_SHA:-latest}"
 IMAGE_TAG="${IMAGE_TAG:0:7}"
 DOCKERHUB_USERNAME="${DOCKERHUB_USERNAME:?Set DOCKERHUB_USERNAME}"
