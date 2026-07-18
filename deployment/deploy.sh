@@ -37,6 +37,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # app container's image field. The file MUST sit at the repo root so `eb deploy`
 # packages it at the bundle root. (docker-compose.yml is kept for local dev only.)
 DOCKERRUN_FILE="${ROOT_DIR}/Dockerrun.aws.json"
+COMPOSE_FILE="${ROOT_DIR}/docker-compose.yml"
 
 DOCKERHUB_IMAGE="${DOCKERHUB_USERNAME}/${IMAGE_NAME}:${IMAGE_TAG}"
 echo "Docker image: ${DOCKERHUB_IMAGE}"
@@ -52,11 +53,14 @@ echo "${DOCKERHUB_TOKEN}" | docker login -u "${DOCKERHUB_USERNAME}" --password-s
 echo "==> Pushing image -> ${DOCKERHUB_IMAGE}"
 docker push "${DOCKERHUB_IMAGE}"
 
-echo "==> Injecting Docker Hub image URI into Dockerrun.aws.json (v2)"
+echo "==> Updating deployment files"
+
 if [[ "$OSTYPE" == "darwin"* ]]; then
-  sed -i '' "s|REPLACE_WITH_ECR_IMAGE_URI|${DOCKERHUB_IMAGE}|g" "${DOCKERRUN_FILE}"
+    sed -i '' "s|REPLACE_WITH_ECR_IMAGE_URI|${DOCKERHUB_IMAGE}|g" "${DOCKERRUN_FILE}"
+    sed -i '' "s|REPLACE_WITH_ECR_IMAGE_URI|${DOCKERHUB_IMAGE}|g" "${COMPOSE_FILE}"
 else
-  sed -i "s|REPLACE_WITH_ECR_IMAGE_URI|${DOCKERHUB_IMAGE}|g" "${DOCKERRUN_FILE}"
+    sed -i "s|REPLACE_WITH_ECR_IMAGE_URI|${DOCKERHUB_IMAGE}|g" "${DOCKERRUN_FILE}"
+    sed -i "s|REPLACE_WITH_ECR_IMAGE_URI|${DOCKERHUB_IMAGE}|g" "${COMPOSE_FILE}"
 fi
 
 echo "========================================="
@@ -148,20 +152,24 @@ find . -name "Dockerrun.aws.json"
 echo "Dockerrun contents:"
 cat Dockerrun.aws.json
 
-echo "Search for placeholder:"
-grep -R "REPLACE_WITH_ECR_IMAGE_URI" .
+echo "Checking only Dockerrun..."
+grep "REPLACE_WITH_ECR_IMAGE_URI" Dockerrun.aws.json || echo "No placeholder in Dockerrun"
 
-echo "========================================="
-echo "Creating deployment zip..."
+echo "===== Repository ====="
+pwd
 
-zip -r deploy.zip . \
-    -x ".git/*" \
-    -x ".github/*" \
-    -x "__pycache__/*"
+echo "===== Dockerrun location ====="
+find . -name "Dockerrun.aws.json"
 
-echo "Checking zip contents..."
+echo "===== Placeholder search ====="
+grep -R "REPLACE_WITH_ECR_IMAGE_URI" . || true
 
-unzip -p deploy.zip Dockerrun.aws.json
+echo "===== Images inside docker-compose.yml ====="
+grep "image:" docker-compose.yml
+
+echo "===== Images inside Dockerrun.aws.json ====="
+grep '"image"' Dockerrun.aws.json
+
 eb deploy "${ENV_NAME}" --label "build-$(date +%Y%m%d-%H%M%S)"
 
 echo "==> Done."
