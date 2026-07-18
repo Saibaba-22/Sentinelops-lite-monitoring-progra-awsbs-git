@@ -43,6 +43,12 @@ DOCKERRUN_FILE="${ROOT_DIR}/Dockerrun.aws.json"
 COMPOSE_FILE="${ROOT_DIR}/docker-compose.yml"
 
 DOCKERHUB_IMAGE="${DOCKERHUB_USERNAME}/${IMAGE_NAME}:${IMAGE_TAG}"
+DOCKERHUB_IMAGE="${DOCKERHUB_USERNAME}/${IMAGE_NAME}:${IMAGE_TAG}"
+
+echo "=================================="
+echo "DOCKERHUB_IMAGE=${DOCKERHUB_IMAGE}"
+echo "DOCKERRUN_FILE=${DOCKERRUN_FILE}"
+echo "=================================="
 echo "Docker image: ${DOCKERHUB_IMAGE}"
 echo "Repository: ${GITHUB_REPOSITORY}"
 echo "Commit: ${GITHUB_SHA}"
@@ -58,13 +64,19 @@ docker push "${DOCKERHUB_IMAGE}"
 
 echo "==> Updating deployment files"
 
-if [[ "$OSTYPE" == "darwin"* ]]; then
-    sed -i '' "s|REPLACE_WITH_ECR_IMAGE_URI|${DOCKERHUB_IMAGE}|g" "${DOCKERRUN_FILE}"
-    sed -i '' "s|REPLACE_WITH_ECR_IMAGE_URI|${DOCKERHUB_IMAGE}|g" "${COMPOSE_FILE}"
-else
-    sed -i "s|REPLACE_WITH_ECR_IMAGE_URI|${DOCKERHUB_IMAGE}|g" "${DOCKERRUN_FILE}"
-    sed -i "s|REPLACE_WITH_ECR_IMAGE_URI|${DOCKERHUB_IMAGE}|g" "${COMPOSE_FILE}"
-fi
+echo "Replacing image placeholder..."
+
+sed -i "s|REPLACE_WITH_ECR_IMAGE_URI|${DOCKERHUB_IMAGE}|g" "${DOCKERRUN_FILE}"
+sed -i "s|REPLACE_WITH_ECR_IMAGE_URI|${DOCKERHUB_IMAGE}|g" "${COMPOSE_FILE}" || true
+
+echo "========== Dockerrun =========="
+cat "${DOCKERRUN_FILE}"
+
+echo "========== docker-compose =========="
+grep "image:" "${COMPOSE_FILE}"
+
+echo "========== Remaining placeholders =========="
+grep -R "REPLACE_WITH_ECR_IMAGE_URI" . || echo "No placeholders found"
 
 echo "========================================="
 echo "Dockerrun.aws.json after replacement:"
