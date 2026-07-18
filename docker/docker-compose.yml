@@ -11,7 +11,7 @@ services:
       - app
 
   app:
-    image: ${DOCKERHUB_USERNAME}/${IMAGE_NAME}:${IMAGE_TAG}
+    image: "saibaba22/sentinelops-lite-monitoring-progra-awsbs-git:${IMAGE_TAG}"
     ports:
       - "5000:5000"
     environment:
