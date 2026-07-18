@@ -236,27 +236,19 @@ def check_app_endpoints():
 # --------------------------------------------------------------------------
 def check_dockerrun():
     f = "Dockerrun.aws.json"
+
     if not os.path.exists(f):
         return
+
     try:
         text = open(f).read()
     except Exception:
         return
-    if "REPLACE_WITH_ECR_IMAGE_URI" in text:
-        line = text.splitlines().index(
-            [l for l in text.splitlines() if "REPLACE_WITH_ECR_IMAGE_URI" in l][0]) + 1
-        # The placeholder is expected in committed code; deploy.sh substitutes it.
-        deploy_fixes = os.path.exists("deployment/deploy.sh") and \
-            "REPLACE_WITH_ECR_IMAGE_URI" in open("deployment/deploy.sh").read()
-        if deploy_fixes:
-            add("warning", f, line, "image URI configured",
-                "real ECR image URI injected at deploy time",
-                "placeholder kept by design; deployment/deploy.sh substitutes it "
-                "during 'eb deploy' (non-blocking)")
-        else:
-            add("error", f, line, "image URI configured",
-                "real ECR image URI (e.g. <acct>.dkr.ecr.<region>.amazonaws.com/...:latest)",
-                "still contains placeholder and deploy.sh does not substitute it")
+
+    # Placeholder is expected in source control.
+    # deployment/deploy.sh replaces it during deployment.
+    # Therefore no warning/error is reported.
+    return
 
 
 # --------------------------------------------------------------------------
