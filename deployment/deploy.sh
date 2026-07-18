@@ -122,6 +122,11 @@ if ! eb status "${ENV_NAME}" >/dev/null 2>&1; then
 fi
 
 echo "==> Deploying to Elastic Beanstalk (${APP_NAME}/${ENV_NAME})"
+echo "===== Files in repository root ====="
+ls -la
+
+echo "===== App image in Dockerrun ====="
+grep '"image"' Dockerrun.aws.json
 eb deploy "${ENV_NAME}" --label "build-$(date +%Y%m%d-%H%M%S)"
 
 echo "==> Done."
