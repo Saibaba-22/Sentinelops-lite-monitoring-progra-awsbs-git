@@ -233,6 +233,14 @@ echo
 echo "========== IMAGE =========="
 grep '"image"' Dockerrun.aws.json
 
+echo "===== FINAL DOCKERRUN BEFORE DEPLOY ====="
+cat Dockerrun.aws.json
+
+echo "===== CREATING ZIP ====="
+zip -r deploy.zip . -x ".git/*"
+
+echo "===== DOCKERRUN INSIDE ZIP ====="
+unzip -p deploy.zip Dockerrun.aws.json
 eb deploy "${ENV_NAME}" --label "build-$(date +%Y%m%d-%H%M%S)"
 
 echo "==> Done."
