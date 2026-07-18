@@ -170,6 +170,40 @@ grep "image:" docker-compose.yml
 echo "===== Images inside Dockerrun.aws.json ====="
 grep '"image"' Dockerrun.aws.json
 
+echo "========== EB DEBUG =========="
+
+eb status
+
+eb printenv
+
+ls -la .elasticbeanstalk || true
+
+find .elasticbeanstalk -type f 2>/dev/null
+
+echo "===== ALL Deployment Files ====="
+find . -type f | grep -E "Dockerrun|docker-compose"
+
+echo
+echo "===== Search Placeholder ====="
+grep -R "REPLACE_WITH_ECR_IMAGE_URI" . || true
+
+echo
+echo "===== ZIP CONTENT ====="
+zip -r deploy.zip . -x ".git/*"
+
+unzip -l deploy.zip | grep -E "Dockerrun|docker-compose"
+
+echo
+echo "===== Dockerrun inside ZIP ====="
+unzip -p deploy.zip Dockerrun.aws.json
+
+echo
+echo "===== docker-compose inside ZIP ====="
+unzip -p deploy.zip docker-compose.yml
+
+echo
+echo "===== docker/docker-compose inside ZIP ====="
+unzip -p deploy.zip docker/docker-compose.yml || true
 eb deploy "${ENV_NAME}" --label "build-$(date +%Y%m%d-%H%M%S)"
 
 echo "==> Done."
