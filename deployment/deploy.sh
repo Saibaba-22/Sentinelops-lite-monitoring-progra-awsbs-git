@@ -43,7 +43,12 @@ DOCKERRUN_FILE="${ROOT_DIR}/Dockerrun.aws.json"
 COMPOSE_FILE="${ROOT_DIR}/docker-compose.yml"
 
 DOCKERHUB_IMAGE="${DOCKERHUB_USERNAME}/${IMAGE_NAME}:${IMAGE_TAG}"
-DOCKERHUB_IMAGE="${DOCKERHUB_USERNAME}/${IMAGE_NAME}:${IMAGE_TAG}"
+echo "===================================="
+echo "DOCKERHUB_USERNAME=${DOCKERHUB_USERNAME}"
+echo "IMAGE_NAME=${IMAGE_NAME}"
+echo "IMAGE_TAG=${IMAGE_TAG}"
+echo "DOCKERHUB_IMAGE=${DOCKERHUB_IMAGE}"
+echo "===================================="
 
 echo "=================================="
 echo "DOCKERHUB_IMAGE=${DOCKERHUB_IMAGE}"
@@ -258,6 +263,13 @@ find . -maxdepth 2 -type f
 
 echo "========== FINAL DOCKERRUN =========="
 cat Dockerrun.aws.json
+
+echo "========== FINAL COMPOSE =========="
+cat docker-compose.yml
+
+echo "========== IMAGE =========="
+grep '"image"' Dockerrun.aws.json
+grep "image:" docker-compose.yml
 eb deploy "${ENV_NAME}" --label "build-$(date +%Y%m%d-%H%M%S)"
 
 echo "==> Done."
