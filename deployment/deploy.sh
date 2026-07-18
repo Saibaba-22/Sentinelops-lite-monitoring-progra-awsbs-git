@@ -136,6 +136,22 @@ ls -la
 
 echo "Dockerrun:"
 cat Dockerrun.aws.json
+echo "========== VERIFYING DEPLOYMENT =========="
+pwd
+
+echo "Git status:"
+git status
+
+echo "Dockerrun location:"
+find . -name "Dockerrun.aws.json"
+
+echo "Dockerrun contents:"
+cat Dockerrun.aws.json
+
+echo "Search for placeholder:"
+grep -R "REPLACE_WITH_ECR_IMAGE_URI" .
+
+echo "========================================="
 eb deploy "${ENV_NAME}" --label "build-$(date +%Y%m%d-%H%M%S)"
 
 echo "==> Done."
