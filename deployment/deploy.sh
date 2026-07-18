@@ -39,6 +39,9 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DOCKERRUN_FILE="${ROOT_DIR}/Dockerrun.aws.json"
 
 DOCKERHUB_IMAGE="${DOCKERHUB_USERNAME}/${IMAGE_NAME}:${IMAGE_TAG}"
+echo "Docker image: ${DOCKERHUB_IMAGE}"
+echo "Repository: ${GITHUB_REPOSITORY}"
+echo "Commit: ${GITHUB_SHA}"
 
 echo "==> Building application image"
 docker build -f "${ROOT_DIR}/docker/Dockerfile" -t "${DOCKERHUB_IMAGE}" "${ROOT_DIR}"
@@ -55,6 +58,11 @@ if [[ "$OSTYPE" == "darwin"* ]]; then
 else
   sed -i "s|REPLACE_WITH_ECR_IMAGE_URI|${DOCKERHUB_IMAGE}|g" "${DOCKERRUN_FILE}"
 fi
+
+echo "========================================="
+echo "Dockerrun.aws.json after replacement:"
+cat "${DOCKERRUN_FILE}"
+echo "========================================="
 
 # `eb deploy` packages the current (repo) directory itself, so no manual
 # bundling is needed — Dockerrun.aws.json and .ebextensions are already at the
