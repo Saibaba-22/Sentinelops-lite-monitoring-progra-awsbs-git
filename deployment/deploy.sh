@@ -222,6 +222,17 @@ unzip -p deploy.zip docker/docker-compose.yml || true
 
 envsubst < docker-compose.yml > docker-compose.generated.yml
 mv docker-compose.generated.yml docker-compose.yml
+echo "========== FINAL DOCKERRUN =========="
+cat Dockerrun.aws.json
+
+echo
+echo "========== SEARCH PLACEHOLDER =========="
+grep "REPLACE_WITH_ECR_IMAGE_URI" Dockerrun.aws.json && exit 1 || echo "Placeholder removed successfully"
+
+echo
+echo "========== IMAGE =========="
+grep '"image"' Dockerrun.aws.json
+
 eb deploy "${ENV_NAME}" --label "build-$(date +%Y%m%d-%H%M%S)"
 
 echo "==> Done."
