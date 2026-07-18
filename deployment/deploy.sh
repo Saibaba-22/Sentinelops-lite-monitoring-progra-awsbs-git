@@ -152,6 +152,16 @@ echo "Search for placeholder:"
 grep -R "REPLACE_WITH_ECR_IMAGE_URI" .
 
 echo "========================================="
+echo "Creating deployment zip..."
+
+zip -r deploy.zip . \
+    -x ".git/*" \
+    -x ".github/*" \
+    -x "__pycache__/*"
+
+echo "Checking zip contents..."
+
+unzip -p deploy.zip Dockerrun.aws.json
 eb deploy "${ENV_NAME}" --label "build-$(date +%Y%m%d-%H%M%S)"
 
 echo "==> Done."
