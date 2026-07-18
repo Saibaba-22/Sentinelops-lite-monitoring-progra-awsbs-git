@@ -19,7 +19,7 @@
     },
     {
       "name": "app",
-      "image": "${DOCKERHUB_USERNAME}/${IMAGE_NAME}:${IMAGE_TAG}",
+      "image": "REPLACE_WITH_ECR_IMAGE_URI",
       "essential": true,
       "memory": 256,
       "portMappings": [
