@@ -5,7 +5,7 @@
 # What it does:
 #   1. Builds the Python application Docker image.
 #   2. Logs in to Docker Hub and PUSHES the image (no AWS ECR needed).
-#   3. Injects the Docker Hub image URI into deployment/Dockerrun.aws.json.
+#   3. Injects the Docker Hub image URI into the root Dockerrun.aws.json (v2).
 #   4. Packages the source bundle and deploys it to an Elastic Beanstalk
 #      Multi-container Docker environment.
 #
@@ -25,17 +25,17 @@ APP_NAME="${APP_NAME:-sentinelops-lite}"
 ENV_NAME="${ENV_NAME:-sentinelops-lite-prod}"
 AWS_REGION="${AWS_REGION:-us-east-1}"
 IMAGE_NAME="${IMAGE_NAME:-sentinelops-lite}"
-IMAGE_TAG="${IMAGE_TAG:-latest}"
+IMAGE_TAG="${IMAGE_TAG:-${GITHUB_RUN_NUMBER:-latest}}"
 DOCKERHUB_USERNAME="${DOCKERHUB_USERNAME:?Set DOCKERHUB_USERNAME}"
 DOCKERHUB_TOKEN="${DOCKERHUB_TOKEN:?Set DOCKERHUB_TOKEN}"
 PLATFORM="${PLATFORM:-}"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-# The ECS ("running ECS") platform uses a docker-compose.yml at the repo root
-# (Dockerrun.aws.json v3 is just a marker file). deploy.sh injects the built
-# image URI into the compose file. Both files MUST sit at the repo root so
-# `eb deploy` packages them at the bundle root.
-COMPOSE_FILE="${ROOT_DIR}/docker-compose.yml"
+# The ECS ("running ECS") platform uses a Dockerrun.aws.json v2 (ECS task
+# definition) at the repo root. deploy.sh injects the built image URI into the
+# app container's image field. The file MUST sit at the repo root so `eb deploy`
+# packages it at the bundle root. (docker-compose.yml is kept for local dev only.)
+DOCKERRUN_FILE="${ROOT_DIR}/Dockerrun.aws.json"
 
 DOCKERHUB_IMAGE="${DOCKERHUB_USERNAME}/${IMAGE_NAME}:${IMAGE_TAG}"
 
@@ -48,11 +48,11 @@ echo "${DOCKERHUB_TOKEN}" | docker login -u "${DOCKERHUB_USERNAME}" --password-s
 echo "==> Pushing image -> ${DOCKERHUB_IMAGE}"
 docker push "${DOCKERHUB_IMAGE}"
 
-echo "==> Injecting Docker Hub image URI into docker-compose.yml"
+echo "==> Injecting Docker Hub image URI into Dockerrun.aws.json (v2)"
 if [[ "$OSTYPE" == "darwin"* ]]; then
-  sed -i '' "s|REPLACE_WITH_ECR_IMAGE_URI|${DOCKERHUB_IMAGE}|g" "${COMPOSE_FILE}"
+  sed -i '' "s|REPLACE_WITH_ECR_IMAGE_URI|${DOCKERHUB_IMAGE}|g" "${DOCKERRUN_FILE}"
 else
-  sed -i "s|REPLACE_WITH_ECR_IMAGE_URI|${DOCKERHUB_IMAGE}|g" "${COMPOSE_FILE}"
+  sed -i "s|REPLACE_WITH_ECR_IMAGE_URI|${DOCKERHUB_IMAGE}|g" "${DOCKERRUN_FILE}"
 fi
 
 # `eb deploy` packages the current (repo) directory itself, so no manual
