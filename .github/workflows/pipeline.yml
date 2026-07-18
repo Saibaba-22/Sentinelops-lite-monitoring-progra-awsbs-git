@@ -27,6 +27,8 @@ env:
   DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
   AWS_REGION: ${{ vars.AWS_REGION }}
   PYTHON_VERSION: ${{ vars.PYTHON_VERSION }}
+  REPOSITORY: ${{ github.repository }}
+  GITHUB_SHA: ${{ github.sha }}
 
 jobs:
   # --------------------------------------------------------------------------
