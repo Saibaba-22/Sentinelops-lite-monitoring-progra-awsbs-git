@@ -74,6 +74,22 @@ echo "Replacing image placeholder..."
 sed -i "s|REPLACE_WITH_ECR_IMAGE_URI|${DOCKERHUB_IMAGE}|g" "${DOCKERRUN_FILE}"
 sed -i "s|REPLACE_WITH_ECR_IMAGE_URI|${DOCKERHUB_IMAGE}|g" "${COMPOSE_FILE}" || true
 
+echo "========== VERIFY IMAGE =========="
+
+cat Dockerrun.aws.json
+
+echo
+
+grep "REPLACE_WITH_ECR_IMAGE_URI" Dockerrun.aws.json && {
+    echo "ERROR: Placeholder still exists!"
+    exit 1
+}
+
+echo "Placeholder replaced successfully."
+
+echo
+
+grep '"image"' Dockerrun.aws.json
 echo "========== Dockerrun =========="
 cat "${DOCKERRUN_FILE}"
 
@@ -215,26 +231,6 @@ echo
 echo "===== Search Placeholder ====="
 grep -R "REPLACE_WITH_ECR_IMAGE_URI" . || true
 
-echo
-echo "===== ZIP CONTENT ====="
-zip -r deploy.zip . -x ".git/*"
-
-unzip -l deploy.zip | grep -E "Dockerrun|docker-compose"
-
-echo
-echo "===== Dockerrun inside ZIP ====="
-unzip -p deploy.zip Dockerrun.aws.json
-
-echo
-echo "===== docker-compose inside ZIP ====="
-unzip -p deploy.zip docker-compose.yml
-
-echo
-echo "===== docker/docker-compose inside ZIP ====="
-unzip -p deploy.zip docker/docker-compose.yml || true
-
-envsubst < docker-compose.yml > docker-compose.generated.yml
-mv docker-compose.generated.yml docker-compose.yml
 echo "========== FINAL DOCKERRUN =========="
 cat Dockerrun.aws.json
 
@@ -248,12 +244,6 @@ grep '"image"' Dockerrun.aws.json
 
 echo "===== FINAL DOCKERRUN BEFORE DEPLOY ====="
 cat Dockerrun.aws.json
-
-echo "===== CREATING ZIP ====="
-zip -r deploy.zip . -x ".git/*"
-
-echo "===== DOCKERRUN INSIDE ZIP ====="
-unzip -p deploy.zip Dockerrun.aws.json
 
 echo "========== CURRENT DIRECTORY =========="
 pwd
