@@ -127,6 +127,15 @@ ls -la
 
 echo "===== App image in Dockerrun ====="
 grep '"image"' Dockerrun.aws.json
+
+echo "Current directory:"
+pwd
+
+echo "Files:"
+ls -la
+
+echo "Dockerrun:"
+cat Dockerrun.aws.json
 eb deploy "${ENV_NAME}" --label "build-$(date +%Y%m%d-%H%M%S)"
 
 echo "==> Done."
