@@ -24,7 +24,7 @@ set -euo pipefail
 APP_NAME="${APP_NAME:-sentinelops-lite}"
 ENV_NAME="${ENV_NAME:-sentinelops-lite-prod}"
 AWS_REGION="${AWS_REGION:-us-east-1}"
-IMAGE_NAME="${DOCKERHUB_REPOSITORY:?Set DOCKERHUB_REPOSITORY}"
+IMAGE_NAME="${REPOSITORY:?Set REPOSITORY}"
 IMAGE_TAG="${GITHUB_SHA:-latest}"
 IMAGE_TAG="${IMAGE_TAG:0:7}"
 DOCKERHUB_USERNAME="${DOCKERHUB_USERNAME:?Set DOCKERHUB_USERNAME}"
@@ -71,7 +71,54 @@ echo "==> Updating deployment files"
 
 echo "Replacing image placeholder..."
 
-sed -i "s|REPLACE_WITH_ECR_IMAGE_URI|${DOCKERHUB_IMAGE}|g" "${DOCKERRUN_FILE}"
+cat > Dockerrun.aws.json <<EOF
+{
+  "AWSEBDockerrunVersion":"2",
+  "containerDefinitions":[
+    {
+      "name":"nginx",
+      "image":"nginx:1.27-alpine",
+      "essential":true,
+      "memory":128,
+      "portMappings":[
+        {
+          "hostPort":80,
+          "containerPort":80
+        }
+      ],
+      "links":["app"]
+    },
+    {
+      "name":"app",
+      "image":"${DOCKERHUB_IMAGE}",
+      "essential":true,
+      "memory":256,
+      "portMappings":[
+        {
+          "hostPort":5000,
+          "containerPort":5000
+        }
+      ]
+    }
+  ]
+}
+EOF
+
+cp "${ROOT_DIR}/Dockerrun.aws.json" "${ROOT_DIR}/Dockerrun.aws.json.bak"
+
+sed -i \
+"s|REPLACE_WITH_ECR_IMAGE_URI|${DOCKERHUB_IMAGE}|g" \
+"${DOCKERRUN_FILE}"
+
+echo
+echo "===== Dockerrun after replacement ====="
+cat "${DOCKERRUN_FILE}"
+
+if grep -q "REPLACE_WITH_ECR_IMAGE_URI" "${DOCKERRUN_FILE}"
+then
+    echo "Placeholder still exists."
+    exit 1
+fi
 sed -i "s|REPLACE_WITH_ECR_IMAGE_URI|${DOCKERHUB_IMAGE}|g" "${COMPOSE_FILE}" || true
 
 echo "========== VERIFY IMAGE =========="
@@ -86,8 +133,6 @@ grep "REPLACE_WITH_ECR_IMAGE_URI" Dockerrun.aws.json && {
 }
 
 echo "Placeholder replaced successfully."
-
-echo
 
 grep '"image"' Dockerrun.aws.json
 echo "========== Dockerrun =========="

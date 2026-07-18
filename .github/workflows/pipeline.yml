@@ -28,7 +28,7 @@ env:
   DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
   DOCKERHUB_REPOSITORY: ${{ vars.DOCKERHUB_REPOSITORY }}
   PYTHON_VERSION: ${{ vars.PYTHON_VERSION }}
-  REPOSITORY: ${{ github.repository }}
+  REPOSITORY: ${{ vars.REPOSITORY }}
   GITHUB_SHA: ${{ github.sha }}
 
 jobs:

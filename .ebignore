@@ -1,0 +1,7 @@
+.git
+.github
+deploy.zip
+*.log
+__pycache__
+*.pyc
+docs
