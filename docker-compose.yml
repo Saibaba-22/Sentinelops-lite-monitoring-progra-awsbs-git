@@ -22,7 +22,7 @@ services:
     # http://app:5000). `links` is legacy v2 syntax and is ignored/rejected here.
 
   app:
-    image: replace_with_ecr_image_url
+    image: ${DOCKERHUB_USERNAME}/${IMAGE_NAME}:${IMAGE_TAG}
     ports:
       - "5000:5000"
     environment:

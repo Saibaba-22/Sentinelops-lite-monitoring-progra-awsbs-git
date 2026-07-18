@@ -31,6 +31,9 @@ DOCKERHUB_USERNAME="${DOCKERHUB_USERNAME:?Set DOCKERHUB_USERNAME}"
 DOCKERHUB_TOKEN="${DOCKERHUB_TOKEN:?Set DOCKERHUB_TOKEN}"
 PLATFORM="${PLATFORM:-}"
 
+export DOCKERHUB_USERNAME
+export IMAGE_NAME
+export IMAGE_TAG
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # The ECS ("running ECS") platform uses a Dockerrun.aws.json v2 (ECS task
 # definition) at the repo root. deploy.sh injects the built image URI into the
@@ -204,6 +207,9 @@ unzip -p deploy.zip docker-compose.yml
 echo
 echo "===== docker/docker-compose inside ZIP ====="
 unzip -p deploy.zip docker/docker-compose.yml || true
+
+envsubst < docker-compose.yml > docker-compose.generated.yml
+mv docker-compose.generated.yml docker-compose.yml
 eb deploy "${ENV_NAME}" --label "build-$(date +%Y%m%d-%H%M%S)"
 
 echo "==> Done."
