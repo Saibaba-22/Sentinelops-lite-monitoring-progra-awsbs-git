@@ -133,6 +133,14 @@ fi
 
 echo "==> Initialising EB CLI in this directory"
 eb init -p "${PLATFORM}" -r "${AWS_REGION}" "${APP_NAME}"
+echo "========== .elasticbeanstalk =========="
+ls -la .elasticbeanstalk
+
+echo "========== config.yml =========="
+cat .elasticbeanstalk/config.yml
+
+echo "========== Git Ignore =========="
+cat .elasticbeanstalk/.gitignore || true
 
 echo "==> Ensuring environment '${ENV_NAME}' exists"
 if ! eb status "${ENV_NAME}" >/dev/null 2>&1; then
@@ -241,6 +249,15 @@ zip -r deploy.zip . -x ".git/*"
 
 echo "===== DOCKERRUN INSIDE ZIP ====="
 unzip -p deploy.zip Dockerrun.aws.json
+
+echo "========== CURRENT DIRECTORY =========="
+pwd
+
+echo "========== FILES =========="
+find . -maxdepth 2 -type f
+
+echo "========== FINAL DOCKERRUN =========="
+cat Dockerrun.aws.json
 eb deploy "${ENV_NAME}" --label "build-$(date +%Y%m%d-%H%M%S)"
 
 echo "==> Done."
