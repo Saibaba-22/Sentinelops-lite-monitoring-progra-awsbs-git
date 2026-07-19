@@ -1,15 +1,12 @@
 apiVersion: 1
 
 providers:
-  - name: "SentinelOps-Lite"
+  - name: default
     orgId: 1
     folder: ""
     type: file
     disableDeletion: false
-    editable: true
     updateIntervalSeconds: 10
     allowUiUpdates: true
     options:
-      # Dashboards are mounted here by Docker / Elastic Beanstalk
-      # (Dockerrun.aws.json mounts monitoring/grafana/dashboards -> .../dashboards/domain).
       path: /var/lib/grafana/dashboards

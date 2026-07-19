@@ -9,6 +9,9 @@ services:
       - ./docker/nginx:/etc/nginx/conf.d:ro
     depends_on:
       - app
+      - prometheus
+      - grafana
+      - node-exporter
 
   app:
     image: "saibaba22/sentinelops-lite-monitoring-progra-awsbs-git:latest"
@@ -32,9 +35,6 @@ services:
       - ./monitoring/prometheus:/etc/prometheus:ro
     command:
       - --config.file=/etc/prometheus/prometheus.yml
-    depends_on:
-      - app
-      - node-exporter
     mem_limit: 256m
 
   grafana:
@@ -48,8 +48,6 @@ services:
     volumes:
       - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
       - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
-    depends_on:
-      - prometheus
     mem_limit: 256m
 
   node-exporter:
