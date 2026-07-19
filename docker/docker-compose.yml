@@ -7,11 +7,20 @@ services:
       - "80:80"
     volumes:
       - ./docker/nginx:/etc/nginx/conf.d:ro
+    links:
+      - app
+      - prometheus
+      - grafana
+      - node-exporter
     depends_on:
       - app
       - prometheus
       - grafana
       - node-exporter
+    networks:
+      monitoring_net:
+        aliases:
+          - nginx
 
   app:
     image: "saibaba22/sentinelops-lite-monitoring-progra-awsbs-git:latest"
@@ -26,6 +35,10 @@ services:
     volumes:
       - ./logs:/app/logs
     mem_limit: 384m
+    networks:
+      monitoring_net:
+        aliases:
+          - app
 
   prometheus:
     image: prom/prometheus:v2.53.0
@@ -35,7 +48,18 @@ services:
       - ./monitoring/prometheus:/etc/prometheus:ro
     command:
       - --config.file=/etc/prometheus/prometheus.yml
+      - --web.external-url=/prometheus/
+    links:
+      - app
+      - node-exporter
+    depends_on:
+      - app
+      - node-exporter
     mem_limit: 256m
+    networks:
+      monitoring_net:
+        aliases:
+          - prometheus
 
   grafana:
     image: grafana/grafana:11.1.0
@@ -45,10 +69,20 @@ services:
       - GF_SECURITY_ADMIN_USER=admin
       - GF_SECURITY_ADMIN_PASSWORD=admin123
       - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_SERVER_ROOT_URL=%(protocol)s://%(domain)s/grafana/
+      - GF_SERVER_SERVE_FROM_SUB_PATH=true
     volumes:
       - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
       - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    links:
+      - prometheus
+    depends_on:
+      - prometheus
     mem_limit: 256m
+    networks:
+      monitoring_net:
+        aliases:
+          - grafana
 
   node-exporter:
     image: prom/node-exporter:v1.8.0
@@ -62,3 +96,11 @@ services:
       - --path.sysfs=/host/sys
       - --collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc|rootfs)($|/)
     mem_limit: 64m
+    networks:
+      monitoring_net:
+        aliases:
+          - node-exporter
+
+networks:
+  monitoring_net:
+    driver: bridge
