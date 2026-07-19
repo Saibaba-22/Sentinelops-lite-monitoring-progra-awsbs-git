@@ -19,7 +19,7 @@
     },
     {
       "name": "app",
-      "image": "REPLACE_WITH_ECR_IMAGE_URI",
+      "image": "replace_with_ecr_image_uri",
       "essential": true,
       "memory": 256,
       "portMappings": [

@@ -71,55 +71,21 @@ echo "==> Updating deployment files"
 
 echo "Replacing image placeholder..."
 
-cat > Dockerrun.aws.json <<EOF
-{
-  "AWSEBDockerrunVersion":"2",
-  "containerDefinitions":[
-    {
-      "name":"nginx",
-      "image":"nginx:1.27-alpine",
-      "essential":true,
-      "memory":128,
-      "portMappings":[
-        {
-          "hostPort":80,
-          "containerPort":80
-        }
-      ],
-      "links":["app"]
-    },
-    {
-      "name":"app",
-      "image":"${DOCKERHUB_IMAGE}",
-      "essential":true,
-      "memory":256,
-      "portMappings":[
-        {
-          "hostPort":5000,
-          "containerPort":5000
-        }
-      ]
-    }
-  ]
-}
-EOF
-
+sed -i "s|replace_with_ecr_image_uri|${DOCKERHUB_IMAGE}|g" "${DOCKERRUN_FILE}"
 cp "${ROOT_DIR}/Dockerrun.aws.json" "${ROOT_DIR}/Dockerrun.aws.json.bak"
 
-sed -i \
-"s|REPLACE_WITH_ECR_IMAGE_URI|${DOCKERHUB_IMAGE}|g" \
-"${DOCKERRUN_FILE}"
+sed -i "s|replace_with_ecr_image_uri|${DOCKERHUB_IMAGE}|g" "${DOCKERRUN_FILE}"
 
 echo
 echo "===== Dockerrun after replacement ====="
 cat "${DOCKERRUN_FILE}"
 
-if grep -q "REPLACE_WITH_ECR_IMAGE_URI" "${DOCKERRUN_FILE}"
+if grep -q "replace_with_ecr_image_uri" "${DOCKERRUN_FILE}"
 then
     echo "Placeholder still exists."
     exit 1
 fi
-sed -i "s|REPLACE_WITH_ECR_IMAGE_URI|${DOCKERHUB_IMAGE}|g" "${COMPOSE_FILE}" || true
+sed -i "s|replace_with_ecr_image_uri|${DOCKERHUB_IMAGE}|g" "${COMPOSE_FILE}" || true
 
 echo "========== VERIFY IMAGE =========="
 
@@ -127,7 +93,7 @@ cat Dockerrun.aws.json
 
 echo
 
-grep "REPLACE_WITH_ECR_IMAGE_URI" Dockerrun.aws.json && {
+grep "replace_with_ecr_image_uri" Dockerrun.aws.json && {
     echo "ERROR: Placeholder still exists!"
     exit 1
 }
@@ -142,7 +108,7 @@ echo "========== docker-compose =========="
 grep "image:" "${COMPOSE_FILE}"
 
 echo "========== Remaining placeholders =========="
-grep -R "REPLACE_WITH_ECR_IMAGE_URI" . || echo "No placeholders found"
+grep -R "replace_with_ecr_image_uri" . || echo "No placeholders found"
 
 echo "========================================="
 echo "Dockerrun.aws.json after replacement:"
@@ -242,7 +208,7 @@ echo "Dockerrun contents:"
 cat Dockerrun.aws.json
 
 echo "Checking only Dockerrun..."
-grep "REPLACE_WITH_ECR_IMAGE_URI" Dockerrun.aws.json || echo "No placeholder in Dockerrun"
+grep "replace_with_ecr_image_uri" Dockerrun.aws.json || echo "No placeholder in Dockerrun"
 
 echo "===== Repository ====="
 pwd
@@ -251,7 +217,7 @@ echo "===== Dockerrun location ====="
 find . -name "Dockerrun.aws.json"
 
 echo "===== Placeholder search ====="
-grep -R "REPLACE_WITH_ECR_IMAGE_URI" . || true
+grep -R "replace_with_ecr_image_uri" . || true
 
 echo "===== Images inside docker-compose.yml ====="
 grep "image:" docker-compose.yml
@@ -274,14 +240,14 @@ find . -type f | grep -E "Dockerrun|docker-compose"
 
 echo
 echo "===== Search Placeholder ====="
-grep -R "REPLACE_WITH_ECR_IMAGE_URI" . || true
+grep -R "replace_with_ecr_image_uri" . || true
 
 echo "========== FINAL DOCKERRUN =========="
 cat Dockerrun.aws.json
 
 echo
 echo "========== SEARCH PLACEHOLDER =========="
-grep "REPLACE_WITH_ECR_IMAGE_URI" Dockerrun.aws.json && exit 1 || echo "Placeholder removed successfully"
+grep "replace_with_ecr_image_uri" Dockerrun.aws.json && exit 1 || echo "Placeholder removed successfully"
 
 echo
 echo "========== IMAGE =========="
