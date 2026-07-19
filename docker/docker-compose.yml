@@ -9,9 +9,12 @@ services:
       - ./docker/nginx:/etc/nginx/conf.d:ro
     depends_on:
       - app
+      - prometheus
+      - grafana
+      - node-exporter
 
   app:
-    image: "saibaba22/sentinelops-lite-monitoring-progra-awsbs-git:${IMAGE_TAG}"
+    image: "saibaba22/sentinelops-lite-monitoring-progra-awsbs-git:latest"
     expose:
       - "5000"
     environment:
@@ -23,3 +26,44 @@ services:
     volumes:
       - ./logs:/app/logs
     mem_limit: 384m
+
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    expose:
+      - "9090"
+    volumes:
+      - ./monitoring/prometheus:/etc/prometheus:ro
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+    mem_limit: 256m
+    depends_on:
+      - app
+      - node-exporter
+
+  grafana:
+    image: grafana/grafana:11.1.0
+    expose:
+      - "3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin123
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_SERVER_ROOT_URL=%(protocol)s://%(domain)s/grafana/
+      - GF_SERVER_SERVE_FROM_SUB_PATH=true
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    mem_limit: 256m
+
+  node-exporter:
+    image: prom/node-exporter:v1.8.0
+    expose:
+      - "9100"
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+    command:
+      - --path.procfs=/host/proc
+      - --path.sysfs=/host/sys
+      - --collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc|rootfs)($|/)
+    mem_limit: 64m
