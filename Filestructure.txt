@@ -93,3 +93,12 @@ git push -u origin main
 
 # --- Option B: create the repo from the CLI with GitHub CLI (gh) ---
 # gh repo create sentinelops-lite --private --source=. --remote=origin --push
+
+
+
+What	URL
+Your app / index.html	http://agent3.us-east-1.elasticbeanstalk.com/
+Live dashboard	http://agent3.us-east-1.elasticbeanstalk.com/dashboard
+Prometheus	http://agent3.us-east-1.elasticbeanstalk.com/prometheus/
+Grafana (login admin / admin)	http://agent3.us-east-1.elasticbeanstalk.com/grafana/
+node-exporter metrics	http://agent3.us-east-1.elasticbeanstalk.com/node-exporter/
