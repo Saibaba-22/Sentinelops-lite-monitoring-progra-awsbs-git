@@ -7,13 +7,20 @@ services:
       - "80:80"
     volumes:
       - ./docker/nginx:/etc/nginx/conf.d:ro
+    links:
+      - app
+      - prometheus
+      - grafana
+      - node-exporter
     depends_on:
       - app
       - prometheus
       - grafana
       - node-exporter
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+    networks:
+      monitoring_net:
+        aliases:
+          - nginx
 
   app:
     image: "saibaba22/sentinelops-lite-monitoring-progra-awsbs-git:latest"
@@ -28,6 +35,10 @@ services:
     volumes:
       - ./logs:/app/logs
     mem_limit: 384m
+    networks:
+      monitoring_net:
+        aliases:
+          - app
 
   prometheus:
     image: prom/prometheus:v2.53.0
@@ -38,12 +49,17 @@ services:
     command:
       - --config.file=/etc/prometheus/prometheus.yml
       - --web.external-url=/prometheus/
+    links:
+      - app
+      - node-exporter
     depends_on:
       - app
       - node-exporter
     mem_limit: 256m
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+    networks:
+      monitoring_net:
+        aliases:
+          - prometheus
 
   grafana:
     image: grafana/grafana:11.1.0
@@ -58,11 +74,15 @@ services:
     volumes:
       - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
       - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    links:
+      - prometheus
     depends_on:
       - prometheus
     mem_limit: 256m
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+    networks:
+      monitoring_net:
+        aliases:
+          - grafana
 
   node-exporter:
     image: prom/node-exporter:v1.8.0
@@ -76,3 +96,11 @@ services:
       - --path.sysfs=/host/sys
       - --collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc|rootfs)($|/)
     mem_limit: 64m
+    networks:
+      monitoring_net:
+        aliases:
+          - node-exporter
+
+networks:
+  monitoring_net:
+    driver: bridge
