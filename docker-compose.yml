@@ -1,13 +1,3 @@
-# SentinelOps-Lite — multi-container stack for the Elastic Beanstalk
-# "running ECS" (Docker Compose) platform.
-#
-# This file REPLACES the old Dockerrun.aws.json v2. The ECS platform reads
-# docker-compose.yml from the source-bundle root. Relative volume paths
-# (./...) resolve to /var/app/current/ on the EB instance.
-#
-# The app image is built by deployment/deploy.sh and pushed to Docker Hub as
-# <DOCKERHUB_USERNAME>/sentinelops-lite:latest; deploy.sh substitutes the
-# REPLACE_WITH_ECR_IMAGE_URI placeholder below at deploy time.
 version: "2.4"
 
 services:
@@ -17,14 +7,15 @@ services:
       - "80:80"
     volumes:
       - ./docker/nginx:/etc/nginx/conf.d:ro
-    # NOTE: no `links:` — the ECS (running ECS) platform puts all services on a
-    # shared network where they resolve each other by service name (nginx ->
-    # http://app:5000). `links` is legacy v2 syntax and is ignored/rejected here.
+    depends_on:
+      - app
+      - prometheus
+      - grafana
 
   app:
     image: "saibaba22/sentinelops-lite-monitoring-progra-awsbs-git:${IMAGE_TAG}"
-    ports:
-      - "5000:5000"
+    expose:
+      - "5000"
     environment:
       - PORT=5000
       - APP_VERSION=1.0.0
@@ -37,8 +28,8 @@ services:
 
   prometheus:
     image: prom/prometheus:v2.53.0
-    ports:
-      - "9090:9090"
+    expose:
+      - "9090"
     volumes:
       - ./monitoring/prometheus:/etc/prometheus:ro
     command:
@@ -47,25 +38,15 @@ services:
 
   grafana:
     image: grafana/grafana:11.1.0
-    ports:
-      - "3000:3000"
+    expose:
+      - "3000"
     environment:
       - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin123
       - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_SERVER_ROOT_URL=%(protocol)s://%(domain)s/grafana/
+      - GF_SERVER_SERVE_FROM_SUB_PATH=true
     volumes:
       - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
-      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
     mem_limit: 256m
-
-  node-exporter:
-    image: prom/node-exporter:v1.8.0
-    ports:
-      - "9100:9100"
-    volumes:
-      - /proc:/host/proc:ro
-      - /sys:/host/sys:ro
-    command:
-      - --path.procfs=/host/proc
-      - --path.sysfs=/host/sys
-      - --collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc|rootfs)($|/)
-    mem_limit: 64m
