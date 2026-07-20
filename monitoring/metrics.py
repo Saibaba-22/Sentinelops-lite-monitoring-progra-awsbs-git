@@ -316,6 +316,21 @@ def private_ip():
         return "127.0.0.1"
 
 # ---------------------------------------------------------------------------
+# Deployment metrics
+# ---------------------------------------------------------------------------
+deployment_uptime_seconds = Gauge(
+    "deployment_uptime_seconds",
+    "Deployment uptime in seconds.",
+)
+deployment_restart_total = Counter(
+    "deployment_restart_total",
+    "Total number of application/deployment process starts.",
+)
+container_status = Gauge(
+    "container_status",
+    "Container health status. 1 means healthy; 0 means unhealthy.",
+)
+# ---------------------------------------------------------------------------
 # One-time initialisation (runs at import / process start)
 # ---------------------------------------------------------------------------
 def _init():
