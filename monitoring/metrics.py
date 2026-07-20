@@ -290,6 +290,30 @@ def start_metrics_updater(interval: int = 5):
     thread = threading.Thread(target=_metrics_loop, args=(interval,), daemon=True)
     thread.start()
 
+def public_ip():
+    """Best-effort public-IP lookup; never raises."""
+    try:
+        import urllib.request
+
+        with urllib.request.urlopen(
+            "https://api.ipify.org",
+            timeout=2,
+        ) as response:
+            return response.read().decode().strip() or "unknown"
+
+    except Exception:
+        return "unknown"
+
+def private_ip():
+    """Best-effort private-IP lookup; never raises."""
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.connect(("8.8.8.8", 80))
+        ip_address = sock.getsockname()[0]
+        sock.close()
+        return ip_address
+    except Exception:
+        return "127.0.0.1"
 
 # ---------------------------------------------------------------------------
 # One-time initialisation (runs at import / process start)
