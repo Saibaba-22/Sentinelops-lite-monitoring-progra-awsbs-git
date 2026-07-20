@@ -315,6 +315,17 @@ def private_ip():
     except Exception:
         return "127.0.0.1"
 
+def _set_agent_state(active_state: str):
+    """
+    Set exactly one default AI-agent state.
+    This is for the older unlabelled agent_state metric:
+    agent_state{state="idle|running|approved|rejected|failed"}
+    """
+    active_state = str(active_state).lower()
+    for state in AGENT_STATES:
+        agent_state.labels(state=state).set(
+            1 if state == active_state else 0
+        )
 # ---------------------------------------------------------------------------
 # One-time initialisation (runs at import / process start)
 # ---------------------------------------------------------------------------
@@ -344,6 +355,5 @@ def _init():
         update_metrics()
     except Exception:
         pass
-
 
 _init()
