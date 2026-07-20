@@ -298,8 +298,8 @@ def _init():
     system_info.info(
         {
             "hostname": socket.gethostname(),
-            "public_ip": _public_ip(),
-            "private_ip": _private_ip(),
+            "public_ip": public_ip(),
+            "private_ip": private_ip(),
             "os": platform.system(),
             "python_version": platform.python_version(),
         }
