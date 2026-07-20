@@ -142,30 +142,29 @@ REASON: <one sentence>
 --- PROJECT SOURCES ---
 {src_block}
 """
-            api_started_at = time.perf_counter()
-verdict, prompt_tokens, completion_tokens = ask(prompt)
-api_duration = time.perf_counter() - api_started_at
-            print("----- test_agent.py -----")
-            print(verdict)
-            print("-------------------------")
-
-            status, failfile = "FAIL", "<unknown>"
-            for line in verdict.splitlines():
-                s = line.strip()
-                if s.upper().startswith("STATUS:"):
-                    status = s.split(":", 1)[1].strip().upper()
-                elif s.upper().startswith("FILE:"):
-                    failfile = s.split(":", 1)[1].strip()
-
-            if status != "PASS":
-                label = failfile if failfile and failfile.upper() != "NONE" else "<unknown>"
-                print(f"test_agent.py failed with {label}")
-                sys.exit(1)
-            print("test_agent.py passed.")
-            sys.exit(0)
-        except Exception as e:
-            # AI worked a moment ago but this call failed; degrade safely.
-            ai_ok, ai_reason = False, f"AI call failed: {e}"
+try:
+    ...
+    api_started_at = time.perf_counter()
+    verdict, prompt_tokens, completion_tokens = ask(prompt)
+    api_duration = time.perf_counter() - api_started_at
+    print("----- test_agent.py -----")
+    print(verdict)
+    print("-------------------------")
+    status, failfile = "FAIL", "<unknown>"
+    for line in verdict.splitlines():
+        s = line.strip()
+        if s.upper().startswith("STATUS:"):
+            status = s.split(":", 1)[1].strip().upper()
+        elif s.upper().startswith("FILE:"):
+            failfile = s.split(":", 1)[1].strip()
+    if status != "PASS":
+        label = failfile if failfile and failfile.upper() != "NONE" else "<unknown>"
+        print(f"test_agent.py failed with {label}")
+        sys.exit(1)
+    print("test_agent.py passed.")
+    sys.exit(0)
+except Exception as e:
+    ai_ok, ai_reason = False, f"AI call failed: {e}"
 
     # Degraded (no AI): trust the raw test exit code.
     if code == 0:
@@ -219,8 +218,6 @@ send_agent_status(
     api_response_time_seconds=api_duration,
 )
 sys.exit(1)
-
-
 
 if __name__ == "__main__":
     main()
