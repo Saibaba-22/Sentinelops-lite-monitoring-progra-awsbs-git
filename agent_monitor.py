@@ -36,9 +36,6 @@ from monitoring.metrics import (
     agent_tasks_total,
     agent_token_usage_total,
     agent_api_calls_total,
-    agent_total_decisions,
-    agent_current_task,
-    agent_last_task,
     AGENT_STATES,
     APP_STATS,
     generate_latest,
@@ -64,7 +61,6 @@ from monitoring.metrics import (
 
 from monitoring import collectors
 from monitoring import agent_state as agent_state_store
-
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 application = Flask(
@@ -74,7 +70,6 @@ application = Flask(
 
 application.config["ACTIVE_SESSIONS"] = 0
 application.config["ACTIVE_USERS"] = 0
-
 
 # ---------------------------------------------------------------------------
 # Request instrumentation (feeds both Prometheus metrics and APP_STATS)
