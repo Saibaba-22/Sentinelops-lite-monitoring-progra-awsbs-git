@@ -60,9 +60,8 @@ def ai_status():
 
 def ask(prompt):
     """Ask the AI and return (text, token_count)."""
-        prompt_tokens = 0
-        completion_tokens = 0
-
+    prompt_tokens = 0
+    completion_tokens = 0
     try:
         usage = resp.usage_metadata
         prompt_tokens = usage.prompt_token_count or 0
