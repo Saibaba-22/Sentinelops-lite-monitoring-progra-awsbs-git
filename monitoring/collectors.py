@@ -78,18 +78,8 @@ def _application_snapshot():
 
 def _agent_snapshot():
     state = agent_state_store.load()
-    return {
-        "status": state.get("status", "Idle"),
-        "model": state.get("model"),
-        "tokens": state.get("tokens", 0),
-        "requests": state.get("requests", 0),
-        "api_keys": state.get("api_keys", 0),
-        "last_run": state.get("last_run"),
-        "current_task": state.get("current_task"),
-        "last_task": state.get("last_task"),
-        "queue_size": state.get("queue_size", 0),
-        "accuracy": state.get("accuracy"),
-    }
+    return state.get("agents", {})
+
 
 
 def _deployment_snapshot():

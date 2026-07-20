@@ -1,0 +1,218 @@
+# =============================================================================
+# azure App service pipeline.yml — SentinelOps-Lite CI/CD pipeline (GitHub Actions)
+# Place at .github/workflows/pipeline.yml
+#
+# ALL values are read from GitHub Settings:
+#   Variables (Settings -> Secrets and variables -> Actions -> Variables):
+#     APP_NAME, ENV_NAME, DOCKERHUB_USERNAME, AWS_REGION, PYTHON_VERSION
+#   Secrets (same page -> Secrets):
+#     AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, DOCKERHUB_TOKEN, GEMINI_API_KEY
+#
+# Registry: Docker Hub. The image is pushed to
+#   docker.io/<DOCKERHUB_USERNAME>/sentinelops-lite:latest
+# and Dockerrun.aws.json references it. The Beanstalk URL is auto-discovered.
+# Nothing is hard-coded here.  
+# Variables and Secrets provide at last which need to be provided
+# =============================================================================
+name: SentinelOps-Lite Pipeline (Azure App Service)
+
+on:
+#  push:                # Use only when single pipeline and for azure
+#    branches: [main]
+  workflow_dispatch: {}
+
+env:
+# Azure Cloud
+  AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }} # Azure RG
+  AZURE_WEBAPP_NAME: ${{ vars.AZURE_WEBAPP_NAME }}       # Azure App service name
+  APP_HEALTH_PATH: ${{ vars.APP_HEALTH_PATH }}
+
+# Docker Hub
+  DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}  
+  DOCKERHUB_REPOSITORY: ${{ vars.DOCKERHUB_REPOSITORY }}
+  REPOSITORY: ${{ vars.REPOSITORY }}
+
+# Other
+  PYTHON_VERSION: ${{ vars.PYTHON_VERSION }}
+  GITHUB_SHA: ${{ github.sha }}
+
+jobs:
+  review:
+    name: Pre-deploy review
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Run review agent
+        run: |
+          if [ -f review_agent.py ]; then
+            python review_agent.py
+          else
+            echo "review_agent.py not found, skipping." > review_report.txt
+          fi
+
+      - name: Upload review report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: review-report
+          path: review_report.txt
+
+  deploy:
+    name: Build, push, deploy to Azure App Service
+    needs: review
+    runs-on: ubuntu-latest
+
+    outputs:
+      app_url: ${{ steps.get-url.outputs.app_url }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Docker Hub login
+        run: echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u "${{ env.DOCKERHUB_USERNAME }}" --password-stdin
+
+      - name: Build Docker image
+        run: |
+          docker build \
+            -t docker.io/${{ env.DOCKERHUB_USERNAME }}/${{ env.DOCKERHUB_REPOSITORY }}:${{ github.sha }} \
+            -t docker.io/${{ env.DOCKERHUB_USERNAME }}/${{ env.DOCKERHUB_REPOSITORY }}:latest \
+            .
+
+      - name: Push Docker image
+        run: |
+          docker push docker.io/${{ env.DOCKERHUB_USERNAME }}/${{ env.DOCKERHUB_REPOSITORY }}:${{ github.sha }}
+          docker push docker.io/${{ env.DOCKERHUB_USERNAME }}/${{ env.DOCKERHUB_REPOSITORY }}:latest
+
+      - name: Configure Azure Web App container
+        run: |
+          az webapp config container set \
+            --name "${{ env.AZURE_WEBAPP_NAME }}" \
+            --resource-group "${{ env.AZURE_RESOURCE_GROUP }}" \
+            --container-image-name "docker.io/${{ env.DOCKERHUB_USERNAME }}/${{ env.DOCKERHUB_REPOSITORY }}:${{ github.sha }}" \
+            --container-registry-url "https://index.docker.io" \
+            --container-registry-user "${{ env.DOCKERHUB_USERNAME }}" \
+            --container-registry-password "${{ secrets.DOCKERHUB_TOKEN }}"
+
+      - name: Restart Azure Web App
+        run: |
+          az webapp restart \
+            --name "${{ env.AZURE_WEBAPP_NAME }}" \
+            --resource-group "${{ env.AZURE_RESOURCE_GROUP }}"
+
+      - name: Get App URL
+        id: get-url
+        run: |
+          HOSTNAME=$(az webapp show \
+            --name "${{ env.AZURE_WEBAPP_NAME }}" \
+            --resource-group "${{ env.AZURE_RESOURCE_GROUP }}" \
+            --query defaultHostName -o tsv)
+          echo "app_url=https://$HOSTNAME" >> "$GITHUB_OUTPUT"
+          echo "Resolved app URL: https://$HOSTNAME"
+
+  verify:
+    name: Post-deploy verification
+    needs: deploy
+    runs-on: ubuntu-latest
+
+    env:
+      APP_URL: ${{ needs.deploy.outputs.app_url }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Install verification dependencies
+        run: |
+          pip install requests
+
+      - name: Wait for app to become ready
+        shell: bash
+        run: |
+          URL="${APP_URL}${{ env.APP_HEALTH_PATH }}"
+          if [ -z "${{ env.APP_HEALTH_PATH }}" ]; then
+            URL="${APP_URL}/"
+          fi
+
+          echo "Checking: $URL"
+
+          for i in {1..30}; do
+            STATUS=$(curl -k -s -o /dev/null -w "%{http_code}" "$URL" || true)
+            echo "Attempt $i -> HTTP $STATUS"
+            if [ "$STATUS" = "200" ] || [ "$STATUS" = "302" ]; then
+              exit 0
+            fi
+            sleep 10
+          done
+
+          echo "Application did not become ready in time."
+          exit 1
+
+      - name: Run final verification agent
+        env:
+          APP_URL: ${{ env.APP_URL }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          if [ -f final_agent.py ]; then
+            python final_agent.py
+          else
+            echo "APP_URL=${APP_URL}" > final_review.txt
+            echo "final_agent.py not found, basic verification only." >> final_review.txt
+          fi
+
+      - name: Upload final review
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: final-review
+          path: final_review.txt
+
+
+#==========Variables================
+#AZURE_WEBAPP_NAME
+#AZURE_RESOURCE_GROUP
+#DOCKERHUB_USERNAME
+#DOCKERHUB_REPOSITORY
+#PYTHON_VERSION
+#APP_HEALTH_PATH
+#
+# Secrets
+#AZURE_CREDENTIALS
+#DOCKERHUB_TOKEN
+#GEMINI_API_KEY
+#=====================================

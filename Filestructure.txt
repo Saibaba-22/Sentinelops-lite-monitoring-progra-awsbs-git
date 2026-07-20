@@ -102,3 +102,107 @@ Live dashboard	http://agent3.us-east-1.elasticbeanstalk.com/dashboard
 Prometheus	http://agent3.us-east-1.elasticbeanstalk.com/prometheus/
 Grafana (login admin / admin)	http://agent3.us-east-1.elasticbeanstalk.com/grafana/
 node-exporter metrics	http://agent3.us-east-1.elasticbeanstalk.com/node-exporter/
+
+
+
+
+D:\11>tree /F
+Folder PATH listing for volume Local Disk
+Volume serial number is 000000A1 920E:6D3C
+D:.
+│   .dockerignore
+│   .ebignore
+│   .env.example
+│   .gitignore
+│   agent.py
+│   agent_monitor.py
+│   app.py
+│   docker-compose.yml
+│   Dockerrun.aws.json
+│   error.docx
+│   Filestructure.txt
+│   final_agent.py
+│   requirements.txt
+│   review_agent.py
+│   Sentinelops-AI-Progra.rar
+│   test_app.py
+│
+├───.ebextensions
+│       01-nginx.config
+│       02-logging.config
+│
+├───.github
+│   └───workflows
+│           awsbs.yml
+│           azappser.yml
+│           pipeline.yml
+│
+├───.platform
+│   └───hooks
+│       └───predeploy
+│               10-inject-private-ip.sh
+│
+├───agent
+│       errors.py
+│       final_agent.py
+│       single_agent.py
+│       test_agent.py
+│
+├───deployment
+│       deploy.sh
+│       Procfile
+│
+├───docker
+│   │   docker-compose.yml
+│   │   Dockerfile
+│   │
+│   └───nginx
+│           nginx.conf
+│
+├───docs
+│       architecture.svg
+│       DEPLOYMENT.md
+│       monitoring-flow.svg
+│       README.md
+│       TROUBLESHOOTING.md
+│
+├───logs
+├───monitoring
+│   │   agent_state.py
+│   │   collectors.py
+│   │   metrics.py
+│   │   __init__.py
+│   │
+│   ├───exporters
+│   │   └───node-exporter
+│   ├───grafana
+│   │   ├───dashboards
+│   │   │       ai-agent-dashboard.json
+│   │   │       application-dashboard.json
+│   │   │       deployment-dashboard.json
+│   │   │       system-dashboard.json
+│   │   │
+│   │   └───provisioning
+│   │       ├───dashboards
+│   │       │       dashboard.yml
+│   │       │       dashboards.json
+│   │       │
+│   │       └───datasources
+│   │               datasource.yml
+│   │
+│   └───prometheus
+│           alert.rules.yml
+│           prometheus.yml
+│           recording.rules.yml
+│
+├───static
+│   ├───css
+│   │       dashboard.css
+│   │
+│   ├───images
+│   └───js
+│           dashboard.js
+│
+└───templates
+        dashboard.html
+        index.html

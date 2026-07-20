@@ -14,17 +14,47 @@ STATS_FILE = os.path.join(BASE_DIR, "logs", "agent_stats.json")
 _LOCK = threading.Lock()
 
 DEFAULT_STATE = {
-    "status": "Idle",
-    "tokens": 0,
-    "requests": 0,
-    "api_keys": 0,
-    "model": "gemini-2.5-flash",
-    "last_run": None,
-    "api_key_name": "GEMINI_API_KEY",
-    "current_task": None,
-    "last_task": None,
-    "queue_size": 0,
-    "accuracy": None,
+    "agents": {
+        "test_agent": {
+            "status": "idle",
+            "decision": "none",
+            "model": "gemini-2.5-flash",
+            "provider": "gemini",
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "requests": 0,
+            "api_key_count": 0,
+            "last_run": None,
+            "execution_time_seconds": 0,
+        },
+        "errors_agent": {
+            "status": "idle",
+            "decision": "none",
+            "model": "gemini-2.5-flash",
+            "provider": "gemini",
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "requests": 0,
+            "api_key_count": 0,
+            "last_run": None,
+            "execution_time_seconds": 0,
+        },
+        "final_agent": {
+            "status": "idle",
+            "decision": "none",
+            "model": "gemini-2.5-flash",
+            "provider": "gemini",
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "requests": 0,
+            "api_key_count": 0,
+            "last_run": None,
+            "execution_time_seconds": 0,
+        },
+    }
 }
 
 

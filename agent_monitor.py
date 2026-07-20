@@ -45,7 +45,23 @@ from monitoring.metrics import (
     CONTENT_TYPE_LATEST,
     start_metrics_updater,
     update_metrics,
+    agent_state,
+    agent_last_decision,
+    agent_model_info,
+    agent_prompt_tokens_total,
+    agent_completion_tokens_total,
+    agent_token_usage_total,
+    agent_api_calls_total,
+    agent_tasks_total,
+    agent_api_key_count,
+    agent_last_run_timestamp_seconds,
+    agent_execution_time_seconds,
+    agent_execution_duration_seconds,
+    agent_api_response_time_seconds,
+    AGENT_STATES,
+    AGENT_DECISIONS,
 )
+
 from monitoring import collectors
 from monitoring import agent_state as agent_state_store
 
@@ -135,43 +151,151 @@ def agent_status():
 
 @application.route("/monitor/status", methods=["POST"])
 def monitor_status():
-    """Receiver for the ``agent.py`` CI release-gate.
-
-    Expected JSON payload (see agent.py):
-        {status, tokens, requests, api_keys, model, last_run, api_key_name}
     """
+    Receives monitoring events from CI AI agents.
+
+    Required:
+      agent_name, stage, status
+
+    Optional:
+      cloud, provider, model,
+      prompt_tokens, completion_tokens, total_tokens,
+      requests, api_key_count,
+      execution_time_seconds, api_response_time_seconds,
+      decision, error
+    """
+
+    # Recommended: protect this endpoint with a secret.
+    expected_token = os.getenv("MONITOR_TOKEN")
+    if expected_token and request.headers.get("X-Monitor-Token") != expected_token:
+        return jsonify(error="unauthorized"), 401
+
     data = request.get_json(silent=True) or {}
-    status = str(data.get("status", "Unknown"))
-    tokens = int(data.get("tokens", 0) or 0)
-    reqs = int(data.get("requests", 1) or 1)
 
-    # Update the agent state gauge (exactly one state active).
-    active = status.lower()
-    for name in AGENT_STATES:
-        agent_state.labels(state=name).set(1 if name == active else 0)
+    agent_name = str(data.get("agent_name", "unknown")).strip().lower()
+    stage = str(data.get("stage", "unknown")).strip().lower()
+    cloud = str(data.get("cloud", "unknown")).strip().lower()
 
-    if active == "approved":
-        agent_tasks_total.labels(result="approved").inc()
-    elif active == "rejected":
-        agent_tasks_total.labels(result="rejected").inc()
-    elif active == "failed":
-        agent_tasks_total.labels(result="failed").inc()
+    provider = str(data.get("provider", "gemini")).strip().lower()
+    model = str(data.get("model", "unknown")).strip()
 
-    # Approved / Healthy -> successful API call, otherwise a failed call.
-    call_status = "success" if active in ("approved", "healthy") else "failed"
-    agent_api_calls_total.labels(status=call_status).inc(reqs)
-    agent_token_usage_total.inc(tokens)
-    agent_total_decisions.inc()
+    # status: idle / running / approved / rejected / failed / healthy
+    status = str(data.get("status", "idle")).strip().lower()
+    if status not in AGENT_STATES:
+        status = "failed"
 
-    # Persist the broadcast so dashboards can render it without Prometheus.
+    # Decision is intentionally separate from state.
+    decision = str(data.get("decision", status)).strip().lower()
+    if decision not in AGENT_DECISIONS:
+        decision = "none"
+
+    prompt_tokens = max(0, int(data.get("prompt_tokens", 0) or 0))
+    completion_tokens = max(0, int(data.get("completion_tokens", 0) or 0))
+    total_tokens = max(
+        0,
+        int(data.get("total_tokens", prompt_tokens + completion_tokens) or 0),
+    )
+
+    api_requests = max(0, int(data.get("requests", 0) or 0))
+    api_key_count = max(0, int(data.get("api_key_count", 1) or 0))
+
+    execution_time = max(0.0, float(data.get("execution_time_seconds", 0) or 0))
+    api_response_time = max(
+        0.0,
+        float(data.get("api_response_time_seconds", 0) or 0),
+    )
+
+    labels = {
+        "agent_name": agent_name,
+        "stage": stage,
+        "cloud": cloud,
+    }
+
+    # Set exactly one state and one last decision for this agent.
+    for item in AGENT_STATES:
+        agent_state.labels(**labels, state=item).set(1 if item == status else 0)
+
+    for item in AGENT_DECISIONS:
+        agent_last_decision.labels(**labels, decision=item).set(
+            1 if item == decision else 0
+        )
+
+    # Provider/model metadata. Do not send secrets as labels.
+    agent_model_info.labels(**labels).info({
+        "provider": provider,
+        "model": model,
+    })
+
+    agent_api_key_count.labels(**labels, provider=provider).set(api_key_count)
+    agent_last_run_timestamp_seconds.labels(**labels).set(time.time())
+
+    # Only increment counters for actual completed AI calls.
+    if api_requests:
+        api_status = "success" if status not in ("failed",) else "failed"
+        agent_api_calls_total.labels(
+            **labels,
+            provider=provider,
+            model=model,
+            status=api_status,
+        ).inc(api_requests)
+
+    if prompt_tokens:
+        agent_prompt_tokens_total.labels(
+            **labels, provider=provider, model=model
+        ).inc(prompt_tokens)
+
+    if completion_tokens:
+        agent_completion_tokens_total.labels(
+            **labels, provider=provider, model=model
+        ).inc(completion_tokens)
+
+    if total_tokens:
+        agent_token_usage_total.labels(
+            **labels, provider=provider, model=model
+        ).inc(total_tokens)
+
+    # Do not increment execution/task counters for a "running" status update.
+    if status not in ("idle", "running"):
+        result = (
+            "approved" if status in ("approved", "healthy")
+            else "rejected" if status == "rejected"
+            else "failed"
+        )
+        agent_tasks_total.labels(**labels, result=result).inc()
+
+        agent_execution_time_seconds.labels(**labels).set(execution_time)
+        agent_execution_duration_seconds.labels(**labels).observe(execution_time)
+
+        if api_response_time:
+            agent_api_response_time_seconds.labels(
+                **labels,
+                provider=provider,
+                model=model,
+            ).observe(api_response_time)
+
+    # Persist latest state for dashboard/API.
     stored = agent_state_store.load()
-    for key in ("status", "tokens", "requests", "api_keys", "model", "last_run", "api_key_name"):
-        if key in data:
-            stored[key] = data[key]
+    stored.setdefault("agents", {})
+    stored["agents"][agent_name] = {
+        "agent_name": agent_name,
+        "stage": stage,
+        "cloud": cloud,
+        "status": status,
+        "decision": decision,
+        "provider": provider,
+        "model": model,
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens,
+        "requests": api_requests,
+        "api_key_count": api_key_count,
+        "execution_time_seconds": execution_time,
+        "api_response_time_seconds": api_response_time,
+        "last_run": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
     agent_state_store.save(stored)
 
-    return jsonify(ok=True)
-
+    return jsonify(ok=True, agent=agent_name, status=status)
 
 @application.route("/dashboard")
 def dashboard():
