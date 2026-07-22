@@ -124,23 +124,24 @@ jobs:
       - name: Log in to Docker Hub
         run: echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u "${{ env.DOCKERHUB_USERNAME }}" --password-stdin
 
-      - name: Build Docker image
+      # FIX: Build and Push Docker image using Buildx with provenance=false and correct platform targeting.
+      # This outputs a standard single-image manifest format, preventing the "unsupported manifest format" error on AWS Elastic Beanstalk.
+      - name: Build and Push Docker image
         run: |
-          docker build \
+          docker buildx build \
+            --platform linux/amd64 \
+            --provenance=false \
             -f docker/Dockerfile \
             -t docker.io/${{ env.DOCKERHUB_USERNAME }}/${{ env.DOCKERHUB_REPOSITORY }}:${{ github.sha }} \
             -t docker.io/${{ env.DOCKERHUB_USERNAME }}/${{ env.DOCKERHUB_REPOSITORY }}:latest \
+            --push \
             .
-
-      - name: Push Docker image
-        run: |
-          docker push docker.io/${{ env.DOCKERHUB_USERNAME }}/${{ env.DOCKERHUB_REPOSITORY }}:${{ github.sha }}
-          docker push docker.io/${{ env.DOCKERHUB_USERNAME }}/${{ env.DOCKERHUB_REPOSITORY }}:latest
 
       - name: Verify Docker Hub image exists
         run: |
           docker manifest inspect docker.io/${DOCKERHUB_USERNAME}/${DOCKERHUB_REPOSITORY}:latest
           docker pull docker.io/${DOCKERHUB_USERNAME}/${DOCKERHUB_REPOSITORY}:latest
+
       # ---------------- AWS ----------------
       - name: Configure AWS credentials
         if: env.TARGET_CLOUD == 'aws'
