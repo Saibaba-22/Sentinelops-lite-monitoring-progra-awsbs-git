@@ -125,7 +125,6 @@ jobs:
         run: echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u "${{ env.DOCKERHUB_USERNAME }}" --password-stdin
 
       # FIX: Build and Push Docker image using Buildx with provenance=false and correct platform targeting.
-      # This outputs a standard single-image manifest format, preventing the "unsupported manifest format" error on AWS Elastic Beanstalk.
       - name: Build and Push Docker image
         run: |
           docker buildx build \
@@ -156,61 +155,29 @@ jobs:
         run: |
           pip install awsebcli awscli
 
-      - name: Verify Docker Hub image exists
+      # CRITICAL FIX: Force Elastic Beanstalk to deploy using docker-compose.yml (Multi-Container mode)
+      # If Dockerrun.aws.json is present, Elastic Beanstalk boots in "Single Container" mode, ignoring the Nginx reverse proxy, Grafana, and Prometheus entirely.
+      - name: Force Beanstalk to use docker-compose.yml
         if: env.TARGET_CLOUD == 'aws'
         run: |
-          echo "Checking image:"
-          echo "docker.io/${DOCKERHUB_USERNAME}/${DOCKERHUB_REPOSITORY}:latest"
-
-          docker manifest inspect docker.io/${DOCKERHUB_USERNAME}/${DOCKERHUB_REPOSITORY}:latest
-          docker pull docker.io/${DOCKERHUB_USERNAME}/${DOCKERHUB_REPOSITORY}:latest
-
-      - name: Update EB deployment image
-        if: env.TARGET_CLOUD == 'aws'
-        run: |
-          IMAGE="docker.io/${DOCKERHUB_USERNAME}/${DOCKERHUB_REPOSITORY}:latest"
-          echo "Using image: $IMAGE"
-
-          python - <<'PY'
-          import json, os
-
-          image = os.environ["IMAGE"]
-
-          path = "Dockerrun.aws.json"
-          with open(path) as f:
-              data = json.load(f)
-
-          found = False
-          for c in data.get("containerDefinitions", []):
-              if c.get("name") == "app":
-                  c["image"] = image
-                  found = True
-
-          if not found:
-              raise SystemExit("ERROR: app container not found in Dockerrun.aws.json")
-
-          with open(path, "w") as f:
-              json.dump(data, f, indent=2)
-
-          print("Updated Dockerrun.aws.json app image to:", image)
-          PY
-        env:
-          IMAGE: docker.io/${{ env.DOCKERHUB_USERNAME }}/${{ env.DOCKERHUB_REPOSITORY }}:latest
+          if [ -f Dockerrun.aws.json ]; then
+            rm -f Dockerrun.aws.json
+            echo "Removed Dockerrun.aws.json to force Beanstalk to use the Multi-Container docker-compose.yml platform."
+          fi
 
       - name: Debug EB deployment files
         if: env.TARGET_CLOUD == 'aws'
         run: |
-          echo "===== Final Dockerrun.aws.json ====="
-          cat Dockerrun.aws.json
+          echo "===== docker-compose.yml ====="
+          cat docker-compose.yml || true
 
-          echo "===== Image lines ====="
-          grep -n '"image"' Dockerrun.aws.json
+          echo "===== Images ====="
+          grep -n 'image:' docker-compose.yml || true
 
           echo "===== Git status ====="
           git status --short
 
-
-      # ---- FIX: Initialize EB CLI before deploying ----
+      # ---- Initialize EB CLI before deploying ----
       - name: Initialize EB CLI
         if: env.TARGET_CLOUD == 'aws'
         run: |
@@ -219,25 +186,11 @@ jobs:
             --platform "Docker" \
             --no-verify-ssl
 
-      - name: Show deployment files before EB deploy
-        if: env.TARGET_CLOUD == 'aws'
-        run: |
-          echo "===== Dockerrun.aws.json ====="
-          cat Dockerrun.aws.json || true
-
-          echo "===== docker-compose.yml ====="
-          cat docker-compose.yml || true
-
-          echo "===== Images ====="
-          grep -n '"image"' Dockerrun.aws.json || true
-          grep -n 'image:' docker-compose.yml || true
-
       - name: Deploy to AWS Elastic Beanstalk
         id: aws_deploy
         if: env.TARGET_CLOUD == 'aws'
         continue-on-error: true
         run: |
-          # Removed --staged: in CI we deploy the committed code, not uncommitted changes
           eb deploy "${AWS_ENV_NAME}" 
 
       - name: Run deploy-time error agent for AWS
