@@ -141,8 +141,87 @@ def api_status():
 
 @application.route("/agent/status")
 def agent_status():
-    return jsonify(agent_state_store.load())
+    """
+    Return backward-compatible top-level agent status plus all three agents.
 
+    Top-level fields keep existing tests/dashboard clients working.
+    The `agents` field contains detailed per-agent monitoring state.
+    """
+
+    state_data = agent_state_store.load()
+    agents = state_data.get("agents", {})
+
+    # Select the agent with the newest last_run value as the summary agent.
+    latest_agent = {}
+
+    for agent_data in agents.values():
+        if not latest_agent:
+            latest_agent = agent_data
+            continue
+
+        if str(agent_data.get("last_run") or "") > str(
+            latest_agent.get("last_run") or ""
+        ):
+            latest_agent = agent_data
+
+    # Fallback values preserve old /agent/status response behavior.
+    response = {
+        "status": str(
+    latest_agent.get("status", state_data.get("status", "Idle"))
+).capitalize(),
+        "decision": latest_agent.get(
+            "decision",
+            state_data.get("decision", "none"),
+        ),
+        "provider": latest_agent.get(
+            "provider",
+            state_data.get("provider", "gemini"),
+        ),
+        "model": latest_agent.get(
+            "model",
+            state_data.get("model", "gemini-2.5-flash"),
+        ),
+        "prompt_tokens": latest_agent.get(
+            "prompt_tokens",
+            state_data.get("prompt_tokens", 0),
+        ),
+        "completion_tokens": latest_agent.get(
+            "completion_tokens",
+            state_data.get("completion_tokens", 0),
+        ),
+        "total_tokens": latest_agent.get(
+            "total_tokens",
+            state_data.get("total_tokens", 0),
+        ),
+        "tokens": latest_agent.get(
+            "total_tokens",
+            state_data.get("tokens", 0),
+        ),
+        "requests": latest_agent.get(
+            "requests",
+            state_data.get("requests", 0),
+        ),
+        "api_key_count": latest_agent.get(
+            "api_key_count",
+            state_data.get("api_key_count", 0),
+        ),
+        "api_keys": latest_agent.get(
+            "api_key_count",
+            state_data.get("api_keys", 0),
+        ),
+        "last_run": latest_agent.get(
+            "last_run",
+            state_data.get("last_run"),
+        ),
+        "execution_time_seconds": latest_agent.get(
+            "execution_time_seconds",
+            state_data.get("execution_time_seconds", 0),
+        ),
+
+        # New detailed data for all three CI agents.
+        "agents": agents,
+    }
+    return jsonify(response)
 
 @application.route("/monitor/status", methods=["POST"])
 def monitor_status():
@@ -252,7 +331,7 @@ def monitor_status():
     # Do not increment execution/task counters for a "running" status update.
     if status not in ("idle", "running"):
         result = (
-            "approved" if status in ("approved", "healthy")
+            "Approved" if status in ("Approved", "healthy")
             else "rejected" if status == "rejected"
             else "failed"
         )

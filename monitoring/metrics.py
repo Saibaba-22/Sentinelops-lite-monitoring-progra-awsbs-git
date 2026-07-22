@@ -222,6 +222,17 @@ agent_api_response_time_seconds = Histogram(
 )
 
 
+
+def _open_fds(proc):
+    """
+    Return the number of open file descriptors for the current process.
+
+    Windows does not support proc.num_fds(), so return 0 safely there.
+    """
+    try:
+        return proc.num_fds()
+    except Exception:
+        return 0
 # ---------------------------------------------------------------------------
 # Live metric update (called by the background thread)
 # ---------------------------------------------------------------------------
