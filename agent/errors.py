@@ -218,6 +218,47 @@ Detected file/line hints from regex:
 """
     return ask_ai(prompt)
 
+def deterministic_diagnosis(context):
+    text = context.lower()
+
+    if "cannotpullimagemanifesterror" in text or "failed to pull image" in text:
+        return """FILE: Dockerrun.aws.json
+LINE: N/A
+PRESENT_ERROR: Elastic Beanstalk/ECS cannot pull the app Docker image from Docker Hub: CannotPullImageManifestError unauthorized/authentication required.
+EXPECTED_VALUE: Dockerrun.aws.json should reference an existing public Docker Hub image such as docker.io/saibaba22/sentinelops-lite-monitoring-progra-awsbs-git:latest.
+WHY: The image name/tag used by EB is wrong, missing, private, or the deployed Dockerrun.aws.json does not match the image pushed by the pipeline.
+SOLUTION: Print Dockerrun.aws.json before eb deploy, ensure the app image is docker.io/saibaba22/sentinelops-lite-monitoring-progra-awsbs-git:latest, then deploy with git add Dockerrun.aws.json && eb deploy "$AWS_ENV_NAME" --staged.
+"""
+
+    if "replace_with_dockerhub_image_uri" in text or "replace_with_ecr_image_uri" in text:
+        return """FILE: Dockerrun.aws.json
+LINE: N/A
+PRESENT_ERROR: Image placeholder is still present in deployment config.
+EXPECTED_VALUE: Placeholder should be replaced with a real Docker image URI.
+WHY: The pipeline deployed an unreplaced Dockerrun.aws.json/docker-compose.yml.
+SOLUTION: Replace the placeholder before EB deploy and use eb deploy --staged.
+"""
+
+    if "no such image" in text or "manifest unknown" in text:
+        return """FILE: Dockerrun.aws.json
+LINE: N/A
+PRESENT_ERROR: Docker image tag does not exist on Docker Hub.
+EXPECTED_VALUE: The tag referenced by EB must exist on Docker Hub.
+WHY: Pipeline pushed one tag but EB tried to pull another tag.
+SOLUTION: Push the same tag used in Dockerrun.aws.json, or use latest consistently.
+"""
+
+    if "environment variable" in text and "not set" in text:
+        return """FILE: GitHub Actions workflow
+LINE: N/A
+PRESENT_ERROR: Required environment variable is missing.
+EXPECTED_VALUE: Required variable should be passed to the failing step.
+WHY: The job or step environment does not include the variable.
+SOLUTION: Add the variable under the step env block and print it before running the command.
+"""
+
+    return None
+
 def main():
     start = time.perf_counter()
     print(f"[errors.py] UNIVERSAL deploy error diagnoser - cloud={os.getenv('TARGET_CLOUD','unknown')} model={MODEL}")
@@ -313,5 +354,21 @@ ERROR: {e}
             f.write(fallback)
         sys.exit(1)
 
+deterministic = deterministic_diagnosis(context)
+
+if deterministic:
+    print("----- errors.py diagnosis deterministic -----")
+    print(deterministic)
+    print("--------------------------------------------")
+
+    Path("reports").mkdir(exist_ok=True)
+
+    with open("errors_report.txt", "w", encoding="utf-8") as f:
+        f.write(deterministic + "\n\n--- RAW CONTEXT ---\n" + context[-8000:])
+
+    with open("reports/deploy_error_diagnosis.txt", "w", encoding="utf-8") as f:
+        f.write(deterministic)
+
+    sys.exit(1)
 if __name__ == "__main__":
     main()
