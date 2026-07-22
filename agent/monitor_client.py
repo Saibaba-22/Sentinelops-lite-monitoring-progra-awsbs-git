@@ -10,7 +10,7 @@ def send_agent_status(
     status,
     decision="none",
     provider="gemini",
-    model="gemini-2.5-flash",
+    model="gemini-3.1-flash-lite",
     prompt_tokens=0,
     completion_tokens=0,
     total_tokens=0,

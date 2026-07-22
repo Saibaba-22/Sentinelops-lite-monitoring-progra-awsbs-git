@@ -30,7 +30,7 @@ from monitor_client import send_agent_status
 # ---------------------------------------------------------------------------
 
 PROVIDER = os.getenv("AI_PROVIDER", "gemini")
-MODEL = os.getenv("AI_MODEL", "gemini-2.5-flash")
+MODEL = os.getenv("AI_MODEL", "gemini-3.1-flash-lite")
 
 AGENT_NAME = "test_agent"
 STAGE = "pre_deploy"

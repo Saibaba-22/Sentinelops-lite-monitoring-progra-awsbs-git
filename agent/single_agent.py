@@ -34,7 +34,7 @@ Usage:
 # ===== AI CONFIG =========================================================
 # Edit MODEL here if the model is unavailable (e.g. quota / region).
 # Other valid examples: "gemini-2.5-pro", "gemini-1.5-flash".
-MODEL = "gemini-2.5-flash"
+MODEL = "gemini-3.1-flash-lite"
 # The API key is taken from the GEMINI_API_KEY environment variable.
 # ========================================================================
 

@@ -30,8 +30,21 @@ env:
   AZURE_WEBAPP_NAME: ${{ vars.AZURE_WEBAPP_NAME }}
   AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
 
-  MONITOR_API_URL: ${{ secrets.MONITOR_API_URL }}
-  MONITOR_TOKEN: ${{ secrets.MONITOR_TOKEN }}
+- name: Run pre-deploy agent
+  env:
+    GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+    TARGET_CLOUD: ${{ env.TARGET_CLOUD }}
+
+    AI_PROVIDER: ${{ vars.AI_PROVIDER }}
+    AI_MODEL: ${{ vars.AI_MODEL }}
+
+    MONITOR_API_URL: ${{ github.event.inputs.cloud == 'aws' && secrets.MONITOR_API_URL_AWS || secrets.MONITOR_API_URL_AZURE }}
+    MONITOR_TOKEN: ${{ github.event.inputs.cloud == 'aws' && secrets.MONITOR_TOKEN_AWS || secrets.MONITOR_TOKEN_AZURE }}
+
+  run: |
+    python agent/test_agent.py
+#  MONITOR_API_URL: ${{ secrets.MONITOR_API_URL }}
+#  MONITOR_TOKEN: ${{ secrets.MONITOR_TOKEN }}
 
 jobs:
   pre_deploy:
@@ -121,6 +134,7 @@ jobs:
       - name: Build Docker image
         run: |
           docker build \
+            -f docker/Dockerfile \
             -t docker.io/${{ env.DOCKERHUB_USERNAME }}/${{ env.DOCKERHUB_REPOSITORY }}:${{ github.sha }} \
             -t docker.io/${{ env.DOCKERHUB_USERNAME }}/${{ env.DOCKERHUB_REPOSITORY }}:latest \
             .
@@ -152,7 +166,7 @@ jobs:
           eb deploy "${AWS_ENV_NAME}" --staged
 
       - name: Run deploy-time error agent for AWS
-        if: always() && env.TARGET_CLOUD == 'aws'
+        if: steps.aws_deploy.outcome != 'success' && env.TARGET_CLOUD == 'aws'
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           TARGET_CLOUD: aws
@@ -194,7 +208,7 @@ jobs:
             --resource-group "${AZURE_RESOURCE_GROUP}"
 
       - name: Run deploy-time error agent for Azure
-        if: always() && env.TARGET_CLOUD == 'azure'
+        if: steps.azure_deploy.outcome != 'success' && env.TARGET_CLOUD == 'azure'
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           TARGET_CLOUD: azure
@@ -300,8 +314,25 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           TARGET_CLOUD: ${{ env.TARGET_CLOUD }}
           DEPLOY_URL: ${{ env.APP_URL }}
-          MONITOR_API_URL: ${{ secrets.MONITOR_API_URL }}
-          MONITOR_TOKEN: ${{ secrets.MONITOR_TOKEN }}
+
+          - name: Run post-deploy final agent
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          TARGET_CLOUD: ${{ env.TARGET_CLOUD }}
+
+          AI_PROVIDER: ${{ vars.AI_PROVIDER }}
+          AI_MODEL: ${{ vars.AI_MODEL }}
+
+          DEPLOY_URL: ${{ env.APP_URL }}
+
+          MONITOR_API_URL: ${{ github.event.inputs.cloud == 'aws' && secrets.MONITOR_API_URL_AWS || secrets.MONITOR_API_URL_AZURE }}
+          MONITOR_TOKEN: ${{ github.event.inputs.cloud == 'aws' && secrets.MONITOR_TOKEN_AWS || secrets.MONITOR_TOKEN_AZURE }}
+
+        run: |
+          python agent/final_agent.py
+
+#          MONITOR_API_URL: ${{ secrets.MONITOR_API_URL }}
+#          MONITOR_TOKEN: ${{ secrets.MONITOR_TOKEN }}
         run: python agent/final_agent.py
 
       - name: Upload post-deploy artifacts
