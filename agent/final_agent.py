@@ -31,7 +31,7 @@ except ImportError:
     def send_agent_status(*a, **k):
         pass
 
-MODEL = os.getenv("AI_MODEL", "gemini-2.0-flash")
+MODEL = os.getenv("AI_MODEL", "gemini-2.5-flash")
 PROVIDER = os.getenv("AI_PROVIDER", "gemini")
 
 def build_client():
