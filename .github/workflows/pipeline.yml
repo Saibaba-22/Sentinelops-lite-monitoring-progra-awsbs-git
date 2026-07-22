@@ -151,22 +151,33 @@ jobs:
         run: |
           pip install awsebcli awscli
 
+      # ---- FIX: Initialize EB CLI before deploying ----
+      - name: Initialize EB CLI
+        if: env.TARGET_CLOUD == 'aws'
+        run: |
+          eb init "${AWS_APP_NAME}" \
+            --region "${AWS_REGION}" \
+            --platform "Docker" \
+            --no-verify-ssl
+
       - name: Deploy to AWS Elastic Beanstalk
         id: aws_deploy
         if: env.TARGET_CLOUD == 'aws'
         continue-on-error: true
         run: |
-          eb deploy "${AWS_ENV_NAME}" --staged
+          # Removed --staged: in CI we deploy the committed code, not uncommitted changes
+          eb deploy "${AWS_ENV_NAME}"
 
       - name: Run deploy-time error agent for AWS
         if: steps.aws_deploy.outcome != 'success' && env.TARGET_CLOUD == 'aws'
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           TARGET_CLOUD: aws
-#          DEPLOY_OUTCOME: ${{ steps.aws_deploy.outcome }}
           AWS_APP_NAME: ${{ env.AWS_APP_NAME }}
           AWS_ENV_NAME: ${{ env.AWS_ENV_NAME }}
           AWS_REGION: ${{ env.AWS_REGION }}
+          DOCKERHUB_USERNAME: ${{ env.DOCKERHUB_USERNAME }}
+          DOCKERHUB_REPOSITORY: ${{ env.DOCKERHUB_REPOSITORY }}
         run: |
           python agent/errors.py
 
@@ -205,9 +216,10 @@ jobs:
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           TARGET_CLOUD: azure
-#          DEPLOY_OUTCOME: ${{ steps.azure_deploy.outcome }}
           AZURE_WEBAPP_NAME: ${{ env.AZURE_WEBAPP_NAME }}
           AZURE_RESOURCE_GROUP: ${{ env.AZURE_RESOURCE_GROUP }}
+          DOCKERHUB_USERNAME: ${{ env.DOCKERHUB_USERNAME }}
+          DOCKERHUB_REPOSITORY: ${{ env.DOCKERHUB_REPOSITORY }}
         run: |
           python agent/errors.py
 
