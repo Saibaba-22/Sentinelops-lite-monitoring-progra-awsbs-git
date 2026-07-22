@@ -30,7 +30,6 @@ env:
   AZURE_WEBAPP_NAME: ${{ vars.AZURE_WEBAPP_NAME }}
   AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
 
-
 #  MONITOR_API_URL: ${{ secrets.MONITOR_API_URL }}
 #  MONITOR_TOKEN: ${{ secrets.MONITOR_TOKEN }}
 
@@ -308,27 +307,14 @@ jobs:
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           TARGET_CLOUD: ${{ env.TARGET_CLOUD }}
-          DEPLOY_URL: ${{ env.APP_URL }}
-
-          - name: Run post-deploy final agent
-        env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          TARGET_CLOUD: ${{ env.TARGET_CLOUD }}
-
           AI_PROVIDER: ${{ vars.AI_PROVIDER }}
           AI_MODEL: ${{ vars.AI_MODEL }}
-
           DEPLOY_URL: ${{ env.APP_URL }}
-
           MONITOR_API_URL: ${{ github.event.inputs.cloud == 'aws' && secrets.MONITOR_API_URL_AWS || secrets.MONITOR_API_URL_AZURE }}
           MONITOR_TOKEN: ${{ github.event.inputs.cloud == 'aws' && secrets.MONITOR_TOKEN_AWS || secrets.MONITOR_TOKEN_AZURE }}
 
         run: |
           python agent/final_agent.py
-
-#          MONITOR_API_URL: ${{ secrets.MONITOR_API_URL }}
-#          MONITOR_TOKEN: ${{ secrets.MONITOR_TOKEN }}
-        run: python agent/final_agent.py
 
       - name: Upload post-deploy artifacts
         if: always()
