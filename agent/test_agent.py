@@ -1,14 +1,11 @@
 """
 test_agent.py - PHASE 1: PRE-DEPLOY test verification.
-
 Runs tests before deployment, uses Gemini to review the result, and sends
 AI-agent metrics to the deployed monitoring endpoint.
-
 Required environment variables:
     GEMINI_API_KEY
     MONITOR_API_URL
     MONITOR_TOKEN
-
 Optional environment variables:
     TEST_CMD
     TARGET_CLOUD
@@ -21,7 +18,6 @@ import os
 import subprocess
 import sys
 import time
-
 from monitor_client import send_agent_status
 
 # ---------------------------------------------------------------------------
@@ -29,7 +25,7 @@ from monitor_client import send_agent_status
 # ---------------------------------------------------------------------------
 
 PROVIDER = os.getenv("AI_PROVIDER", "gemini")
-MODEL = os.getenv("AI_MODEL", "gemini-3.1-flash-lite")
+MODEL = os.getenv("AI_MODEL", "gemini-3.5-flash")
 
 AGENT_NAME = "test_agent"
 STAGE = "pre_deploy"
@@ -59,20 +55,16 @@ def build_client():
 def extract_usage(response):
     """
     Return prompt/input and completion/output token counts safely.
-
     Token metadata may not exist for every provider response, so zero is valid.
     """
-
     prompt_tokens = 0
     completion_tokens = 0
-
     try:
         usage = response.usage_metadata
         prompt_tokens = int(getattr(usage, "prompt_token_count", 0) or 0)
         completion_tokens = int(getattr(usage, "candidates_token_count", 0) or 0)
     except Exception:
         pass
-
     return prompt_tokens, completion_tokens
 
 
