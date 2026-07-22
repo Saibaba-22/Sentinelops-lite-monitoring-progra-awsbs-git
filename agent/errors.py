@@ -269,13 +269,44 @@ def main():
     else:
         print(f"[AI] unavailable: {ai_reason}")
 
-    context = collect_context()
-    print(f"[errors.py] collected {len(context)} chars context")
+context = collect_context()
+print(f"[errors.py] collected {len(context)} chars context")
 
-    file_lines = parse_file_line(context)
-    print(f"[errors.py] parsed file/line hints: {file_lines}")
+file_lines = parse_file_line(context)
+print(f"[errors.py] parsed file/line hints: {file_lines}")
 
-    present, expected = heuristic_present_expected(context)
+present, expected = heuristic_present_expected(context)
+
+deterministic = deterministic_diagnosis(context)
+
+if deterministic:
+    print("----- errors.py diagnosis deterministic -----")
+    print(deterministic)
+    print("--------------------------------------------")
+
+    Path("reports").mkdir(exist_ok=True)
+
+    with open("errors_report.txt", "w", encoding="utf-8") as f:
+        f.write(deterministic + "\n\n--- RAW CONTEXT ---\n" + context[-8000:])
+
+    with open("reports/deploy_error_diagnosis.txt", "w", encoding="utf-8") as f:
+        f.write(deterministic)
+
+    try:
+        send_agent_status(
+            agent_name="errors_agent",
+            stage="deploy",
+            status="failed",
+            decision="failed",
+            provider=PROVIDER,
+            model=MODEL,
+            execution_time_seconds=time.perf_counter() - start,
+            error="deployment failed - deterministic diagnosis",
+        )
+    except Exception:
+        pass
+
+    sys.exit(1)
 
     print("\n--- Context Preview ---")
     print(context[:2000])
@@ -353,8 +384,6 @@ ERROR: {e}
         with open("reports/deploy_error_diagnosis.txt", "w", encoding="utf-8") as f:
             f.write(fallback)
         sys.exit(1)
-
-deterministic = deterministic_diagnosis(context)
 
 if deterministic:
     print("----- errors.py diagnosis deterministic -----")
