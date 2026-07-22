@@ -1,0 +1,6 @@
+FILE: N/A
+LINE: N/A
+PRESENT_ERROR: The DOCKERHUB_USERNAME environment variable, required for Docker Hub operations, is currently N/A.
+EXPECTED_VALUE: The DOCKERHUB_USERNAME environment variable should be set to your actual Docker Hub username.
+WHY: The deployment pipeline requires the Docker Hub username to tag and push Docker images, but this critical variable is not configured in the environment.
+SOLUTION: Set DOCKERHUB_USERNAME as a GitHub repository variable in your repository's settings (Settings → Secrets and variables → Actions → Variables).

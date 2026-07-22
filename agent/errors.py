@@ -1,237 +1,317 @@
 """
-errors.py  -  PHASE 2: DURING DEPLOYMENT / ACCESSING THE APP
-------------------------------------------------------------
-Runs the command that deploys or accesses your application.
-If it succeeds -> prints SUCCESS.
-If it fails   -> uses an AI model as a "supporter" to report:
-    FILE      : which file failed
-    LINE      : the line number
-    ISSUE     : what the error is (one sentence)
-    WHY       : why it failed (one sentence)
-    SOLUTION  : how to solve it
+errors.py - UNIVERSAL DURING-DEPLOY ERROR DIAGNOSER
+Phase 2: Runs during deployment, analyzes failure logs and provides:
+  FILE: file name
+  LINE: line number
+  PRESENT_ERROR: current wrong value / error
+  EXPECTED_VALUE: what should be
+  WHY: root cause
+  SOLUTION: how to fix
 
-The AI model is defined IN THIS FILE (MODEL below) so you can change it
-on the spot if it becomes unavailable. The API key is read from the
-GEMINI_API_KEY environment variable.
+Works for ANY project: Python, Docker, AWS EB, Azure App Service, K8s, etc.
+
+No custom command needed - auto-collects logs from:
+- Environment (TARGET_CLOUD, AWS_*, AZURE_*)
+- *.log, reports/, /tmp/, eb logs, docker ps, Dockerrun.aws.json
+- Python tracebacks
+- GitHub Actions logs
 
 Usage:
-    python errors.py --deploy "python deploy.py"
-    python errors.py --deploy "kubectl apply -f k8s/"
-    DEPLOY_CMD="docker compose up -d" python errors.py
+  python agent/errors.py
+  TARGET_CLOUD=aws python agent/errors.py
+
+Output: errors_report.txt + reports/deploy_error_diagnosis.txt
 """
 
-# ===== AI CONFIG =========================================================
-# Edit MODEL here if the model is unavailable (e.g. quota / region).
-# Other valid examples: "gemini-2.5-pro", "gemini-1.5-flash".
-MODEL = "gemini-3.1-flash-lite"
-# The API key is taken from the GEMINI_API_KEY environment variable.
-# ========================================================================
-
 import os
+import re
 import sys
-import argparse
-import subprocess
+import glob
 import time
-from monitor_client import send_agent_status
+import subprocess
+from pathlib import Path
 
-def _build_client():
+try:
+    from monitor_client import send_agent_status
+except ImportError:
+    def send_agent_status(*a, **k):
+        print(f"[monitor] {k.get('status')}")
+
+MODEL = os.getenv("AI_MODEL", "gemini-2.5-flash")
+PROVIDER = os.getenv("AI_PROVIDER", "gemini")
+
+def build_client():
     try:
         from google import genai
-    except ImportError:
-        raise RuntimeError("google-genai SDK not installed -> pip install google-genai")
-    key = os.environ.get("GEMINI_API_KEY")
+    except ImportError as e:
+        raise RuntimeError(f"google-genai not installed: {e}")
+    key = os.getenv("GEMINI_API_KEY")
     if not key:
-        raise RuntimeError("GEMINI_API_KEY environment variable is not set")
+        raise RuntimeError("GEMINI_API_KEY not set")
     return genai.Client(api_key=key)
-
 
 def ai_status():
     try:
-        client = _build_client()
-    except Exception as e:
-        return False, str(e)
-    try:
-        client.models.generate_content(model=MODEL, contents="Reply with exactly: OK")
+        client = build_client()
+        client.models.generate_content(model=MODEL, contents="OK")
         return True, ""
     except Exception as e:
-        return False, f"model '{MODEL}' could not respond: {e}"
+        return False, str(e)
 
-
-def ask(prompt):
-    """Send a prompt to Gemini and return response plus token counts."""
+def ask_ai(prompt):
     client = build_client()
-    response = client.models.generate_content(
-        model=MODEL,
-        contents=prompt,
-    )
-    text = (response.text or "").strip()
-    prompt_tokens = 0
-    completion_tokens = 0
+    resp = client.models.generate_content(model=MODEL, contents=prompt)
+    return (resp.text or "").strip()
+
+def collect_context():
+    parts = []
+    parts.append("=== ENV ===")
+    for k in ["TARGET_CLOUD","AWS_APP_NAME","AWS_ENV_NAME","AWS_REGION","AZURE_WEBAPP_NAME","AZURE_RESOURCE_GROUP","GITHUB_SHA","DOCKERHUB_USERNAME","DOCKERHUB_REPOSITORY","APP_NAME","ENV_NAME"]:
+        parts.append(f"{k}={os.getenv(k,'N/A')}")
+
+    # Try EB / Azure / Docker status - best effort
+    parts.append("\n=== DEPLOY STATUS COMMANDS ===")
+    cmds = [
+        "eb status 2>&1 | head -n 150",
+        "eb health 2>&1 | head -n 150",
+        "az webapp log tail --name $AZURE_WEBAPP_NAME --resource-group $AZURE_RESOURCE_GROUP 2>&1 | head -n 150" if os.getenv("AZURE_WEBAPP_NAME") else "echo no azure",
+        "docker ps -a 2>&1 | head -n 100",
+        "docker logs $(docker ps -aq | head -n1) 2>&1 | tail -n 200" if os.getenv("DOCKERHUB_REPOSITORY") else "echo no docker container",
+        "cat Dockerrun.aws.json 2>&1 | head -n 100",
+        "cat docker-compose.yml 2>&1 | head -n 100",
+        "cat .elasticbeanstalk/config.yml 2>&1 | head -n 100",
+    ]
+    for cmd in cmds:
+        try:
+            out = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=12)
+            txt = (out.stdout + out.stderr)[:4000]
+            if txt.strip():
+                parts.append(f"\n$ {cmd}\n{txt}")
+        except Exception:
+            pass
+
+    parts.append("\n=== LOG FILES ===")
+    for pat in ["*.log", "reports/*.log", "reports/*.txt", "/tmp/*.log", "*.txt"]:
+        for f in glob.glob(pat, recursive=True)[:8]:
+            try:
+                p = Path(f)
+                size = p.stat().st_size
+                if size > 2000000:
+                    content = p.read_text(encoding="utf-8", errors="ignore")[-6000:]
+                else:
+                    content = p.read_text(encoding="utf-8", errors="ignore")[:6000]
+                if content.strip():
+                    parts.append(f"\n--- {f} ---\n{content[-5000:]}")
+            except Exception:
+                pass
+
+    # GitHub Actions failure - check if error file exists from previous steps
+    parts.append("\n=== RECENT TRACEBACKS ===")
+    combined = "\n".join(parts)
+    # Also capture current directory ls
     try:
-        usage = response.usage_metadata
-        prompt_tokens = int(usage.prompt_token_count or 0)
-        completion_tokens = int(usage.candidates_token_count or 0)
+        ls = subprocess.run("ls -la 2>&1 | head -n 100", shell=True, capture_output=True, text=True, timeout=5)
+        parts.append(f"\nls -la:\n{ls.stdout[:2000]}")
     except Exception:
         pass
-    return text, prompt_tokens, completion_tokens
 
+    return "\n".join(parts)[-20000:]
 
-def run_deploy(cmd):
-    proc = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-    out = (proc.stdout or "") + "\n" + (proc.stderr or "")
-    return proc.returncode, out
+def parse_file_line(error_text):
+    """Universal regex to extract FILE/LINE from tracebacks"""
+    patterns = [
+        r'File "([^"]+)", line (\d+)',  # Python
+        r'File ([^\s:]+\.py):(\d+)',       # alternative
+        r'([a-zA-Z0-9_\-/\.]+\.py):(\d+):', # pylint/flake
+        r'at ([^\s]+\.py):(\d+)',           # some logs
+        r'ERROR.*file: ([^\s]+\.py)',       # custom
+        r'([A-Za-z0-9_\-/]+\.json):? line (\d+)?', # json
+        r'Dockerfile:(\d+)',                 # dockerfile
+    ]
+    results = []
+    for pat in patterns:
+        for m in re.finditer(pat, error_text):
+            file = m.group(1)
+            line = m.group(2) if len(m.groups()) >=2 and m.group(2) else "N/A"
+            # filter out stdlib
+            if "site-packages" in file or "importlib" in file:
+                continue
+            if len(file) > 200:
+                continue
+            results.append((file, line))
+    # deduplicate keep order
+    seen = set()
+    uniq = []
+    for f,l in results:
+        if (f,l) not in seen:
+            seen.add((f,l))
+            uniq.append((f,l))
+    return uniq[:5]
 
+def heuristic_present_expected(error_text):
+    """Heuristic to guess present vs expected"""
+    present = "Unknown error"
+    expected = "Valid configuration / code"
+    # common cases
+    if "replace_with_ecr_image_uri" in error_text:
+        present = "Placeholder image URI 'replace_with_ecr_image_uri' still present"
+        expected = "Real Docker image URI like 'docker.io/username/repo:tag'"
+    elif "ModuleNotFoundError" in error_text or "No module named" in error_text:
+        m = re.search(r"No module named '([^']+)'", error_text)
+        mod = m.group(1) if m else "unknown"
+        present = f"Missing module '{mod}' not installed"
+        expected = f"Add '{mod}' to requirements.txt and pip install"
+    elif "SyntaxError" in error_text:
+        present = "Python syntax error"
+        expected = "Valid Python syntax"
+    elif "Docker" in error_text and ("pull" in error_text.lower() or "image" in error_text.lower()):
+        present = "Docker image pull failed - invalid image name or auth failed"
+        expected = "Valid Docker Hub image with correct auth"
+    elif "401" in error_text or "Unauthorized" in error_text:
+        present = "Authentication failed (Docker Hub / AWS / Azure)"
+        expected = "Valid credentials / token / OIDC role"
+    elif "404" in error_text and "elasticbeanstalk" in error_text.lower():
+        present = "EB environment not found"
+        expected = "Existing EB application + environment name"
+    elif "port" in error_text.lower() and "already" in error_text.lower():
+        present = "Port already in use / conflict"
+        expected = "Free port or proper EXPOSE in Dockerfile"
+    elif "health" in error_text.lower():
+        present = "Health check failed"
+        expected = "App should return 200 on APP_HEALTH_PATH"
+    elif "KeyError" in error_text or "Environment variable" in error_text:
+        present = "Missing environment variable"
+        expected = "Set required env var in EB/Azure config"
+    else:
+        # take first error line
+        lines = [l.strip() for l in error_text.splitlines() if "error" in l.lower() or "exception" in l.lower() or "fail" in l.lower()]
+        if lines:
+            present = lines[-1][:500]
 
-def diagnose(error_text):
+    return present, expected
+
+def diagnose_with_ai(context, file_line_list):
     prompt = f"""
-A command failed while deploying / accessing a software application.
-Analyse the output/traceback below and report EXACTLY these fields:
+You are a universal deployment failure diagnostician for ANY project.
 
-FILE: <path/to/file.py or N/A>
+Analyze the deployment failure context and produce EXACTLY this format for the TOP error (one issue):
+
+FILE: <path/to/file.py or Dockerrun.aws.json or Dockerfile or N/A>
 LINE: <line number or N/A>
-ISSUE: <what the error is, one sentence>
-WHY: <why it failed, one sentence>
-SOLUTION: <how to solve it - code snippet or step>
+PRESENT_ERROR: <what is currently wrong - the actual wrong value/error message, one sentence>
+EXPECTED_VALUE: <what should be instead - correct value, one sentence>
+WHY: <why it failed - root cause, one sentence>
+SOLUTION: <how to fix - actionable command or code snippet, one sentence>
 
-Keep each field short. If unsure about a field, write N/A.
+Rules:
+- Focus on Python, Docker, AWS EB, Azure App Service failures
+- If file/line not clear, use N/A but still provide PRESENT_ERROR/EXPECTED_VALUE
+- PRESENT_ERROR should be the wrong value present now
+- EXPECTED_VALUE should be correct value expected
+- Keep each field max 2 lines, very concise, actionable
 
---- DEPLOY / ACCESS OUTPUT (tail) ---
-{error_text}
+Detected file/line hints from regex:
+{file_line_list}
+
+--- FAILURE CONTEXT (last 20k chars) ---
+{context}
 """
-    return ask(prompt)
-
+    return ask_ai(prompt)
 
 def main():
-    started_at = time.perf_counter()
+    start = time.perf_counter()
+    print(f"[errors.py] UNIVERSAL deploy error diagnoser - cloud={os.getenv('TARGET_CLOUD','unknown')} model={MODEL}")
 
-    parser = argparse.ArgumentParser()
-
-    parser.add_argument(
-        "--deploy",
-        default=os.getenv("DEPLOY_CMD"),
-        help="Command that deploys or accesses the app",
-    )
-
-    args = parser.parse_args()
-
-    # No command supplied: report a configuration failure, then exit.
-    if not args.deploy:
-        error_message = "No DEPLOY_CMD or --deploy argument provided"
-
-        print("errors.py: no deploy/access command provided.")
-        print('Usage: python agent/errors.py --deploy "python deploy.py"')
-        print("       or set the DEPLOY_CMD environment variable.")
-
-        send_agent_status(
-            agent_name="errors_agent",
-            stage="deploy",
-            status="failed",
-            decision="failed",
-            provider=os.getenv("AI_PROVIDER", "gemini"),
-            model=MODEL,
-            requests_count=0,
-            api_key_count=1 if os.getenv("GEMINI_API_KEY") else 0,
-            execution_time_seconds=time.perf_counter() - started_at,
-            error=error_message,
-        )
-
-        sys.exit(2)
-
-    # Check Gemini availability.
     ai_ok, ai_reason = ai_status()
-
     if ai_ok:
-        print(f"[AI] model '{MODEL}' available and running.")
+        print(f"[AI] model {MODEL} available")
     else:
-        print(f"[AI] model NOT available: {ai_reason}")
+        print(f"[AI] unavailable: {ai_reason}")
 
-    print(f"errors.py: running deploy/access -> {args.deploy}")
+    context = collect_context()
+    print(f"[errors.py] collected {len(context)} chars context")
 
-    code, output = run_deploy(args.deploy)
+    file_lines = parse_file_line(context)
+    print(f"[errors.py] parsed file/line hints: {file_lines}")
 
-    print(output)
+    present, expected = heuristic_present_expected(context)
 
-    # Deployment/access command succeeded.
-    if code == 0:
-        print("SUCCESS: application deployed and accessible.")
+    print("\n--- Context Preview ---")
+    print(context[:2000])
+    print("--- End Preview ---\n")
 
-        send_agent_status(
-            agent_name="errors_agent",
-            stage="deploy",
-            status="approved",
-            decision="healthy",
-            provider=os.getenv("AI_PROVIDER", "gemini"),
-            model=MODEL,
-            requests_count=1 if ai_ok else 0,
-            api_key_count=1 if os.getenv("GEMINI_API_KEY") else 0,
-            execution_time_seconds=time.perf_counter() - started_at,
-            error="" if ai_ok else ai_reason,
-        )
-        sys.exit(0)
+    Path("reports").mkdir(exist_ok=True)
 
-    # ---- failure path ----
-    # ---- failure path ----
-    if ai_ok:
+    if not ai_ok:
+        # Deterministic fallback - still provide FILE/LINE/PRESENT/EXPECTED
+        fallback_file = file_lines[0][0] if file_lines else "N/A"
+        fallback_line = file_lines[0][1] if file_lines else "N/A"
+
+        report = f"""FILE: {fallback_file}
+LINE: {fallback_line}
+PRESENT_ERROR: {present}
+EXPECTED_VALUE: {expected}
+WHY: Deployment failed - see logs above
+SOLUTION: Check {fallback_file}:{fallback_line} and fix {present}
+
+--- RAW CONTEXT ---
+{context[-8000:]}
+
+AI was unavailable: {ai_reason}
+"""
+        print("----- errors.py diagnosis (fallback, no AI) -----")
+        print(report)
+        print("-------------------------------------------------")
+        with open("errors_report.txt", "w", encoding="utf-8") as f:
+            f.write(report)
+        with open("reports/deploy_error_diagnosis.txt", "w", encoding="utf-8") as f:
+            f.write(report)
+
         try:
-            api_started_at = time.perf_counter()
+            send_agent_status(agent_name="errors_agent", stage="deploy", status="failed", decision="failed",
+                              provider=PROVIDER, model=MODEL, execution_time_seconds=time.perf_counter()-start,
+                              error=f"{present} in {fallback_file}:{fallback_line}")
+        except Exception:
+            pass
+        sys.exit(1)
 
-            diag, prompt_tokens, completion_tokens = diagnose(
-                output[-20_000:]
-            )
+    try:
+        ai_report = diagnose_with_ai(context, file_lines)
+        print("----- errors.py diagnosis (AI) -----")
+        print(ai_report)
+        print("------------------------------------")
 
-            api_duration = time.perf_counter() - api_started_at
+        full_report = ai_report + "\n\n--- RAW CONTEXT ---\n" + context[-8000:]
 
-            print("----- errors.py diagnosis (AI supporter) -----")
-            print(diag)
-            print("-----------------------------------------------")
+        with open("errors_report.txt", "w", encoding="utf-8") as f:
+            f.write(full_report)
+        with open("reports/deploy_error_diagnosis.txt", "w", encoding="utf-8") as f:
+            f.write(ai_report)
 
-            with open("errors_report.txt", "w", encoding="utf-8") as file_handle:
-                file_handle.write(diag)
+        try:
+            send_agent_status(agent_name="errors_agent", stage="deploy", status="failed", decision="failed",
+                              provider=PROVIDER, model=MODEL, execution_time_seconds=time.perf_counter()-start,
+                              error="deployment failed - diagnosed")
+        except Exception:
+            pass
+        sys.exit(1)
 
-            send_agent_status(
-                agent_name="errors_agent",
-                stage="deploy",
-                status="failed",
-                decision="failed",
-                provider=os.getenv("AI_PROVIDER", "gemini"),
-                model=MODEL,
-                prompt_tokens=prompt_tokens,
-                completion_tokens=completion_tokens,
-                total_tokens=prompt_tokens + completion_tokens,
-                requests_count=2,
-                api_key_count=1 if os.getenv("GEMINI_API_KEY") else 0,
-                execution_time_seconds=time.perf_counter() - started_at,
-                api_response_time_seconds=api_duration,
-                error="Deployment/access command failed",
-            )
-
-            sys.exit(1)
-
-        except Exception as exc:
-            ai_ok = False
-            ai_reason = f"AI call failed: {exc}"
-    # ---- degraded (no AI) ----
-
-    print("FAILED during deployment. AI supporter unavailable ->", ai_reason)
-    print("Raw output (tail):")
-    print(output[-5000:])
-    with open("errors_report.txt", "w", encoding="utf-8") as f:
-        f.write(f"AI supporter unavailable: {ai_reason}\n\n{output}")
-
-        send_agent_status(
-        agent_name="errors_agent",
-        stage="deploy",
-        status="failed",
-        decision="failed",
-        provider=os.getenv("AI_PROVIDER", "gemini"),
-        model=MODEL,
-        requests_count=1 if os.getenv("GEMINI_API_KEY") else 0,
-        api_key_count=1 if os.getenv("GEMINI_API_KEY") else 0,
-        execution_time_seconds=time.perf_counter() - started_at,
-        error=ai_reason,
-    )
-    sys.exit(1)
-
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        fallback = f"""FILE: {file_lines[0][0] if file_lines else "N/A"}
+LINE: {file_lines[0][1] if file_lines else "N/A"}
+PRESENT_ERROR: {present}
+EXPECTED_VALUE: {expected}
+WHY: {ai_reason if not ai_ok else "AI call failed"}
+SOLUTION: Check logs and fix {present}
+ERROR: {e}
+"""
+        with open("errors_report.txt", "w", encoding="utf-8") as f:
+            f.write(fallback + "\n" + context[-5000:])
+        with open("reports/deploy_error_diagnosis.txt", "w", encoding="utf-8") as f:
+            f.write(fallback)
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()

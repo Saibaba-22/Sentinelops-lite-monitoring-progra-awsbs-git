@@ -1,0 +1,344 @@
+FILE: N/A
+LINE: N/A
+PRESENT_ERROR: The DOCKERHUB_USERNAME environment variable, required for Docker Hub operations, is currently N/A.
+EXPECTED_VALUE: The DOCKERHUB_USERNAME environment variable should be set to your actual Docker Hub username.
+WHY: The deployment pipeline requires the Docker Hub username to tag and push Docker images, but this critical variable is not configured in the environment.
+SOLUTION: Set DOCKERHUB_USERNAME as a GitHub repository variable in your repository's settings (Settings → Secrets and variables → Actions → Variables).
+
+--- RAW CONTEXT ---
+es_secrets.txt ---
+A. GitHub Repository Variables
+Go to:
+
+text
+
+GitHub Repository
+→ Settings
+→ Secrets and variables
+→ Actions
+→ Variables
+→ New repository variable
+Add these.
+
+Variable name	Example value	Required?	Purpose
+DOCKERHUB_USERNAME	saibaba
+
+--- Filestructure.txt ---
+    # (new) Post-deploy verification → final_review.txt
+├── review_agent.py             # (new) Pre-deploy review gate
+├── pipeline.yaml               # (new) CI/CD pipeline (GH Actions format)
+├── requirements.txt
+├── test_app.py
+├── README.md
+│
+├── monitoring/
+│   ├── __init__.py
+│   ├── metrics.py              # All Prometheus metric definitions + collectors
+│   ├── collectors.py           # /api/status JSON snapshot
+│   ├── agent_state.py          # Persisted agent state (logs/agent_stats.json)
+│   ├── exporters/
+│   │   └── node-exporter/      # (empty — node-exporter runs from image)
+│   ├── prometheus/
+│   │   ├── prometheus.yml
+│   │   ├── alert.rules.yml
+│   │   └── recording.rules.yml
+│   └── grafana/
+│       ├── dashboards/         # system / application / ai-agent / deployment -dashboard.json
+│       └── provisioning/
+│           ├── datasources/datasource.yml
+│           └── dashboards/dashboard.yml + dashboards.json (Overview)
+│
+├── docker/
+│   ├── Dockerfile
+│   ├── docker-compose.yml
+│   └── nginx/nginx.conf
+│
+├── deployment/
+│   ├── Dockerrun.aws.json      # Multi-container Docker manifest
+│   ├── Procfile                # Single-container fallback
+│   ├── deploy.sh               # Build → ECR → EB deploy
+│   └── .ebextensions/
+│       ├── 01-nginx.config     # Health check / proxy tuning
+│       └── 02-logging.config   # Centralised logging
+│
+├── static/
+│   ├── css/dashboard.css
+│   ├── js/dashboard.js
+│   └── images/                 # (empty)
+│
+├── templates/
+│   ├── index.html              # Pipeline UI
+│   └── dashboard.html          # Live monitoring dashboard
+│
+├── docs/
+│   ├── README.md
+│   ├── DEPLOYMENT.md
+│   ├── TROUBLESHOOTING.md
+│   ├── architecture.svg
+│   └── monitoring-flow.svg
+│
+├── logs/                       # runtime logs + agent_stats.json (git-ignored)
+├── .dockerignore
+└── .env.example
+
+# 0) Put the pipeline where GitHub Actions expects it
+mkdir -p .github/workflows
+mv pipeline.yml .github/workflows/pipeline.yml
+
+# 1) Create a .gitignore so logs/caches/secrets aren't committed
+cat > .gitignore <<'EOF'
+__pycache__/
+*.pyc
+.pytest_cache/
+.env
+.env.*
+logs/
+agent_stats.json
+agent_decision.txt
+test_results.txt
+final_review.txt
+review_report.txt
+.idea/
+.vscode/
+EOF
+
+# 2) Initialise, stage and commit
+git init
+git add .
+git commit -m "Initial commit: SentinelOps-Lite AI monitoring platform"
+
+# 3) Push to GitHub
+# --- Option A: you already created the repo on github.com ---
+git branch -M main
+git remote add origin https://github.com/USERNAME/sentinelops-lite.git
+git push -u origin main
+
+# --- Option B: create the repo from the CLI with GitHub CLI (gh) ---
+# gh repo create sentinelops-lite --private --source=. --remote=origin --push
+
+
+
+What	URL
+Your app / index.html	http://agent3.us-east-1.elasticbeanstalk.com/
+Live dashboard	http://agent3.us-east-1.elasticbeanstalk.com/dashboard
+Prometheus	http://agent3.us-east-1.elasticbeanstalk.com/prometheus/
+Grafana (login admin / admin)	http://agent3.us-east-1.elasticbeanstalk.com/grafana/
+node-exporter metrics	http://agent3.us-east-1.elasticbeanstalk.com/node-exporter/
+
+
+
+
+D:\11>tree /F
+Folder PATH listing for volume Local Disk
+Volume serial number is 000000A1 920E:6D3C
+D:.
+│   .dockerignore
+│   .ebignore
+│   .env.example
+│   .gitignore
+│   agent.py
+│   agent_monitor.py
+│   app.py
+│   docker-compose.yml
+│   Dockerrun.aws.json
+│   error.docx
+│   Filestructure.txt
+│   final_agent.py
+│   requirements.txt
+│   review_agent.py
+│   Sentinelops-AI-Progra.rar
+│   test_app.py
+│
+├───.ebextensions
+│       01-nginx.config
+│       02-logging.config
+│
+├───.github
+│   └───workflows
+│           awsbs.yml
+│           azappser.yml
+│           pipeline.yml
+│
+├───.platform
+│   └───hooks
+│       └───predeploy
+│               10-inject-private-ip.sh
+│
+├───agent
+│       errors.py
+│       final_agent.py
+│       single_agent.py
+│       test_agent.py
+│
+├───deployment
+│       deploy.sh
+│       Procfile
+│
+├───docker
+│   │   docker-compose.yml
+│   │   Dockerfile
+│   │
+│   └───nginx
+│           nginx.conf
+│
+├───docs
+│       architecture.svg
+│       DEPLOYMENT.md
+│       monitoring-flow.svg
+│       README.md
+│       TROUBLESHOOTING.md
+│
+├───logs
+├───monitoring
+│   │   agent_state.py
+│   │   collectors.py
+│   │   metrics.py
+│   │   __init__.py
+│   │
+│   ├───exporters
+│   │   └───node-exporter
+│   ├───grafana
+│   │   ├───dashboards
+│   │   │       ai-agent-dashboard.json
+│   │   │       application-dashboard.json
+│   │   │       deployment-dashboard.json
+│   │   │       system-dashboard.json
+│   │   │
+│   │   └───provisioning
+│   │       ├───dashboards
+│   │       │       dashboard.yml
+│   │       │       dashboards.json
+│   │       │
+│   │       └───datasources
+│   │               datasource.yml
+│   │
+│   └───prometheus
+│           alert.rules.yml
+│           prometheus.yml
+│           recording.rules.yml
+│
+├───static
+│   ├───css
+│   │       dashboard.css
+│   │
+│   ├───images
+│   └───js
+│           dashboard.js
+│
+└───templates
+        dashboard.html
+        index.html
+
+
+--- requirements.txt ---
+flask==3.0.3
+gunicorn==22.0.0
+pytest==8.2.0
+psutil==6.0.0
+google-genai
+requests
+tzdata
+prometheus_client==0.20.0
+pyyaml==6.0.1
+
+
+--- variables_secrets.txt ---
+A. GitHub Repository Variables
+Go to:
+
+text
+
+GitHub Repository
+→ Settings
+→ Secrets and variables
+→ Actions
+→ Variables
+→ New repository variable
+Add these.
+
+Variable name	Example value	Required?	Purpose
+DOCKERHUB_USERNAME	saibaba22	Yes	Your Docker Hub username
+DOCKERHUB_REPOSITORY	sentinelops-lite	Yes	Docker Hub image repository
+PYTHON_VERSION	3.11	Yes	Python version used in GitHub Actions
+APP_HEALTH_PATH	/health	Yes	Application health endpoint
+AWS_APP_NAME	sentinelops-lite	If using AWS	Elastic Beanstalk application name
+AWS_ENV_NAME	sentinelops-lite-prod	If using AWS	Elastic Beanstalk environment name
+AWS_REGION	ap-south-1	If using AWS	AWS deployment region
+AZURE_WEBAPP_NAME	sentinelops-lite-prod	If using Azure	Azure App Service name
+AZURE_RESOURCE_GROUP	sentinelops-rg	If using Azure	Azure Resource Group name
+AI_PROVIDER	gemini	Recommended	Prometheus/Grafana provider label
+AI_MODEL	gemini-2.5-flash	Recommended	Prometheus/Grafana model label
+APP_VERSION	1.0.0	Recommended	Deployment metadata
+ENVIRONMENT	production	Recommended	Deployment metadata/labels
+Exact values for your current Gemini setup
+text
+
+DOCKERHUB_USERNAME
+DOCKERHUB_REPOSITORY
+PYTHON_VERSION
+APP_HEALTH_PATH
+
+AWS_APP_NAME
+AWS_ENV_NAME
+AWS_REGION
+
+AZURE_WEBAPP_NAME
+AZURE_RESOURCE_GROUP
+
+AI_PROVIDER
+AI_MODEL
+
+APP_VERSION
+ENVIRONMENT
+
+AI_PROVIDER = gemini
+AI_MODEL = gemini-2.5-flash
+B. GitHub Repository Secrets
+Go to:
+
+text
+
+GitHub Repository
+→ Settings
+→ Secrets and variables
+→ Actions
+→ Secrets
+→ New repository secret
+Add these.
+
+Secret name	Required?	Purpose
+GEMINI_API_KEY	Yes	Gemini API key used by all three AI agents
+DOCKERHUB_TOKEN	Yes	Docker Hub access token used to push images
+AWS_ACCESS_KEY_ID	If using AWS	AWS deployment credential
+AWS_SECRET_ACCESS_KEY	If using AWS	AWS deployment credential
+AZURE_CREDENTIALS	If using Azure	Azure Service Principal JSON for azure/login@v2
+MONITOR_API_URL_AWS	If using AWS	AWS deployed app’s /monitor/status URL
+MONITOR_TOKEN_AWS	If using AWS	Secret token that protects AWS monitor endpoint
+MONITOR_API_URL_AZURE	If using Azure	Azure deployed app’s /monitor/status URL
+MONITOR_TOKEN_AZURE	If using Azure	Secret token that protects Azure monitor endpoint
+
+GEMINI_API_KEY
+DOCKERHUB_TOKEN
+
+AWS_ACCESS_KEY_ID
+AWS_SECRET_ACCESS_KEY
+
+AZURE_CREDENTIALS
+
+MONITOR_API_URL_AWS
+MONITOR_TOKEN_AWS
+
+MONITOR_API_URL_AZURE
+
+https://YOUR-DEPLOYED-APP/monitor/status
+
+MONITOR_TOKEN_AZURE
+
+
+monitor token in power shell 
+[guid]::NewGuid().ToString("N") + [guid]::NewGuid().ToString("N")
+
+
+=== RECENT TRACEBACKS ===
+
+ls -la:
