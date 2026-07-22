@@ -22,8 +22,8 @@ env:
   GITHUB_SHA: ${{ github.sha }}
 
   # AWS
-  APP_NAME: ${{ vars.AWS_APP_NAME }}
-  ENV_NAME: ${{ vars.AWS_ENV_NAME }}
+  APP_NAME: ${{ vars.APP_NAME }}
+  ENV_NAME: ${{ vars.ENV_NAME }}
   AWS_REGION: ${{ vars.AWS_REGION }}
 
   # Azure
