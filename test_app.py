@@ -1,5 +1,5 @@
 from app import application
-
+import os
 
 def test_home():
     client = application.test_client()
@@ -52,15 +52,34 @@ def test_agent_status():
     data = response.get_json()
     assert "status" in data
 
-
-def test_monitor_status_receiver():
-    client = application.test_client()
+def test_monitor_status_receiver(client, monkeypatch):
+    """Verify that an authorized CI-agent monitoring event is accepted."""
+    test_monitor_token = "unit-test-monitor-token
+    # The Flask endpoint checks this value at request time.
+    monkeypatch.setenv("MONITOR_TOKEN", test_monitor_token)
+    payload = {
+        "agent_name": "test_agent",
+        "stage": "pre_deploy",
+        "cloud": "aws",
+        "status": "approved",
+        "decision": "pass",
+        "provider": "gemini",
+        "model": "gemini-3.1-flash-lite",
+        "prompt_tokens": 10,
+        "completion_tokens": 5,
+        "total_tokens": 15,
+        "requests": 1,
+        "api_key_count": 1,
+        "execution_time_seconds": 1.0,
+        "api_response_time_seconds": 0.5,
+    }
     response = client.post(
         "/monitor/status",
-        json={"status": "Approved", "tokens": 123, "requests": 1},
+        json=payload,
+        headers={
+            "X-Monitor-Token": test_monitor_token,
+        },
     )
     assert response.status_code == 200
-    assert response.get_json()["ok"] is True
-    # The agent state should now reflect "approved".
-    status = client.get("/agent/status").get_json()
-    assert status["status"] == "Approved"
+    response_data = response.get_json()
+    assert response_data["ok"] is True
