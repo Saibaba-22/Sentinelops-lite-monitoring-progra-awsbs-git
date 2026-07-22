@@ -29,9 +29,8 @@ env:
   # Azure
   AZURE_WEBAPP_NAME: ${{ vars.AZURE_WEBAPP_NAME }}
   AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
-
-#  MONITOR_API_URL: ${{ secrets.MONITOR_API_URL }}
-#  MONITOR_TOKEN: ${{ secrets.MONITOR_TOKEN }}
+  MONITOR_API_URL: ${{ secrets.MONITOR_API_URL_AWS }}
+  MONITOR_TOKEN: ${{ secrets.MONITOR_TOKEN_AWS }}
 
 jobs:
   pre_deploy:
