@@ -163,7 +163,7 @@ jobs:
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           TARGET_CLOUD: aws
-          DEPLOY_OUTCOME: ${{ steps.aws_deploy.outcome }}
+#          DEPLOY_OUTCOME: ${{ steps.aws_deploy.outcome }}
           AWS_APP_NAME: ${{ env.AWS_APP_NAME }}
           AWS_ENV_NAME: ${{ env.AWS_ENV_NAME }}
           AWS_REGION: ${{ env.AWS_REGION }}
@@ -205,7 +205,7 @@ jobs:
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           TARGET_CLOUD: azure
-          DEPLOY_OUTCOME: ${{ steps.azure_deploy.outcome }}
+#          DEPLOY_OUTCOME: ${{ steps.azure_deploy.outcome }}
           AZURE_WEBAPP_NAME: ${{ env.AZURE_WEBAPP_NAME }}
           AZURE_RESOURCE_GROUP: ${{ env.AZURE_RESOURCE_GROUP }}
         run: |
