@@ -74,8 +74,6 @@ echo "Replacing image placeholder..."
 sed -i "s|replace_with_dockerhub_image_uri|${DOCKERHUB_IMAGE}|g" "${DOCKERRUN_FILE}"
 cp "${ROOT_DIR}/Dockerrun.aws.json" "${ROOT_DIR}/Dockerrun.aws.json.bak"
 
-sed -i "s|replace_with_dockerhub_image_uri|${DOCKERHUB_IMAGE}|g" "${DOCKERRUN_FILE}"
-
 echo
 echo "===== Dockerrun after replacement ====="
 cat "${DOCKERRUN_FILE}"
