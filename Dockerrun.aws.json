@@ -60,34 +60,34 @@
         "--web.route-prefix=/"
       ]
     },
+{
+  "name": "grafana",
+  "image": "grafana/grafana:11.1.0",
+  "essential": true,
+  "memory": 256,
+  "portMappings": [
+    { "hostPort": 3000, "containerPort": 3000 }
+  ],
+  "links": ["prometheus"],
+  "environment": [
+    { "name": "GF_SECURITY_ADMIN_USER", "value": "admin" },
+    { "name": "GF_SECURITY_ADMIN_PASSWORD", "value": "admin123" },
+    { "name": "GF_USERS_ALLOW_SIGN_UP", "value": "false" },
+    { "name": "GF_SERVER_DOMAIN", "value": "agent.eba-wu4pmszn.us-east-1.elasticbeanstalk.com" },
+    { "name": "GF_SERVER_ROOT_URL", "value": "http://agent.eba-wu4pmszn.us-east-1.elasticbeanstalk.com/grafana/" },
+    { "name": "GF_SERVER_SERVE_FROM_SUB_PATH", "value": "true" }
+  ],
+  "mountPoints": [
     {
-      "name": "grafana",
-      "image": "grafana/grafana:11.1.0",
-      "essential": true,
-      "memory": 256,
-      "portMappings": [
-        { "hostPort": 3000, "containerPort": 3000 }
-      ],
-      "links": ["prometheus"],
-      "environment": [
-        { "name": "GF_SECURITY_ADMIN_USER", "value": "admin" },
-        { "name": "GF_SECURITY_ADMIN_PASSWORD", "value": "admin123" },
-        { "name": "GF_USERS_ALLOW_SIGN_UP", "value": "false" },
-        { "name": "GF_SERVER_ROOT_URL", "value": "%(protocol)s://%(domain)s/grafana/" },
-        { "name": "GF_SERVER_SERVE_FROM_SUB_PATH", "value": "true" },
-        { "name": "GF_SERVER_DOMAIN", "value": "localhost" }
-      ],
-      "mountPoints": [
-        {
-          "sourceVolume": "grafana-provisioning",
-          "containerPath": "/etc/grafana/provisioning"
-        },
-        {
-          "sourceVolume": "grafana-dashboards",
-          "containerPath": "/var/lib/grafana/dashboards"
-        }
-      ]
+      "sourceVolume": "grafana-provisioning",
+      "containerPath": "/etc/grafana/provisioning"
     },
+    {
+      "sourceVolume": "grafana-dashboards",
+      "containerPath": "/var/lib/grafana/dashboards"
+    }
+  ]
+},
     {
       "name": "node-exporter",
       "image": "prom/node-exporter:v1.8.0",
