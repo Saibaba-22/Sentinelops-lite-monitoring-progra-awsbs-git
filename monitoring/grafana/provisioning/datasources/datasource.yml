@@ -12,4 +12,4 @@ datasources:
     editable: true
     jsonData:
       httpMethod: POST
-      timeInterval: 15s
+      timeInterval: "15s"
