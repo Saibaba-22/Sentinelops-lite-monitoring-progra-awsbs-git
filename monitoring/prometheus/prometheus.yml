@@ -17,21 +17,22 @@ rule_files:
   - /etc/prometheus/recording.rules.yml
 
 scrape_configs:
-  - job_name: 'flask-app'
+  - job_name: prometheus
     static_configs:
-      - targets: ['app:5000']        # ✅ container name via docker link
+      - targets: ['localhost:9090']
+    metrics_path: /prometheus/metrics
+    
+  - job_name: flask-app
     metrics_path: /metrics
-    labels: {}
-    relabel_configs: []
-    params: {}
-    scheme: http
-
-  - job_name: 'node-exporter'
     static_configs:
-      - targets: ['node-exporter:9100']  # ✅ container name via docker link
+      - targets: ["172.17.0.1:5000"]
+        labels:
+          service: sentinelops-lite
+
+  - job_name: node-exporter
+    static_configs:
+      - targets: ["172.17.0.1:9100"]
+        labels:
+          service: infrastructure
     metrics_path: /metrics
 
-  - job_name: 'prometheus'
-    static_configs:
-      - targets: ['localhost:9090']      # ✅ prometheus scrapes itself
-    metrics_path: /prometheus/metrics   # ✅ because --web.external-url=/prometheus/
