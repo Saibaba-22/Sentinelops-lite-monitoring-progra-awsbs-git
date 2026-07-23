@@ -9,7 +9,7 @@
       "portMappings": [
         { "hostPort": 80, "containerPort": 80 }
       ],
-      "links": ["app"],
+      "links": ["app", "prometheus", "grafana", "node-exporter"],
       "mountPoints": [
         {
           "sourceVolume": "nginx-conf",
@@ -19,7 +19,7 @@
     },
     {
       "name": "app",
-      "image": "replace_with_dockerhub_image_uri",
+      "image": "saibaba22/sentinelops-lite-monitoring-progra-awsbs-git:latest",
       "essential": true,
       "memory": 256,
       "portMappings": [
@@ -43,10 +43,11 @@
       "name": "prometheus",
       "image": "prom/prometheus:v2.53.0",
       "essential": true,
-      "memory": 128,
+      "memory": 256,
       "portMappings": [
         { "hostPort": 9090, "containerPort": 9090 }
       ],
+      "links": ["app", "node-exporter"],
       "mountPoints": [
         {
           "sourceVolume": "prometheus-conf",
@@ -54,20 +55,26 @@
         }
       ],
       "command": [
-        "--config.file=/etc/prometheus/prometheus.yml"
+        "--config.file=/etc/prometheus/prometheus.yml",
+        "--web.external-url=/prometheus/",
+        "--web.route-prefix=/"
       ]
     },
     {
       "name": "grafana",
       "image": "grafana/grafana:11.1.0",
       "essential": true,
-      "memory": 128,
+      "memory": 256,
       "portMappings": [
         { "hostPort": 3000, "containerPort": 3000 }
       ],
+      "links": ["prometheus"],
       "environment": [
         { "name": "GF_SECURITY_ADMIN_USER", "value": "admin" },
-        { "name": "GF_USERS_ALLOW_SIGN_UP", "value": "false" }
+        { "name": "GF_SECURITY_ADMIN_PASSWORD", "value": "admin123" },
+        { "name": "GF_USERS_ALLOW_SIGN_UP", "value": "false" },
+        { "name": "GF_SERVER_ROOT_URL", "value": "%(protocol)s://%(domain)s/grafana/" },
+        { "name": "GF_SERVER_SERVE_FROM_SUB_PATH", "value": "true" }
       ],
       "mountPoints": [
         {
