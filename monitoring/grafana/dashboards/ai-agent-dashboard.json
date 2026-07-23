@@ -9,117 +9,185 @@
   "timezone": "",
   "title": "AI Agent",
   "uid": "ai-agent",
-  "version": 1,
+  "version": 2,
   "panels": [
     {
       "id": 1,
       "type": "stat",
-      "title": "Current Agent State",
+      "title": "Agent States",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "gridPos": { "h": 6, "w": 12, "x": 0, "y": 0 },
       "fieldConfig": {
         "defaults": {
           "unit": "short",
-          "custom": {},
           "thresholds": {
-            "mode": "categorical",
-            "steps": [
-              { "color": "blue", "value": 0 },
-              { "color": "green", "value": 1 }
-            ]
-          },
-          "mappings": [
-            { "type": "value", "options": { "0": { "text": "Idle" }, "1": { "text": "Running" }, "2": { "text": "Waiting" }, "3": { "text": "Approved" }, "4": { "text": "Rejected" }, "5": { "text": "Failed" } } }
-          ]
+            "mode": "absolute",
+            "steps": [{"color":"blue","value":0},{"color":"green","value":1}]
+          }
         },
         "overrides": []
       },
-      "options": { "reduceOptions": { "calcs": ["lastNotNull"] } },
-      "targets": [ { "refId": "A", "expr": "max(agent_state)", "legendFormat": "state" } ]
+      "targets": [
+        { "refId": "A", "expr": "agent_state == 1", "legendFormat": "{{agent_name}} [{{stage}}] → {{state}}" }
+      ]
     },
     {
       "id": 2,
-      "type": "timeseries",
-      "title": "Agent State Timeline",
+      "type": "stat",
+      "title": "Total Tokens Used",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 0 },
-      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 30, "showPoints": "never" } }, "overrides": [] },
-      "targets": [ { "refId": "A", "expr": "agent_state", "legendFormat": "{{state}}" } ]
+      "gridPos": { "h": 6, "w": 4, "x": 12, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "targets": [{ "refId": "A", "expr": "sum(agent_token_usage_total)", "legendFormat": "Tokens" }]
     },
     {
       "id": 3,
-      "type": "barchart",
-      "title": "Task Outcomes",
+      "type": "stat",
+      "title": "Total API Calls",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 6 },
-      "fieldConfig": { "defaults": { "unit": "short", "custom": {} }, "overrides": [] },
-      "targets": [ { "refId": "A", "expr": "sum(agent_tasks_total) by (result)", "legendFormat": "{{result}}" } ]
+      "gridPos": { "h": 6, "w": 4, "x": 16, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "targets": [{ "refId": "A", "expr": "sum(agent_api_calls_total)", "legendFormat": "API Calls" }]
     },
     {
       "id": 4,
-      "type": "timeseries",
-      "title": "Token Usage (tokens/sec)",
+      "type": "stat",
+      "title": "Total Tasks",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 6 },
-      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "showPoints": "never" } }, "overrides": [] },
-      "targets": [ { "refId": "A", "expr": "sum(rate(agent_token_usage_total[5m]))", "legendFormat": "tokens/s" } ]
+      "gridPos": { "h": 6, "w": 4, "x": 20, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "targets": [{ "refId": "A", "expr": "sum(agent_tasks_total)", "legendFormat": "Tasks" }]
     },
     {
       "id": 5,
       "type": "timeseries",
-      "title": "API Calls (success/failed)",
+      "title": "Token Usage Over Time",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 14 },
-      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "showPoints": "never" } }, "overrides": [] },
-      "targets": [ { "refId": "A", "expr": "sum(rate(agent_api_calls_total[5m])) by (status)", "legendFormat": "{{status}}" } ]
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 6 },
+      "fieldConfig": {
+        "defaults": { "unit": "short", "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "showPoints": "never" } },
+        "overrides": []
+      },
+      "targets": [
+        { "refId": "A", "expr": "sum(rate(agent_prompt_tokens_total[5m]))*60", "legendFormat": "Prompt/min" },
+        { "refId": "B", "expr": "sum(rate(agent_completion_tokens_total[5m]))*60", "legendFormat": "Completion/min" },
+        { "refId": "C", "expr": "sum(rate(agent_token_usage_total[5m]))*60", "legendFormat": "Total/min" }
+      ]
     },
     {
       "id": 6,
       "type": "timeseries",
-      "title": "API Response Time (s)",
+      "title": "API Calls Rate",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 14 },
-      "fieldConfig": { "defaults": { "unit": "s", "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "showPoints": "never" } }, "overrides": [] },
-      "targets": [ { "refId": "A", "expr": "agent_api_response_time_seconds", "legendFormat": "resp" } ]
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 6 },
+      "fieldConfig": {
+        "defaults": { "unit": "reqpm", "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "showPoints": "never" } },
+        "overrides": []
+      },
+      "targets": [
+        { "refId": "A", "expr": "sum(rate(agent_api_calls_total{status='success'}[5m]))*60", "legendFormat": "Success/min" },
+        { "refId": "B", "expr": "sum(rate(agent_api_calls_total{status='failed'}[5m]))*60", "legendFormat": "Failed/min" }
+      ]
     },
     {
       "id": 7,
-      "type": "stat",
-      "title": "Total Decisions",
+      "type": "barchart",
+      "title": "Task Outcomes",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "h": 6, "w": 6, "x": 0, "y": 22 },
-      "fieldConfig": { "defaults": { "unit": "short", "custom": {} }, "overrides": [] },
-      "targets": [ { "refId": "A", "expr": "agent_total_decisions" } ]
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 14 },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "targets": [{ "refId": "A", "expr": "sum by(result)(agent_tasks_total)", "legendFormat": "{{result}}" }]
     },
     {
       "id": 8,
-      "type": "stat",
-      "title": "Queue Size",
+      "type": "timeseries",
+      "title": "API Response Time p50/p95",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "h": 6, "w": 6, "x": 6, "y": 22 },
-      "fieldConfig": { "defaults": { "unit": "short", "custom": {} }, "overrides": [] },
-      "targets": [ { "refId": "A", "expr": "agent_queue_size" } ]
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 14 },
+      "fieldConfig": {
+        "defaults": { "unit": "s", "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "showPoints": "never" } },
+        "overrides": []
+      },
+      "targets": [
+        { "refId": "A", "expr": "histogram_quantile(0.50, rate(agent_api_response_time_seconds_bucket[5m]))", "legendFormat": "p50" },
+        { "refId": "B", "expr": "histogram_quantile(0.95, rate(agent_api_response_time_seconds_bucket[5m]))", "legendFormat": "p95" }
+      ]
     },
     {
       "id": 9,
-      "type": "gauge",
-      "title": "Agent Accuracy",
+      "type": "timeseries",
+      "title": "Execution Duration p50/p95",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "h": 6, "w": 6, "x": 12, "y": 22 },
-      "fieldConfig": { "defaults": { "unit": "percentunit", "min": 0, "max": 1, "custom": { "gauge": { "maxValue": 1, "minValue": 0 } } }, "overrides": [] },
-      "targets": [ { "refId": "A", "expr": "agent_accuracy" } ]
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 22 },
+      "fieldConfig": {
+        "defaults": { "unit": "s", "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "showPoints": "never" } },
+        "overrides": []
+      },
+      "targets": [
+        { "refId": "A", "expr": "histogram_quantile(0.50, rate(agent_execution_duration_seconds_bucket[5m]))", "legendFormat": "p50" },
+        { "refId": "B", "expr": "histogram_quantile(0.95, rate(agent_execution_duration_seconds_bucket[5m]))", "legendFormat": "p95" }
+      ]
     },
     {
       "id": 10,
       "type": "timeseries",
-      "title": "Execution Time (last / avg)",
+      "title": "Execution Time Per Agent",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 28 },
-      "fieldConfig": { "defaults": { "unit": "s", "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "showPoints": "never" } }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 22 },
+      "fieldConfig": {
+        "defaults": { "unit": "s", "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "showPoints": "never" } },
+        "overrides": []
+      },
       "targets": [
-        { "refId": "A", "expr": "agent_execution_time_seconds", "legendFormat": "last" },
-        { "refId": "B", "expr": "agent_avg_execution_time_seconds", "legendFormat": "avg" }
+        { "refId": "A", "expr": "agent_execution_time_seconds", "legendFormat": "{{agent_name}} [{{stage}}]" }
       ]
+    },
+    {
+      "id": 11,
+      "type": "bargauge",
+      "title": "Tokens by Agent",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 30 },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "targets": [{ "refId": "A", "expr": "sum by(agent_name)(agent_token_usage_total)", "legendFormat": "{{agent_name}}" }]
+    },
+    {
+      "id": 12,
+      "type": "piechart",
+      "title": "Prompt vs Completion Tokens",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 30 },
+      "targets": [
+        { "refId": "A", "expr": "sum(agent_prompt_tokens_total)", "legendFormat": "Prompt" },
+        { "refId": "B", "expr": "sum(agent_completion_tokens_total)", "legendFormat": "Completion" }
+      ]
+    },
+    {
+      "id": 13,
+      "type": "stat",
+      "title": "Agent Last Run",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 30 },
+      "fieldConfig": { "defaults": { "unit": "dateTimeAsIso" }, "overrides": [] },
+      "targets": [{ "refId": "A", "expr": "agent_last_run_timestamp_seconds", "legendFormat": "{{agent_name}}" }]
+    },
+    {
+      "id": 14,
+      "type": "stat",
+      "title": "API Key Count",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 4, "w": 8, "x": 0, "y": 38 },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "targets": [{ "refId": "A", "expr": "sum(agent_api_key_count)", "legendFormat": "Keys" }]
+    },
+    {
+      "id": 15,
+      "type": "stat",
+      "title": "Agent Decisions",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 4, "w": 16, "x": 8, "y": 38 },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "targets": [{ "refId": "A", "expr": "agent_last_decision == 1", "legendFormat": "{{agent_name}} → {{decision}}" }]
     }
   ]
 }

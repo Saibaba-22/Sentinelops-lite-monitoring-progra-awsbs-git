@@ -7,18 +7,10 @@ counters and the persisted AI-agent state.
 """
 import time
 from datetime import datetime, timezone
-
 import psutil
 
-from monitoring.metrics import (
-    APP_STATS,
-    START_TIME,
-    DEPLOYMENT_VERSION,
-    BUILD_NUMBER,
-    ENVIRONMENT,
-)
+from monitoring.metrics import ( APP_STATS, START_TIME, DEPLOYMENT_VERSION, BUILD_NUMBER, ENVIRONMENT)
 from monitoring import agent_state as agent_state_store
-
 
 def _system_snapshot():
     mem = psutil.virtual_memory()
@@ -30,7 +22,6 @@ def _system_snapshot():
         load = {"1m": l1, "5m": l5, "15m": l15}
     except Exception:
         load = {"1m": 0, "5m": 0, "15m": 0}
-
     boot = psutil.boot_time()
     try:
         logged_in = len(psutil.users())
@@ -54,7 +45,6 @@ def _system_snapshot():
         "hostname": psutil.users() and __import__("socket").gethostname() or "",
     }
 
-
 def _application_snapshot():
     total = APP_STATS["total_requests"]
     failed = APP_STATS["failed_requests"]
@@ -75,12 +65,9 @@ def _application_snapshot():
         "restart_count": APP_STATS.get("restart_count", 0),
     }
 
-
 def _agent_snapshot():
     state = agent_state_store.load()
     return state.get("agents", {})
-
-
 
 def _deployment_snapshot():
     return {
@@ -90,7 +77,6 @@ def _deployment_snapshot():
         "uptime_seconds": int(time.time() - START_TIME),
         "container_status": 1,
     }
-
 
 def build_status():
     """Return the full aggregated status snapshot as a dict."""
