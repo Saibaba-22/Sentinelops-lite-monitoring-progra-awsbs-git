@@ -13,7 +13,6 @@ import subprocess
 import py_compile
 from pathlib import Path
 
-# Optional monitor
 try:
     from monitor_client import send_agent_status
 except ImportError:
@@ -23,7 +22,6 @@ except ImportError:
 MODEL    = os.getenv("AI_MODEL", "gemini-2.5-flash")
 PROVIDER = os.getenv("AI_PROVIDER", "gemini")
 
-# ── Token tracking globals ────────────────────────────────────────
 _ai_prompt_tokens     = 0
 _ai_completion_tokens = 0
 _ai_total_tokens      = 0
@@ -72,7 +70,6 @@ def ask_ai(prompt):
 
 
 def _send(start, status, decision, error=""):
-    """Helper - sends agent metrics, never raises."""
     try:
         send_agent_status(
             agent_name="test_agent",
@@ -93,8 +90,6 @@ def _send(start, status, decision, error=""):
     except Exception:
         pass
 
-
-# ── Checkers ─────────────────────────────────────────────────────
 
 def find_py_files(root):
     excluded = {
@@ -257,7 +252,7 @@ def check_secrets(root):
 
 
 def check_env(root):
-    issues  = []
+    issues   = []
     env_used = set()
     for fp in find_py_files(root)[:100]:
         try:
@@ -275,14 +270,16 @@ def check_env(root):
     if os.path.exists(example_path):
         try:
             example_vars = set()
-            for line in Path(example_path).read_text(encoding="utf-8", errors="ignore").splitlines():
+            for line in Path(example_path).read_text(
+                encoding="utf-8", errors="ignore"
+            ).splitlines():
                 if "=" in line and not line.strip().startswith("#"):
                     example_vars.add(line.split("=")[0].strip())
             missing = env_used - example_vars
             if missing:
                 issues.append({
                     "FILE": ".env.example", "LINE": "N/A",
-                    "PRESENT_ERROR": f"Vars missing from .env.example: {', '.join(list(missing)[:5])}",
+                    "PRESENT_ERROR": f"Vars missing: {', '.join(list(missing)[:5])}",
                     "EXPECTED_VALUE": ".env.example lists all required vars",
                     "WHY": "CI / new devs will miss required env vars",
                     "SOLUTION": f"Add {', '.join(missing)} to .env.example",
@@ -322,8 +319,6 @@ def format_issue(iss):
     )
 
 
-# ── Main ──────────────────────────────────────────────────────────
-
 def main():
     start = time.perf_counter()
     root  = os.path.abspath(os.getenv("PROJECT_PATH", "."))
@@ -338,7 +333,6 @@ def main():
 
     print(f"[test_agent] static issues: {len(all_issues)}")
 
-    # pytest
     test_code, test_output = try_pytest(root)
     print(f"[test_agent] pytest exit code: {test_code}")
     if (
@@ -357,7 +351,6 @@ def main():
                     "SOLUTION": "Fix failing test",
                 })
 
-    # Write report
     Path("reports").mkdir(exist_ok=True)
     with open("reports/pre_deploy_report.txt", "w", encoding="utf-8") as f:
         if not all_issues:
@@ -366,7 +359,6 @@ def main():
             for iss in all_issues:
                 f.write(format_issue(iss) + "\n---\n")
 
-    # ── PASS ─────────────────────────────────────────────────────
     if not all_issues:
         print("\n✅ No errors found - ready to deploy!")
         if ai_available():
@@ -376,11 +368,9 @@ def main():
                 f"Confirm PASS with one sentence."
             )
             print(f"[AI] {summary}")
-
         _send(start, "approved", "approved")
         sys.exit(0)
 
-    # ── FAIL ─────────────────────────────────────────────────────
     print(f"\n❌ Found {len(all_issues)} issues - blocking deploy:\n")
     for iss in all_issues[:10]:
         print(format_issue(iss))

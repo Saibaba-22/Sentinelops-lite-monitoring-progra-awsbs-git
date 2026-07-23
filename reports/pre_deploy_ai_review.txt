@@ -1,13 +1,14 @@
-Based on the provided output, there is only **1 critical issue** identified, not 3.
-
-Here is the summary of that issue:
+Based on the provided information, there is only **1 critical pre-deploy issue** identified.
 
 ---
 
-### Top 1 Critical Issue:
+**Top Critical Issue:**
 
-**1. Missing Environment Variable in `.env.example`**
-*   **FILE:** `.env.example`
-*   **LINE:** N/A
-*   **PRESENT_ERROR:** The `KEY` variable is missing from `.env.example`. This will cause problems for CI/CD pipelines and new developers who rely on this file to understand required environment variables.
-*   **SOLUTION:** Add `KEY` to the `.env.example` file to ensure all required environment variables are listed.
+1.  **FILE:** `.env.example`
+    *   **LINE:** N/A
+    *   **Issue:** The `.env.example` file is missing the `KEY` variable, which is a required environment variable. This will cause problems for CI/CD pipelines and new developers who won't know about this dependency.
+    *   **Fix:** Add `KEY` to the `.env.example` file.
+
+---
+
+*(Note: Only one critical issue was provided in the input, therefore a list of "top 3" cannot be fully generated.)*

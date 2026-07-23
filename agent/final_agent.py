@@ -334,7 +334,6 @@ def main():
 
     print(f"[final_agent] Found {len(findings)} potential upgrades")
 
-    # Group by category
     by_cat = {}
     for f in findings:
         by_cat.setdefault(f["category"], []).append(f)
@@ -345,38 +344,29 @@ def main():
         report_txt += f"Deployed URL check: {deployed}\n"
     report_txt += f"\nTotal suggestions: {len(findings)}\n"
 
-    for cat in ["Security","Reliability","Performance","Cost","Developer Experience"]:
+    for cat in ["Security", "Reliability", "Performance", "Cost", "Developer Experience"]:
         if cat in by_cat:
             report_txt += f"\n--- {cat.upper()} ({len(by_cat[cat])}) ---\n"
             for i, f in enumerate(by_cat[cat], 1):
                 report_txt += format_upgrade(f, i)
 
-    # AI enhancement if available
     ai_review = ""
     if ai_ok():
         try:
             prompt = f"""
 You are a universal post-deployment DevOps advisor.
-
 Project path: {root}
 Deployed check: {deployed}
 Static findings ({len(findings)}):
-
 {report_txt[:8000]}
 
-Provide:
-1. Top 3 most impactful upgrades with FILE/LINE if applicable, PRESENT vs EXPECTED
-2. Quick wins (less than 1 hour)
-3. Long-term roadmap (security, performance, cost)
-
-Keep concise, actionable, universal for any project.
+Provide top 3 upgrades with PRESENT vs EXPECTED and SOLUTION.
 Format:
 UPGRADE 1: <title>
 CATEGORY: Security/Performance/etc
 PRESENT: current wrong
 EXPECTED: should be
 SOLUTION: command
-
 """
             ai_review = ask_ai(prompt)
             report_txt += "\n\n=== AI ENHANCED UPGRADE ROADMAP ===\n" + ai_review
@@ -390,12 +380,10 @@ SOLUTION: command
         f.write(report_txt)
     with open("final_report.txt", "w", encoding="utf-8") as f:
         f.write(report_txt)
-
-    # Also JSON
     with open("reports/upgrade_report.json", "w", encoding="utf-8") as f:
         json.dump(findings, f, indent=2)
 
-    print(f"\nReports saved: reports/upgrade_report.txt, final_report.txt, reports/upgrade_report.json")
+    print(f"\nReports saved.")
 
     try:
         send_agent_status(
@@ -415,7 +403,9 @@ SOLUTION: command
         )
     except Exception:
         pass
+
     sys.exit(0)
+
 
 if __name__ == "__main__":
     main()

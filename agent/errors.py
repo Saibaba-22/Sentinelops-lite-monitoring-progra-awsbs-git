@@ -47,7 +47,6 @@ def ai_status():
     except Exception as e:
         return False, str(e)
 
-
 def ask_ai(prompt):
     global _ai_prompt_tokens, _ai_completion_tokens, _ai_total_tokens
     global _ai_requests, _ai_response_time
@@ -63,7 +62,6 @@ def ask_ai(prompt):
     except Exception:
         pass
     return (resp.text or "").strip()
-
 
 def collect_context():
     parts = []
