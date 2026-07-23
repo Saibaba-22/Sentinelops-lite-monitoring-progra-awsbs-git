@@ -11,5 +11,7 @@ datasources:
     isDefault: true
     editable: true
     jsonData:
-      httpMethod: POST
-      timeInterval: "15s"
+      timeInterval: "10s"
+      httpMethod: GET
+      prometheusType: Prometheus
+      prometheusVersion: 2.53.0
