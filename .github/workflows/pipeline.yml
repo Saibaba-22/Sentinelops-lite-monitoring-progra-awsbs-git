@@ -250,6 +250,10 @@ jobs:
           AWS_REGION: ${{ env.AWS_REGION }}
           DOCKERHUB_USERNAME: ${{ env.DOCKERHUB_USERNAME }}
           DOCKERHUB_REPOSITORY: ${{ env.DOCKERHUB_REPOSITORY }}
+          MONITOR_API_URL: ${{ secrets.MONITOR_API_URL_AWS }}
+          MONITOR_TOKEN: ${{ secrets.MONITOR_TOKEN_AWS }}
+          AI_MODEL: ${{ vars.AI_MODEL }}
+          AI_PROVIDER: ${{ vars.AI_PROVIDER }}
         run: |
           python agent/errors.py
 
@@ -292,6 +296,10 @@ jobs:
           AZURE_RESOURCE_GROUP: ${{ env.AZURE_RESOURCE_GROUP }}
           DOCKERHUB_USERNAME: ${{ env.DOCKERHUB_USERNAME }}
           DOCKERHUB_REPOSITORY: ${{ env.DOCKERHUB_REPOSITORY }}
+          MONITOR_API_URL: ${{ secrets.MONITOR_API_URL_AWS }}
+          MONITOR_TOKEN: ${{ secrets.MONITOR_TOKEN_AWS }}
+          AI_MODEL: ${{ vars.AI_MODEL }}
+          AI_PROVIDER: ${{ vars.AI_PROVIDER }}
         run: |
           python agent/errors.py
 
