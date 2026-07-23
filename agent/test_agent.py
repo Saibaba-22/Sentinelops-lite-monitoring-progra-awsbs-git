@@ -69,9 +69,19 @@ def ai_available():
         return False
 
 def ask_ai(prompt):
+    global _ai_prompt_tokens, _ai_completion_tokens, _ai_total_tokens, _ai_requests, _ai_response_time
     try:
         client = build_client()
+        t0 = time.perf_counter()
         resp = client.models.generate_content(model=MODEL, contents=prompt)
+        _ai_response_time += time.perf_counter() - t0
+        _ai_requests += 1
+        try:
+            _ai_prompt_tokens     += resp.usage_metadata.prompt_token_count     or 0
+            _ai_completion_tokens += resp.usage_metadata.candidates_token_count or 0
+            _ai_total_tokens      += (_ai_prompt_tokens + _ai_completion_tokens)
+        except Exception:
+            pass
         return (resp.text or "").strip()
     except Exception as e:
         return f"AI unavailable: {e}"
@@ -345,8 +355,22 @@ def main():
             print(f"[AI] {summary}")
         # send monitor
         try:
-            send_agent_status(agent_name="test_agent", stage="pre_deploy", status="approved", decision="pass",
-                              provider=PROVIDER, model=MODEL, execution_time_seconds=time.perf_counter()-start)
+            # SUCCESS call (was decision="pass") ❌
+send_agent_status(
+    agent_name="test_agent",
+    stage="pre_deploy",
+    status="approved",
+    decision="approved",        # ✅ was "pass"
+    provider=PROVIDER,
+    model=MODEL,
+    prompt_tokens=_ai_prompt_tokens,
+    completion_tokens=_ai_completion_tokens,
+    total_tokens=_ai_total_tokens,
+    requests_count=_ai_requests,
+    api_key_count=1,
+    execution_time_seconds=time.perf_counter() - start,
+    api_response_time_seconds=_ai_response_time,
+    )
         except Exception:
             pass
         sys.exit(0)
@@ -382,9 +406,23 @@ SOLUTION: ...
                 f.write(ai_summary)
 
         try:
-            send_agent_status(agent_name="test_agent", stage="pre_deploy", status="rejected", decision="fail",
-                              provider=PROVIDER, model=MODEL, execution_time_seconds=time.perf_counter()-start,
-                              error=f"{len(all_issues)} pre-deploy issues")
+            # FAILURE call (was decision="fail") ❌
+send_agent_status(
+    agent_name="test_agent",
+    stage="pre_deploy",
+    status="rejected",
+    decision="rejected",        # ✅ was "fail"
+    provider=PROVIDER,
+    model=MODEL,
+    prompt_tokens=_ai_prompt_tokens,
+    completion_tokens=_ai_completion_tokens,
+    total_tokens=_ai_total_tokens,
+    requests_count=_ai_requests,
+    api_key_count=1,
+    execution_time_seconds=time.perf_counter() - start,
+    api_response_time_seconds=_ai_response_time,
+    error=f"{len(all_issues)} pre-deploy issues",
+)
         except Exception:
             pass
         sys.exit(1)
