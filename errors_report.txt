@@ -6,22 +6,27 @@ WHY: The deployment pipeline requires the Docker Hub username to tag and push Do
 SOLUTION: Set DOCKERHUB_USERNAME as a GitHub repository variable in your repository's settings (Settings → Secrets and variables → Actions → Variables).
 
 --- RAW CONTEXT ---
-es_secrets.txt ---
-A. GitHub Repository Variables
-Go to:
+dashboard.css
+│   │
+│   ├───images
+│   └───js
+│           dashboard.js
+│
+└───templates
+        dashboard.html
+        index.html
 
-text
 
-GitHub Repository
-→ Settings
-→ Secrets and variables
-→ Actions
-→ Variables
-→ New repository variable
-Add these.
-
-Variable name	Example value	Required?	Purpose
-DOCKERHUB_USERNAME	saibaba
+--- requirements.txt ---
+flask==3.0.3
+gunicorn==22.0.0
+pytest==8.2.0
+psutil==6.0.0
+google-genai
+requests
+tzdata
+prometheus_client==0.20.0
+pyyaml=
 
 --- Filestructure.txt ---
     # (new) Post-deploy verification → final_review.txt
@@ -338,7 +343,5 @@ MONITOR_TOKEN_AZURE
 monitor token in power shell 
 [guid]::NewGuid().ToString("N") + [guid]::NewGuid().ToString("N")
 
-
-=== RECENT TRACEBACKS ===
 
 ls -la:

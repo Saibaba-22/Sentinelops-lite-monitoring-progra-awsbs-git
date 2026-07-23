@@ -53,13 +53,14 @@ def ai_ok():
         return False
 
 def ask_ai(prompt):
-    global _ai_prompt_tokens, _ai_completion_tokens, _ai_total_tokens, _ai_requests, _ai_response_time
+    global _ai_prompt_tokens, _ai_completion_tokens, _ai_total_tokens
+    global _ai_requests, _ai_response_time
     try:
         client = build_client()
-        t0 = time.perf_counter()
+        t0   = time.perf_counter()
         resp = client.models.generate_content(model=MODEL, contents=prompt)
         _ai_response_time += time.perf_counter() - t0
-        _ai_requests += 1
+        _ai_requests      += 1
         try:
             _ai_prompt_tokens     += resp.usage_metadata.prompt_token_count     or 0
             _ai_completion_tokens += resp.usage_metadata.candidates_token_count or 0
@@ -397,26 +398,23 @@ SOLUTION: command
     print(f"\nReports saved: reports/upgrade_report.txt, final_report.txt, reports/upgrade_report.json")
 
     try:
-        # was decision="healthy"/"degraded" ❌
-send_agent_status(
-    agent_name="final_agent",
-    stage="post_deploy",
-    status="approved",
-    decision="approved",        # ✅ was "healthy"/"degraded"
-    provider=PROVIDER,
-    model=MODEL,
-    prompt_tokens=_ai_prompt_tokens,
-    completion_tokens=_ai_completion_tokens,
-    total_tokens=_ai_total_tokens,
-    requests_count=_ai_requests,
-    api_key_count=1,
-    execution_time_seconds=time.perf_counter() - start,
-    api_response_time_seconds=_ai_response_time,
-)
+        send_agent_status(
+            agent_name="final_agent",
+            stage="post_deploy",
+            status="approved",
+            decision="approved",
+            provider=PROVIDER,
+            model=MODEL,
+            prompt_tokens=_ai_prompt_tokens,
+            completion_tokens=_ai_completion_tokens,
+            total_tokens=_ai_total_tokens,
+            requests_count=_ai_requests,
+            api_key_count=1,
+            execution_time_seconds=round(time.perf_counter() - start, 4),
+            api_response_time_seconds=round(_ai_response_time, 4),
+        )
     except Exception:
         pass
-
-    # Exit 0 always - upgrades are suggestions not failures
     sys.exit(0)
 
 if __name__ == "__main__":

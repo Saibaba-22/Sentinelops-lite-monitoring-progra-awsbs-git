@@ -1,1 +1,8 @@
-No issues found - project looks clean for deployment
+FILE: .env.example
+LINE: N/A
+PRESENT_ERROR: Vars missing from .env.example: KEY
+EXPECTED_VALUE: .env.example lists all required vars
+WHY: CI / new devs will miss required env vars
+SOLUTION: Add KEY to .env.example
+
+---
