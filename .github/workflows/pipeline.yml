@@ -21,16 +21,14 @@ env:
   APP_HEALTH_PATH: ${{ vars.APP_HEALTH_PATH }}
   GITHUB_SHA: ${{ github.sha }}
 
-  # AWS
-  AWS_APP_NAME: ${{ vars.APP_NAME }}
-  AWS_ENV_NAME: ${{ vars.ENV_NAME }}
+  # AWS — FIXED: variable names match GitHub Variables
+  AWS_APP_NAME: ${{ vars.AWS_APP_NAME }}
+  AWS_ENV_NAME: ${{ vars.AWS_ENV_NAME }}
   AWS_REGION: ${{ vars.AWS_REGION }}
 
   # Azure
   AZURE_WEBAPP_NAME: ${{ vars.AZURE_WEBAPP_NAME }}
   AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
-  MONITOR_API_URL: ${{ secrets.MONITOR_API_URL_AWS }}
-  MONITOR_TOKEN: ${{ secrets.MONITOR_TOKEN_AWS }}
 
 jobs:
   pre_deploy:
@@ -56,13 +54,10 @@ jobs:
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           TARGET_CLOUD: ${{ env.TARGET_CLOUD }}
-
           AI_PROVIDER: ${{ vars.AI_PROVIDER }}
           AI_MODEL: ${{ vars.AI_MODEL }}
-
           MONITOR_API_URL: ${{ github.event.inputs.cloud == 'aws' && secrets.MONITOR_API_URL_AWS || secrets.MONITOR_API_URL_AZURE }}
           MONITOR_TOKEN: ${{ github.event.inputs.cloud == 'aws' && secrets.MONITOR_TOKEN_AWS || secrets.MONITOR_TOKEN_AZURE }}
-
         run: |
           python agent/test_agent.py
 
@@ -124,8 +119,6 @@ jobs:
       - name: Log in to Docker Hub
         run: echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u "${{ env.DOCKERHUB_USERNAME }}" --password-stdin
 
-      # FIX: Build and Push Docker image using Buildx with provenance=false and correct platform targeting.
-      # This outputs a standard single-image manifest format, preventing the "unsupported manifest format" error on AWS Elastic Beanstalk.
       - name: Build and Push Docker image
         run: |
           docker buildx build \
@@ -155,15 +148,6 @@ jobs:
         if: env.TARGET_CLOUD == 'aws'
         run: |
           pip install awsebcli awscli
-
-      - name: Verify Docker Hub image exists
-        if: env.TARGET_CLOUD == 'aws'
-        run: |
-          echo "Checking image:"
-          echo "docker.io/${DOCKERHUB_USERNAME}/${DOCKERHUB_REPOSITORY}:latest"
-
-          docker manifest inspect docker.io/${DOCKERHUB_USERNAME}/${DOCKERHUB_REPOSITORY}:latest
-          docker pull docker.io/${DOCKERHUB_USERNAME}/${DOCKERHUB_REPOSITORY}:latest
 
       - name: Update EB deployment image
         if: env.TARGET_CLOUD == 'aws'
@@ -209,7 +193,6 @@ jobs:
           echo "===== Git status ====="
           git status --short
 
-      # ---- FIX: Initialize EB CLI before deploying ----
       - name: Initialize EB CLI
         if: env.TARGET_CLOUD == 'aws'
         run: |
@@ -252,7 +235,7 @@ jobs:
             echo "❌ Deploy failed! Health: $STATUS"
             exit 1
           fi
-          
+
       - name: Run deploy-time error agent for AWS
         if: steps.aws_deploy.outcome == 'failure' && env.TARGET_CLOUD == 'aws'
         env:
@@ -301,7 +284,7 @@ jobs:
             --resource-group "${AZURE_RESOURCE_GROUP}"
 
       - name: Run deploy-time error agent for Azure
-        if: steps.azure_deploy.outcome != 'failure' && env.TARGET_CLOUD == 'azure'
+        if: steps.azure_deploy.outcome == 'failure' && env.TARGET_CLOUD == 'azure'
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           TARGET_CLOUD: azure
@@ -309,8 +292,9 @@ jobs:
           AZURE_RESOURCE_GROUP: ${{ env.AZURE_RESOURCE_GROUP }}
           DOCKERHUB_USERNAME: ${{ env.DOCKERHUB_USERNAME }}
           DOCKERHUB_REPOSITORY: ${{ env.DOCKERHUB_REPOSITORY }}
+          # FIXED: Using AZURE secrets, not AWS
           MONITOR_API_URL: ${{ secrets.MONITOR_API_URL_AZURE }}
-          MONITOR_TOKEN: ${{ secrets.MONITOR_TOKEN_AWS }}
+          MONITOR_TOKEN: ${{ secrets.MONITOR_TOKEN_AZURE }}
           AI_MODEL: ${{ vars.AI_MODEL }}
           AI_PROVIDER: ${{ vars.AI_PROVIDER }}
         run: |
@@ -324,7 +308,7 @@ jobs:
 
       # ---------------- RESOLVE APP URL ----------------
       - name: Resolve AWS app URL
-        if: env.TARGET_CLOUD == 'aws'
+        if: env.TARGET_CLOUD == 'aws' && steps.aws_deploy.outcome == 'success'
         id: resolve-url-aws
         run: |
           CNAME=$(aws elasticbeanstalk describe-environments \
@@ -335,7 +319,7 @@ jobs:
           echo "app_url=http://${CNAME}" >> "$GITHUB_OUTPUT"
 
       - name: Resolve Azure app URL
-        if: env.TARGET_CLOUD == 'azure'
+        if: env.TARGET_CLOUD == 'azure' && steps.azure_deploy.outcome == 'success'
         id: resolve-url-azure
         run: |
           HOSTNAME=$(az webapp show \
@@ -368,6 +352,7 @@ jobs:
   post_deploy:
     name: Post-deploy verification
     needs: deploy
+    if: needs.deploy.result == 'success'
     runs-on: ubuntu-latest
 
     env:
@@ -416,7 +401,6 @@ jobs:
           DEPLOY_URL: ${{ env.APP_URL }}
           MONITOR_API_URL: ${{ github.event.inputs.cloud == 'aws' && secrets.MONITOR_API_URL_AWS || secrets.MONITOR_API_URL_AZURE }}
           MONITOR_TOKEN: ${{ github.event.inputs.cloud == 'aws' && secrets.MONITOR_TOKEN_AWS || secrets.MONITOR_TOKEN_AZURE }}
-
         run: |
           python agent/final_agent.py
 

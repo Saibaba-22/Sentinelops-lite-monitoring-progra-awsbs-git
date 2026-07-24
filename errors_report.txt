@@ -1,33 +1,28 @@
 FILE: N/A
 LINE: N/A
-PRESENT_ERROR: The DOCKERHUB_USERNAME environment variable, required for Docker Hub operations, is currently N/A.
-EXPECTED_VALUE: The DOCKERHUB_USERNAME environment variable should be set to your actual Docker Hub username.
-WHY: The deployment pipeline requires the Docker Hub username to tag and push Docker images, but this critical variable is not configured in the environment.
-SOLUTION: Set DOCKERHUB_USERNAME as a GitHub repository variable in your repository's settings (Settings → Secrets and variables → Actions → Variables).
+PRESENT_ERROR: The 'docker' command is not recognized, preventing any Docker-related operations.
+EXPECTED_VALUE: The 'docker' command should be executable, meaning Docker is installed and configured in the system's PATH.
+WHY: The Docker client software is not installed on the system where the deployment command was attempted, or its executable path is not correctly added to the system's PATH environment variable.
+SOLUTION: Install Docker Desktop or Docker Engine on the system and ensure its installation directory is added to the system's PATH, then restart the terminal.
 
 --- RAW CONTEXT ---
-ic
-│   ├───css
-│   │       dashboard.css
-│   │
-│   ├───images
-│   └───js
-│           dashboard.js
-│
-└───templates
-        dashboard.html
-        index.html
+.txt ---
+A. GitHub Repository Variables
+Go to:
 
+text
 
---- requirements.txt ---
-flask==3.0.3
-gunicorn==22.0.0
-pytest==8.2.0
-psutil==6.0.0
-google-genai
-requests
-tzdata
-promet
+GitHub Repository
+→ Settings
+→ Secrets and variables
+→ Actions
+→ Variables
+→ New repository variable
+Add these.
+
+Variable name	Example value	Required?	Purpose
+DOCKERHUB_USERNAME	saibaba22	Yes	Your Docker Hub username
+DOCKER
 
 --- Filestructure.txt ---
     # (new) Post-deploy verification → final_review.txt
@@ -246,7 +241,6 @@ requests
 tzdata
 prometheus_client==0.20.0
 pyyaml==6.0.1
-
 
 --- variables_secrets.txt ---
 A. GitHub Repository Variables

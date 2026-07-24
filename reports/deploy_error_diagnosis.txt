@@ -1,6 +1,6 @@
 FILE: N/A
 LINE: N/A
-PRESENT_ERROR: The DOCKERHUB_USERNAME environment variable, required for Docker Hub operations, is currently N/A.
-EXPECTED_VALUE: The DOCKERHUB_USERNAME environment variable should be set to your actual Docker Hub username.
-WHY: The deployment pipeline requires the Docker Hub username to tag and push Docker images, but this critical variable is not configured in the environment.
-SOLUTION: Set DOCKERHUB_USERNAME as a GitHub repository variable in your repository's settings (Settings → Secrets and variables → Actions → Variables).
+PRESENT_ERROR: The 'docker' command is not recognized, preventing any Docker-related operations.
+EXPECTED_VALUE: The 'docker' command should be executable, meaning Docker is installed and configured in the system's PATH.
+WHY: The Docker client software is not installed on the system where the deployment command was attempted, or its executable path is not correctly added to the system's PATH environment variable.
+SOLUTION: Install Docker Desktop or Docker Engine on the system and ensure its installation directory is added to the system's PATH, then restart the terminal.
