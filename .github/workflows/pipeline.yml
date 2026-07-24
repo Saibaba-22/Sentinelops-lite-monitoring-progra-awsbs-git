@@ -237,8 +237,6 @@ jobs:
         continue-on-error: true
         run: |
           eb deploy "${AWS_ENV_NAME}" --timeout 20 || true
-
-          # Check actual EB health instead of eb CLI exit code
           sleep 30
           STATUS=$(aws elasticbeanstalk describe-environments \
             --environment-names "${AWS_ENV_NAME}" \
@@ -256,7 +254,7 @@ jobs:
           fi
           
       - name: Run deploy-time error agent for AWS
-        if: steps.aws_deploy.outcome != 'failure' && env.TARGET_CLOUD == 'aws'
+        if: steps.aws_deploy.outcome == 'failure' && env.TARGET_CLOUD == 'aws'
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           TARGET_CLOUD: aws
