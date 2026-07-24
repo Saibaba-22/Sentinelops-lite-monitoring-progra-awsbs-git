@@ -249,9 +249,6 @@ jobs:
           eb logs "${AWS_ENV_NAME}" --all 2>&1 | tail -200
 
       - name: Run deploy-time error agent for AWS
-        if: steps.aws_deploy.outcome == 'failure' && env.TARGET_CLOUD == 'aws'
-
-      - name: Run deploy-time error agent for AWS
         if: steps.aws_deploy.outcome != 'failure' && env.TARGET_CLOUD == 'aws'
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
