@@ -209,7 +209,6 @@ jobs:
           echo "===== Git status ====="
           git status --short
 
-
       # ---- FIX: Initialize EB CLI before deploying ----
       - name: Initialize EB CLI
         if: env.TARGET_CLOUD == 'aws'
@@ -239,17 +238,13 @@ jobs:
         run: |
           eb deploy "${AWS_ENV_NAME}"
 
-      # ✅ ADD THE NEW STEP HERE ↓
-
       - name: Get EB logs on failure
         if: steps.aws_deploy.outcome == 'failure' && env.TARGET_CLOUD == 'aws'
         run: |
           echo "=== EB Status ==="
           eb status "${AWS_ENV_NAME}"
-          
           echo "=== EB Health ==="
           eb health "${AWS_ENV_NAME}"
-          
           echo "=== EB Logs ==="
           eb logs "${AWS_ENV_NAME}" --all 2>&1 | tail -200
 
