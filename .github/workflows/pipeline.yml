@@ -241,7 +241,7 @@ jobs:
           eb deploy "${AWS_ENV_NAME}" 
 
       - name: Run deploy-time error agent for AWS
-        if: steps.aws_deploy.outcome != 'success' && env.TARGET_CLOUD == 'aws'
+        if: steps.aws_deploy.outcome != 'failure' && env.TARGET_CLOUD == 'aws'
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           TARGET_CLOUD: aws
@@ -288,7 +288,7 @@ jobs:
             --resource-group "${AZURE_RESOURCE_GROUP}"
 
       - name: Run deploy-time error agent for Azure
-        if: steps.azure_deploy.outcome != 'success' && env.TARGET_CLOUD == 'azure'
+        if: steps.azure_deploy.outcome != 'failure' && env.TARGET_CLOUD == 'azure'
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           TARGET_CLOUD: azure
