@@ -236,7 +236,24 @@ jobs:
         if: env.TARGET_CLOUD == 'aws'
         continue-on-error: true
         run: |
-          eb deploy "${AWS_ENV_NAME}"
+          eb deploy "${AWS_ENV_NAME}" --timeout 20 || true
+
+          # Check actual EB health instead of eb CLI exit code
+          sleep 30
+          STATUS=$(aws elasticbeanstalk describe-environments \
+            --environment-names "${AWS_ENV_NAME}" \
+            --query 'Environments[0].Health' \
+            --output text)
+
+          echo "EB Environment Health: $STATUS"
+
+          if [ "$STATUS" = "Green" ] || [ "$STATUS" = "Ok" ]; then
+            echo "✅ Deploy successful!"
+            exit 0
+          else
+            echo "❌ Deploy failed! Health: $STATUS"
+            exit 1
+          fi
 
       - name: Get EB logs on failure
         if: steps.aws_deploy.outcome == 'failure' && env.TARGET_CLOUD == 'aws'
@@ -247,7 +264,7 @@ jobs:
           eb health "${AWS_ENV_NAME}"
           echo "=== EB Logs ==="
           eb logs "${AWS_ENV_NAME}" --all 2>&1 | tail -200
-
+          
       - name: Run deploy-time error agent for AWS
         if: steps.aws_deploy.outcome != 'failure' && env.TARGET_CLOUD == 'aws'
         env:
