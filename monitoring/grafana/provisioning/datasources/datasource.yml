@@ -7,11 +7,11 @@ datasources:
     access: proxy
 #    url: http://prometheus:9090
 #    url: http://host.docker.internal:9090
-    url: http://172.17.0.1:9090/prometheus
+    url: http://172.17.0.1:9090 #/prometheus
     isDefault: true
     editable: true
     jsonData:
       timeInterval: "10s"
-      httpMethod: GET
+      httpMethod: POST
       prometheusType: Prometheus
       prometheusVersion: 2.53.0
