@@ -23,7 +23,7 @@ env:
 
   # AWS
   AWS_APP_NAME: ${{ vars.AWS_APP_NAME }}
-  AWS_ENV_NAME: ${{ vars.AWS.ENV_NAME }}
+  AWS_ENV_NAME: ${{ vars.AWS_ENV_NAME }}
   AWS_REGION: ${{ vars.AWS_REGION }}
 
   # Azure
