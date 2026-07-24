@@ -254,16 +254,6 @@ jobs:
             echo "❌ Deploy failed! Health: $STATUS"
             exit 1
           fi
-
-      - name: Get EB logs on failure
-        if: steps.aws_deploy.outcome == 'failure' && env.TARGET_CLOUD == 'aws'
-        run: |
-          echo "=== EB Status ==="
-          eb status "${AWS_ENV_NAME}"
-          echo "=== EB Health ==="
-          eb health "${AWS_ENV_NAME}"
-          echo "=== EB Logs ==="
-          eb logs "${AWS_ENV_NAME}" --all 2>&1 | tail -200
           
       - name: Run deploy-time error agent for AWS
         if: steps.aws_deploy.outcome != 'failure' && env.TARGET_CLOUD == 'aws'
