@@ -98,9 +98,6 @@ services:
     mem_limit: 64m
     networks:
       monitoring_net:
+        driver: bridge
         aliases:
           - node-exporter
-
-networks:
-  monitoring_net:
-    driver: bridge
