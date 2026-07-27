@@ -33,6 +33,7 @@
          
         { "name": "BUILD_NUMBER", "value": "replace_with_build_number" },
         { "name": "ENVIRONMENT", "value": "replace_with_environment" }, 
+        { "name": "MONITOR_TOKEN", "value": "replace_with_monitor_token" },
         { "name": "METRICS_INTERVAL", "value": "5" }
       ],
       "mountPoints": [
