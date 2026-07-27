@@ -2,17 +2,10 @@
 #
 # SentinelOps-Lite — AWS Elastic Beanstalk deployment helper (Docker Hub)
 #
-# What it does:
-#   1. Builds the Python application Docker image.
-#   2. Logs in to Docker Hub and PUSHES the image.
-#   3. Resolves EB CNAME and injects Docker Hub image URI + monitoring URLs
-#      into docker-compose.yml (the file EB reads for multi-container).
-#   4. Selects AWS-specific nginx config.
-#   5. Deploys to an Elastic Beanstalk Multi-container Docker environment.
-#
 # Required env:
 #   APP_NAME, ENV_NAME, AWS_REGION        (EB)
 #   DOCKERHUB_USERNAME, DOCKERHUB_TOKEN    (Docker Hub push auth)
+#   MONITOR_TOKEN_AWS                      (Flask /monitor/status POST auth)
 
 set -euo pipefail
 
@@ -23,6 +16,7 @@ IMAGE_NAME="${REPOSITORY:?Set REPOSITORY}"
 IMAGE_TAG="${GITHUB_SHA:0:7}"
 DOCKERHUB_USERNAME="${DOCKERHUB_USERNAME:?Set DOCKERHUB_USERNAME}"
 DOCKERHUB_TOKEN="${DOCKERHUB_TOKEN:?Set DOCKERHUB_TOKEN}"
+MONITOR_TOKEN_AWS="${MONITOR_TOKEN_AWS:-}"
 PLATFORM="${PLATFORM:-}"
 
 export DOCKERHUB_USERNAME
@@ -30,7 +24,7 @@ export IMAGE_NAME
 export IMAGE_TAG
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-COMPOSE_FILE="${ROOT_DIR}/docker-compose.yml"
+DOCKERRUN_FILE="${ROOT_DIR}/Dockerrun.aws.json"
 
 DOCKERHUB_IMAGE="${DOCKERHUB_USERNAME}/${IMAGE_NAME}:${IMAGE_TAG}"
 
@@ -39,6 +33,7 @@ echo "DOCKERHUB_USERNAME=${DOCKERHUB_USERNAME}"
 echo "IMAGE_NAME=${IMAGE_NAME}"
 echo "IMAGE_TAG=${IMAGE_TAG}"
 echo "DOCKERHUB_IMAGE=${DOCKERHUB_IMAGE}"
+echo "MONITOR_TOKEN_AWS=${MONITOR_TOKEN_AWS:+***SET***}"
 echo "===================================="
 
 # ─── Build & Push ───
@@ -82,25 +77,38 @@ fi
 echo "==> Selecting AWS nginx config"
 cp "${ROOT_DIR}/docker/nginx/nginx-aws.conf" "${ROOT_DIR}/docker/nginx/default.conf"
 
-# ─── Update docker-compose.yml ───
+# ─── Update Dockerrun.aws.json ───
 
-echo "==> Replacing placeholders in docker-compose.yml"
+echo "==> Replacing placeholders in Dockerrun.aws.json"
 
 # Image placeholder
-sed -i "s|replace_with_dockerhub_image_uri|${DOCKERHUB_IMAGE}|g" "${COMPOSE_FILE}"
+sed -i "s|replace_with_dockerhub_image_uri|${DOCKERHUB_IMAGE}|g" "${DOCKERRUN_FILE}"
 
 # Monitoring URL placeholders
-sed -i "s|replace_with_prometheus_url|${PROM_URL}|g" "${COMPOSE_FILE}"
-sed -i "s|replace_with_gf_server_domain|${GF_DOMAIN}|g" "${COMPOSE_FILE}"
-sed -i "s|replace_with_gf_server_root_url|${GF_ROOT_URL}|g" "${COMPOSE_FILE}"
+sed -i "s|replace_with_prometheus_url|${PROM_URL}|g" "${DOCKERRUN_FILE}"
+sed -i "s|replace_with_gf_server_domain|${GF_DOMAIN}|g" "${DOCKERRUN_FILE}"
+sed -i "s|replace_with_gf_server_root_url|${GF_ROOT_URL}|g" "${DOCKERRUN_FILE}"
 
 # App env placeholders
-sed -i "s|replace_with_build_number|${GITHUB_SHA}|g" "${COMPOSE_FILE}"
-sed -i "s|replace_with_environment|production|g" "${COMPOSE_FILE}"
+sed -i "s|replace_with_build_number|${GITHUB_SHA}|g" "${DOCKERRUN_FILE}"
+sed -i "s|replace_with_environment|production|g" "${DOCKERRUN_FILE}"
+sed -i "s|replace_with_monitor_token|${MONITOR_TOKEN_AWS}|g" "${DOCKERRUN_FILE}"
+
+# Also update docker-compose.yml (for local dev reference)
+COMPOSE_FILE="${ROOT_DIR}/docker-compose.yml"
+if [ -f "${COMPOSE_FILE}" ]; then
+  sed -i "s|replace_with_dockerhub_image_uri|${DOCKERHUB_IMAGE}|g" "${COMPOSE_FILE}"
+  sed -i "s|replace_with_prometheus_url|${PROM_URL}|g" "${COMPOSE_FILE}"
+  sed -i "s|replace_with_gf_server_domain|${GF_DOMAIN}|g" "${COMPOSE_FILE}"
+  sed -i "s|replace_with_gf_server_root_url|${GF_ROOT_URL}|g" "${COMPOSE_FILE}"
+  sed -i "s|replace_with_build_number|${GITHUB_SHA}|g" "${COMPOSE_FILE}"
+  sed -i "s|replace_with_environment|production|g" "${COMPOSE_FILE}"
+  sed -i "s|replace_with_monitor_token|${MONITOR_TOKEN_AWS}|g" "${COMPOSE_FILE}"
+fi
 
 # ─── Verify no placeholders remain ───
 
-echo "========== VERIFY COMPOSE =========="
+echo "========== VERIFY DOCKERRUN =========="
 
 for placeholder in \
   "replace_with_dockerhub_image_uri" \
@@ -108,8 +116,9 @@ for placeholder in \
   "replace_with_gf_server_domain" \
   "replace_with_gf_server_root_url" \
   "replace_with_build_number" \
-  "replace_with_environment"; do
-  if grep -q "${placeholder}" "${COMPOSE_FILE}" 2>/dev/null; then
+  "replace_with_environment" \
+  "replace_with_monitor_token"; do
+  if grep -q "${placeholder}" "${DOCKERRUN_FILE}" 2>/dev/null; then
     echo "ERROR: Placeholder '${placeholder}' still exists!"
     exit 1
   fi
@@ -117,14 +126,14 @@ done
 echo "✅ All placeholders replaced successfully."
 
 echo "========== Images =========="
-grep "image:" "${COMPOSE_FILE}"
+grep '"image"' "${DOCKERRUN_FILE}"
 
 echo "========== Monitoring URLs =========="
-grep "PROMETHEUS_URL" "${COMPOSE_FILE}"
-grep "GF_SERVER" "${COMPOSE_FILE}"
+grep 'PROMETHEUS_URL' "${DOCKERRUN_FILE}"
+grep 'GF_SERVER' "${DOCKERRUN_FILE}"
 
-echo "========== FINAL COMPOSE =========="
-cat "${COMPOSE_FILE}"
+echo "========== FINAL DOCKERRUN =========="
+cat "${DOCKERRUN_FILE}"
 
 # ─── EB CLI Setup & Deploy ───
 
@@ -167,16 +176,16 @@ eb init -p "${PLATFORM}" -r "${AWS_REGION}" "${APP_NAME}"
 echo "==> Ensuring environment '${ENV_NAME}' exists"
 if ! eb status "${ENV_NAME}" >/dev/null 2>&1; then
   echo "   creating..."
-  eb create "${ENV_NAME}" --platform "${PLATFORM}" --region "${AWS_REGION}" --single --instance-type c7i.flex.large
+  eb create "${ENV_NAME}" --platform "${PLATFORM}" --region "${AWS_REGION}" --single --instance-type t3.small
 fi
 
 echo "==> Deploying to Elastic Beanstalk (${APP_NAME}/${ENV_NAME})"
 echo "===== App image ====="
-grep "image:" "${COMPOSE_FILE}"
+grep '"image"' "${DOCKERRUN_FILE}"
 
 echo "===== Monitoring URLs ====="
-grep "PROMETHEUS_URL" "${COMPOSE_FILE}" || echo "No PROMETHEUS_URL"
-grep "GF_SERVER" "${COMPOSE_FILE}" || echo "No GF_SERVER"
+grep 'PROMETHEUS_URL' "${DOCKERRUN_FILE}" || echo "No PROMETHEUS_URL"
+grep 'GF_SERVER' "${DOCKERRUN_FILE}" || echo "No GF_SERVER"
 
 eb deploy "${ENV_NAME}" --label "build-$(date +%Y%m%d-%H%M%S)"
 
