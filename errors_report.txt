@@ -6,39 +6,7 @@ WHY: The Docker client software is not installed on the system where the deploym
 SOLUTION: Install Docker Desktop or Docker Engine on the system and ensure its installation directory is added to the system's PATH, then restart the terminal.
 
 --- RAW CONTEXT ---
-.txt ---
-A. GitHub Repository Variables
-Go to:
-
-text
-
-GitHub Repository
-→ Settings
-→ Secrets and variables
-→ Actions
-→ Variables
-→ New repository variable
-Add these.
-
-Variable name	Example value	Required?	Purpose
-DOCKERHUB_USERNAME	saibaba22	Yes	Your Docker Hub username
-DOCKER
-
---- Filestructure.txt ---
-    # (new) Post-deploy verification → final_review.txt
-├── review_agent.py             # (new) Pre-deploy review gate
-├── pipeline.yaml               # (new) CI/CD pipeline (GH Actions format)
-├── requirements.txt
-├── test_app.py
-├── README.md
-│
-├── monitoring/
-│   ├── __init__.py
-│   ├── metrics.py              # All Prometheus metric definitions + collectors
-│   ├── collectors.py           # /api/status JSON snapshot
-│   ├── agent_state.py          # Persisted agent state (logs/agent_stats.json)
-│   ├── exporters/
-│   │   └── node-exporter/      # (empty — node-exporter runs from image)
+ (empty — node-exporter runs from image)
 │   ├── prometheus/
 │   │   ├── prometheus.yml
 │   │   ├── alert.rules.yml
@@ -337,6 +305,38 @@ MONITOR_TOKEN_AZURE
 
 monitor token in power shell 
 [guid]::NewGuid().ToString("N") + [guid]::NewGuid().ToString("N")
+
+http://agent.eba-wu4pmszn.us-east-1.elasticbeanstalk.com/prometheus/
+
+
+
+GitHub Variables (11 — all existing, 0 new)
+Variable	Example
+DOCKERHUB_USERNAME	saibaba22
+DOCKERHUB_REPOSITORY	sentinelops-lite-...-git
+PYTHON_VERSION	3.11
+APP_HEALTH_PATH	/health
+AWS_APP_NAME	sentinelops-lite
+AWS_ENV_NAME	sentinelops-lite-prod
+AWS_REGION	us-east-1
+AZURE_WEBAPP_NAME	sentinelops-monitor
+AZURE_RESOURCE_GROUP	sentinelops-rg
+AI_PROVIDER	gemini
+AI_MODEL	gemini-2.5-flash
+
+
+
+GitHub Secrets (9 — all existing, 0 new)
+Secret	Example
+DOCKERHUB_TOKEN	dckr_pat_xxxx...
+AWS_ACCESS_KEY_ID	AKIAxxxx...
+AWS_SECRET_ACCESS_KEY	wJalrxxxx...
+AZURE_CREDENTIALS	JSON service principal
+GEMINI_API_KEY	AIzaxxxx...
+MONITOR_API_URL_AWS	http://agent.eba-.../monitor/status
+MONITOR_TOKEN_AWS	aws-secret-xxx
+MONITOR_API_URL_AZURE	https://app.../monitor/status
+MONITOR_TOKEN_AZURE	azure-secret-xxx
 
 
 ls -la:
