@@ -36,7 +36,7 @@ env:
 
 jobs:
   # ══════════════════════════════════════════════════════════════
-  #  JOB 1: Pre-deploy checks (unchanged)
+  #  JOB 1: Pre-deploy checks
   # ══════════════════════════════════════════════════════════════
   pre_deploy:
     name: Pre-deploy checks
@@ -80,7 +80,7 @@ jobs:
           if-no-files-found: ignore
 
   # ══════════════════════════════════════════════════════════════
-  #  JOB 2: Build & Deploy
+  #  JOB 2: Build, push, deploy
   # ══════════════════════════════════════════════════════════════
   deploy:
     name: Build, push, deploy
@@ -123,7 +123,31 @@ jobs:
             pip install -r requirements.txt
           fi
 
-      # ─── AWS Deployment: uses deploy-aws.sh ───
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        run: echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u "${{ env.DOCKERHUB_USERNAME }}" --password-stdin
+
+      - name: Build and Push Docker image
+        run: |
+          docker buildx build \
+            --platform linux/amd64 \
+            --provenance=false \
+            -f docker/Dockerfile \
+            -t docker.io/${{ env.DOCKERHUB_USERNAME }}/${{ env.DOCKERHUB_REPOSITORY }}:${{ github.sha }} \
+            -t docker.io/${{ env.DOCKERHUB_USERNAME }}/${{ env.DOCKERHUB_REPOSITORY }}:latest \
+            --push \
+            .
+
+      - name: Verify Docker Hub image exists
+        run: |
+          docker manifest inspect docker.io/${DOCKERHUB_USERNAME}/${DOCKERHUB_REPOSITORY}:latest
+          docker pull docker.io/${DOCKERHUB_USERNAME}/${DOCKERHUB_REPOSITORY}:latest
+
+      # ══════════════════════════════════════════════════════════
+      #  AWS SECTION — ALL inline steps with ALL placeholder replacements
+      # ══════════════════════════════════════════════════════════
 
       - name: Configure AWS credentials
         if: env.TARGET_CLOUD == 'aws'
@@ -137,20 +161,205 @@ jobs:
         if: env.TARGET_CLOUD == 'aws'
         run: pip install awsebcli awscli
 
-      - name: Deploy to AWS (deploy-aws.sh)
+      # ─── AWS Step 1: Resolve EB CNAME ───
+      - name: Resolve EB environment CNAME (AWS)
+        if: env.TARGET_CLOUD == 'aws'
+        id: resolve-eb-cname-aws
+        run: |
+          CNAME=$(aws elasticbeanstalk describe-environments \
+            --application-name "${AWS_APP_NAME}" \
+            --environment-names "${AWS_ENV_NAME}" \
+            --query 'Environments[0].CNAME' \
+            --output text)
+
+          echo "EB CNAME: ${CNAME}"
+          echo "eb_cname=${CNAME}" >> "$GITHUB_OUTPUT"
+
+          PROM_URL="http://${CNAME}/prometheus/"
+          GF_DOMAIN="${CNAME}"
+          GF_ROOT_URL="http://${CNAME}/grafana/"
+
+          echo "prom_url=${PROM_URL}" >> "$GITHUB_OUTPUT"
+          echo "gf_domain=${GF_DOMAIN}" >> "$GITHUB_OUTPUT"
+          echo "gf_root_url=${GF_ROOT_URL}" >> "$GITHUB_OUTPUT"
+
+          echo "✅ Resolved monitoring URLs:"
+          echo "   PROMETHEUS_URL:  ${PROM_URL}"
+          echo "   GF_SERVER_DOMAIN: ${GF_DOMAIN}"
+          echo "   GF_SERVER_ROOT_URL: ${GF_ROOT_URL}"
+
+      # ─── AWS Step 2: Update ALL placeholders in Dockerrun.aws.json ───
+      - name: Update Dockerrun.aws.json (image + monitoring URLs + env vars)
+        if: env.TARGET_CLOUD == 'aws'
+        run: |
+          IMAGE="docker.io/${DOCKERHUB_USERNAME}/${DOCKERHUB_REPOSITORY}:latest"
+          PROM_URL="${{ steps.resolve-eb-cname-aws.outputs.prom_url }}"
+          GF_DOMAIN="${{ steps.resolve-eb-cname-aws.outputs.gf_domain }}"
+          GF_ROOT_URL="${{ steps.resolve-eb-cname-aws.outputs.gf_root_url }}"
+          BUILD_NUM="${{ github.sha }}"
+          ENV_NAME="production"
+          MONITOR_TOKEN="${{ secrets.MONITOR_TOKEN_AWS }}"
+
+          python - <<'PY'
+          import json, os
+
+          image       = os.environ["IMAGE"]
+          prom_url    = os.environ["PROM_URL"]
+          gf_domain   = os.environ["GF_DOMAIN"]
+          gf_root     = os.environ["GF_ROOT_URL"]
+          build_num   = os.environ["BUILD_NUM"]
+          env_name    = os.environ["ENV_NAME"]
+          monitor_tok = os.environ["MONITOR_TOKEN"]
+
+          path = "Dockerrun.aws.json"
+          with open(path) as f:
+              data = json.load(f)
+
+          found_app = False
+          found_grafana = False
+
+          for c in data.get("containerDefinitions", []):
+              if c.get("name") == "app":
+                  c["image"] = image
+                  found_app = True
+                  for env in c.get("environment", []):
+                      if env.get("name") == "BUILD_NUMBER":
+                          env["value"] = build_num
+                      if env.get("name") == "ENVIRONMENT":
+                          env["value"] = env_name
+                      if env.get("name") == "MONITOR_TOKEN":
+                          env["value"] = monitor_tok
+
+              if c.get("name") == "grafana":
+                  found_grafana = True
+                  for env in c.get("environment", []):
+                      if env.get("name") == "GF_SERVER_DOMAIN":
+                          env["value"] = gf_domain
+                      if env.get("name") == "GF_SERVER_ROOT_URL":
+                          env["value"] = gf_root
+                      if env.get("name") == "PROMETHEUS_URL":
+                          env["value"] = prom_url
+
+          if not found_app:
+              raise SystemExit("ERROR: app container not found in Dockerrun.aws.json")
+          if not found_grafana:
+              raise SystemExit("ERROR: grafana container not found in Dockerrun.aws.json")
+
+          with open(path, "w") as f:
+              json.dump(data, f, indent=2)
+
+          print("✅ Dockerrun.aws.json updated:")
+          print(f"   app image           → {image}")
+          print(f"   PROMETHEUS_URL       → {prom_url}")
+          print(f"   GF_SERVER_DOMAIN     → {gf_domain}")
+          print(f"   GF_SERVER_ROOT_URL   → {gf_root}")
+          print(f"   BUILD_NUMBER         → {build_num}")
+          print(f"   ENVIRONMENT          → {env_name}")
+          print(f"   MONITOR_TOKEN        → ***SET***")
+          PY
+        env:
+          IMAGE: docker.io/${{ env.DOCKERHUB_USERNAME }}/${{ env.DOCKERHUB_REPOSITORY }}:latest
+          PROM_URL: ${{ steps.resolve-eb-cname-aws.outputs.prom_url }}
+          GF_DOMAIN: ${{ steps.resolve-eb-cname-aws.outputs.gf_domain }}
+          GF_ROOT_URL: ${{ steps.resolve-eb-cname-aws.outputs.gf_root_url }}
+          BUILD_NUM: ${{ github.sha }}
+          ENV_NAME: production
+          MONITOR_TOKEN: ${{ secrets.MONITOR_TOKEN_AWS }}
+
+      # ─── AWS Step 3: Verify no placeholders remain ───
+      - name: Verify Dockerrun placeholders replaced (AWS)
+        if: env.TARGET_CLOUD == 'aws'
+        run: |
+          echo "===== Final Dockerrun.aws.json ====="
+          cat Dockerrun.aws.json
+
+          echo "===== Checking for unreplaced placeholders ====="
+          for placeholder in \
+            "replace_with_dockerhub_image_uri" \
+            "replace_with_prometheus_url" \
+            "replace_with_gf_server_domain" \
+            "replace_with_gf_server_root_url" \
+            "replace_with_build_number" \
+            "replace_with_environment" \
+            "replace_with_monitor_token"; do
+            if grep -q "${placeholder}" Dockerrun.aws.json 2>/dev/null; then
+              echo "ERROR: Placeholder '${placeholder}' still exists!"
+              exit 1
+            fi
+          done
+          echo "✅ All placeholders replaced successfully."
+
+          echo "===== Images ====="
+          grep '"image"' Dockerrun.aws.json
+
+          echo "===== Monitoring URLs ====="
+          grep 'PROMETHEUS_URL' Dockerrun.aws.json
+          grep 'GF_SERVER' Dockerrun.aws.json
+
+      # ─── AWS Step 4: Select nginx config ───
+      - name: Select AWS nginx config
+        if: env.TARGET_CLOUD == 'aws'
+        run: |
+          cp docker/nginx/nginx-aws.conf docker/nginx/default.conf
+          echo "✅ Using nginx-aws.conf"
+
+      # ─── AWS Step 5: Debug EB deployment files ───
+      - name: Debug EB deployment files (AWS)
+        if: env.TARGET_CLOUD == 'aws'
+        run: |
+          echo "===== Dockerrun.aws.json ====="
+          cat Dockerrun.aws.json
+
+          echo "===== Image lines ====="
+          grep -n '"image"' Dockerrun.aws.json
+
+          echo "===== Monitoring URLs ====="
+          grep -n 'PROMETHEUS_URL' Dockerrun.aws.json
+          grep -n 'GF_SERVER' Dockerrun.aws.json
+
+          echo "===== nginx config ====="
+          cat docker/nginx/default.conf
+
+      # ─── AWS Step 6: Initialize EB CLI ───
+      - name: Initialize EB CLI
+        if: env.TARGET_CLOUD == 'aws'
+        run: |
+          eb init "${AWS_APP_NAME}" \
+            --region "${AWS_REGION}" \
+            --platform "Docker" \
+            --no-verify-ssl
+
+      - name: Show deployment files before EB deploy
+        if: env.TARGET_CLOUD == 'aws'
+        run: |
+          echo "===== Dockerrun.aws.json ====="
+          cat Dockerrun.aws.json || true
+
+          echo "===== Images ====="
+          grep -n '"image"' Dockerrun.aws.json || true
+
+      # ─── AWS Step 7: Deploy to Elastic Beanstalk ───
+      - name: Deploy to AWS Elastic Beanstalk
         id: aws_deploy
         if: env.TARGET_CLOUD == 'aws'
         continue-on-error: true
-        env:
-          APP_NAME: ${{ env.AWS_APP_NAME }}
-          ENV_NAME: ${{ env.AWS_ENV_NAME }}
-          AWS_REGION: ${{ env.AWS_REGION }}
-          REPOSITORY: ${{ env.DOCKERHUB_REPOSITORY }}
-          DOCKERHUB_USERNAME: ${{ env.DOCKERHUB_USERNAME }}
-          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
         run: |
-          chmod +x deploy/deploy-aws.sh
-          bash deploy/deploy-aws.sh
+          eb deploy "${AWS_ENV_NAME}" --timeout 20 || true
+          sleep 30
+          STATUS=$(aws elasticbeanstalk describe-environments \
+            --environment-names "${AWS_ENV_NAME}" \
+            --query 'Environments[0].Health' \
+            --output text)
+
+          echo "EB Environment Health: $STATUS"
+
+          if [ "$STATUS" = "Green" ] || [ "$STATUS" = "Ok" ]; then
+            echo "✅ Deploy successful!"
+            exit 0
+          else
+            echo "❌ Deploy failed! Health: $STATUS"
+            exit 1
+          fi
 
       - name: Run deploy-time error agent for AWS
         if: steps.aws_deploy.outcome == 'failure' && env.TARGET_CLOUD == 'aws'
@@ -175,90 +384,11 @@ jobs:
           echo "AWS deployment failed."
           exit 1
 
-      # ─── Azure Deployment: uses deploy-azure.sh ───
-
-      - name: Azure login
-        if: env.TARGET_CLOUD == 'azure'
-        uses: azure/login@v2
-        with:
-          creds: ${{ secrets.AZURE_CREDENTIALS }}
-
-      - name: Deploy to Azure (deploy-azure.sh)
-        id: azure_deploy
-        if: env.TARGET_CLOUD == 'azure'
-        continue-on-error: true
-        env:
-          AZURE_WEBAPP_NAME: ${{ env.AZURE_WEBAPP_NAME }}
-          AZURE_RESOURCE_GROUP: ${{ env.AZURE_RESOURCE_GROUP }}
-          REPOSITORY: ${{ env.DOCKERHUB_REPOSITORY }}
-          DOCKERHUB_USERNAME: ${{ env.DOCKERHUB_USERNAME }}
-          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
-        run: |
-          chmod +x deploy/deploy-azure.sh
-          bash deploy/deploy-azure.sh
-
-      - name: Run deploy-time error agent for Azure
-        if: steps.azure_deploy.outcome == 'failure' && env.TARGET_CLOUD == 'azure'
-        env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          TARGET_CLOUD: azure
-          AZURE_WEBAPP_NAME: ${{ env.AZURE_WEBAPP_NAME }}
-          AZURE_RESOURCE_GROUP: ${{ env.AZURE_RESOURCE_GROUP }}
-          DOCKERHUB_USERNAME: ${{ env.DOCKERHUB_USERNAME }}
-          DOCKERHUB_REPOSITORY: ${{ env.DOCKERHUB_REPOSITORY }}
-          MONITOR_API_URL_AZURE: ${{ secrets.MONITOR_API_URL_AZURE }}
-          MONITOR_TOKEN_AZURE: ${{ secrets.MONITOR_TOKEN_AZURE }}
-          AI_MODEL: ${{ vars.AI_MODEL }}
-          AI_PROVIDER: ${{ vars.AI_PROVIDER }}
-        run: |
-          python agent/errors.py
-
-      - name: Fail if Azure deploy failed
-        if: env.TARGET_CLOUD == 'azure' && steps.azure_deploy.outcome != 'success'
-        run: |
-          echo "Azure deployment failed."
-          exit 1
-
-      # ─── Resolve app URL ───
-
-      - name: Resolve AWS app URL
-        if: env.TARGET_CLOUD == 'aws'
-        id: resolve-url-aws
-        run: |
-          CNAME=$(aws elasticbeanstalk describe-environments \
-            --application-name "${AWS_APP_NAME}" \
-            --environment-names "${AWS_ENV_NAME}" \
-            --query 'Environments[0].CNAME' \
-            --output text)
-          echo "app_url=http://${CNAME}" >> "$GITHUB_OUTPUT"
-
-      - name: Resolve Azure app URL
-        if: env.TARGET_CLOUD == 'azure'
-        id: resolve-url-azure
-        run: |
-          HOSTNAME=$(az webapp show \
-            --name "${AZURE_WEBAPP_NAME}" \
-            --resource-group "${AZURE_RESOURCE_GROUP}" \
-            --query defaultHostName \
-            -o tsv)
-          echo "app_url=https://${HOSTNAME}" >> "$GITHUB_OUTPUT"
-
-      - name: Set final output URL
-        id: resolve-url
-        run: |
-          if [ "${TARGET_CLOUD}" = "aws" ]; then
-            echo "app_url=${{ steps.resolve-url-aws.outputs.app_url }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "app_url=${{ steps.resolve-url-azure.outputs.app_url }}" >> "$GITHUB_OUTPUT"
-          fi
-
-      # ─── Verify Grafana auto-provisioned ───
-
+      # ─── AWS Step 8: Verify Grafana auto-provisioned ───
       - name: Verify Grafana datasource (AWS)
         if: env.TARGET_CLOUD == 'aws' && steps.aws_deploy.outcome == 'success'
         run: |
-          CNAME="${{ steps.resolve-url-aws.outputs.app_url }}"
-          CNAME="${CNAME#http://}"
+          CNAME="${{ steps.resolve-eb-cname-aws.outputs.eb_cname }}"
           GRAFANA_URL="http://${CNAME}/grafana"
 
           echo "🔍 Checking Grafana at: ${GRAFANA_URL}"
@@ -284,11 +414,134 @@ jobs:
             echo "⚠️ Grafana not ready yet (HTTP: ${HEALTH})"
           fi
 
+      # ══════════════════════════════════════════════════════════
+      #  AZURE SECTION
+      # ══════════════════════════════════════════════════════════
+
+      - name: Azure login
+        if: env.TARGET_CLOUD == 'azure'
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      # ─── Azure Step 1: Resolve Azure hostname ───
+      - name: Resolve Azure App Service hostname (Azure)
+        if: env.TARGET_CLOUD == 'azure'
+        id: resolve-azure-hostname
+        run: |
+          HOSTNAME=$(az webapp show \
+            --name "${AZURE_WEBAPP_NAME}" \
+            --resource-group "${AZURE_RESOURCE_GROUP}" \
+            --query defaultHostName \
+            -o tsv)
+
+          echo "Azure Hostname: ${HOSTNAME}"
+          echo "azure_hostname=${HOSTNAME}" >> "$GITHUB_OUTPUT"
+
+          PROM_URL="https://${HOSTNAME}/prometheus/"
+          GF_DOMAIN="${HOSTNAME}"
+          GF_ROOT_URL="https://${HOSTNAME}/grafana/"
+
+          echo "prom_url=${PROM_URL}" >> "$GITHUB_OUTPUT"
+          echo "gf_domain=${GF_DOMAIN}" >> "$GITHUB_OUTPUT"
+          echo "gf_root_url=${GF_ROOT_URL}" >> "$GITHUB_OUTPUT"
+
+          echo "✅ Resolved monitoring URLs:"
+          echo "   PROMETHEUS_URL:  ${PROM_URL}"
+          echo "   GF_SERVER_DOMAIN: ${GF_DOMAIN}"
+          echo "   GF_SERVER_ROOT_URL: ${GF_ROOT_URL}"
+
+      # ─── Azure Step 2: Select nginx config ───
+      - name: Select Azure nginx config
+        if: env.TARGET_CLOUD == 'azure'
+        run: |
+          cp docker/nginx/nginx-azure.conf docker/nginx/default.conf
+          echo "✅ Using nginx-azure.conf"
+
+      # ─── Azure Step 3: Update docker-compose.azure.yml ───
+      - name: Update docker-compose.azure.yml (image + monitoring URLs + env vars)
+        if: env.TARGET_CLOUD == 'azure'
+        run: |
+          IMAGE="docker.io/${DOCKERHUB_USERNAME}/${DOCKERHUB_REPOSITORY}:latest"
+          PROM_URL="${{ steps.resolve-azure-hostname.outputs.prom_url }}"
+          GF_DOMAIN="${{ steps.resolve-azure-hostname.outputs.gf_domain }}"
+          GF_ROOT_URL="${{ steps.resolve-azure-hostname.outputs.gf_root_url }}"
+          BUILD_NUM="${{ github.sha }}"
+          ENV_NAME="production"
+          MONITOR_TOKEN="${{ secrets.MONITOR_TOKEN_AZURE }}"
+
+          sed -i "s|replace_with_dockerhub_image_uri|${IMAGE}|g"           docker-compose.azure.yml
+          sed -i "s|replace_with_prometheus_url|${PROM_URL}|g"             docker-compose.azure.yml
+          sed -i "s|replace_with_gf_server_domain|${GF_DOMAIN}|g"          docker-compose.azure.yml
+          sed -i "s|replace_with_gf_server_root_url|${GF_ROOT_URL}|g"      docker-compose.azure.yml
+          sed -i "s|replace_with_build_number|${BUILD_NUM}|g"              docker-compose.azure.yml
+          sed -i "s|replace_with_environment|${ENV_NAME}|g"                docker-compose.azure.yml
+          sed -i "s|replace_with_monitor_token|${MONITOR_TOKEN}|g"         docker-compose.azure.yml
+
+          echo "✅ docker-compose.azure.yml updated"
+
+      # ─── Azure Step 4: Verify no placeholders ───
+      - name: Verify docker-compose.azure.yml placeholders replaced (Azure)
+        if: env.TARGET_CLOUD == 'azure'
+        run: |
+          for placeholder in \
+            "replace_with_dockerhub_image_uri" \
+            "replace_with_prometheus_url" \
+            "replace_with_gf_server_domain" \
+            "replace_with_gf_server_root_url" \
+            "replace_with_build_number" \
+            "replace_with_environment" \
+            "replace_with_monitor_token"; do
+            if grep -q "${placeholder}" docker-compose.azure.yml 2>/dev/null; then
+              echo "ERROR: Placeholder '${placeholder}' still exists!"
+              exit 1
+            fi
+          done
+          echo "✅ All placeholders replaced successfully."
+
+      # ─── Azure Step 5: Deploy to Azure App Service ───
+      - name: Deploy to Azure App Service
+        id: azure_deploy
+        if: env.TARGET_CLOUD == 'azure'
+        continue-on-error: true
+        run: |
+          az webapp config container set \
+            --name "${AZURE_WEBAPP_NAME}" \
+            --resource-group "${AZURE_RESOURCE_GROUP}" \
+            --multicontainer-config-type COMPOSE \
+            --multicontainer-config-file docker-compose.azure.yml
+
+          az webapp restart \
+            --name "${AZURE_WEBAPP_NAME}" \
+            --resource-group "${AZURE_RESOURCE_GROUP}"
+
+      - name: Run deploy-time error agent for Azure
+        if: steps.azure_deploy.outcome == 'failure' && env.TARGET_CLOUD == 'azure'
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          TARGET_CLOUD: azure
+          AZURE_WEBAPP_NAME: ${{ env.AZURE_WEBAPP_NAME }}
+          AZURE_RESOURCE_GROUP: ${{ env.AZURE_RESOURCE_GROUP }}
+          DOCKERHUB_USERNAME: ${{ env.DOCKERHUB_USERNAME }}
+          DOCKERHUB_REPOSITORY: ${{ env.DOCKERHUB_REPOSITORY }}
+          MONITOR_API_URL_AZURE: ${{ secrets.MONITOR_API_URL_AZURE }}
+          MONITOR_TOKEN_AZURE: ${{ secrets.MONITOR_TOKEN_AZURE }}
+          AI_MODEL: ${{ vars.AI_MODEL }}
+          AI_PROVIDER: ${{ vars.AI_PROVIDER }}
+        run: |
+          python agent/errors.py
+
+      - name: Fail if Azure deploy failed
+        if: env.TARGET_CLOUD == 'azure' && steps.azure_deploy.outcome != 'success'
+        run: |
+          echo "Azure deployment failed."
+          exit 1
+
+      # ─── Azure Step 6: Verify Grafana auto-provisioned ───
       - name: Verify Grafana datasource (Azure)
         if: env.TARGET_CLOUD == 'azure' && steps.azure_deploy.outcome == 'success'
         run: |
-          HOSTNAME="${{ steps.resolve-url-azure.outputs.app_url }}"
-          HOSTNAME="${HOSTNAME#https://}"
+          HOSTNAME="${{ steps.resolve-azure-hostname.outputs.azure_hostname }}"
           GRAFANA_URL="https://${HOSTNAME}/grafana"
 
           echo "🔍 Checking Grafana at: ${GRAFANA_URL}"
@@ -314,6 +567,33 @@ jobs:
             echo "⚠️ Grafana not ready yet (HTTP: ${HEALTH})"
           fi
 
+      # ══════════════════════════════════════════════════════════
+      #  Resolve final app URL (both clouds)
+      # ══════════════════════════════════════════════════════════
+
+      - name: Resolve AWS app URL
+        if: env.TARGET_CLOUD == 'aws'
+        id: resolve-url-aws
+        run: |
+          CNAME="${{ steps.resolve-eb-cname-aws.outputs.eb_cname }}"
+          echo "app_url=http://${CNAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve Azure app URL
+        if: env.TARGET_CLOUD == 'azure'
+        id: resolve-url-azure
+        run: |
+          HOSTNAME="${{ steps.resolve-azure-hostname.outputs.azure_hostname }}"
+          echo "app_url=https://${HOSTNAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Set final output URL
+        id: resolve-url
+        run: |
+          if [ "${TARGET_CLOUD}" = "aws" ]; then
+            echo "app_url=${{ steps.resolve-url-aws.outputs.app_url }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "app_url=${{ steps.resolve-url-azure.outputs.app_url }}" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Upload deploy-time artifacts
         if: always()
         uses: actions/upload-artifact@v4
@@ -326,7 +606,7 @@ jobs:
           if-no-files-found: ignore
 
   # ══════════════════════════════════════════════════════════════
-  #  JOB 3: Post-deploy verification (unchanged)
+  #  JOB 3: Post-deploy verification
   # ══════════════════════════════════════════════════════════════
   post_deploy:
     name: Post-deploy verification
