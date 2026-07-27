@@ -1,17 +1,4 @@
-name: SentinelOps-Lite Multi-Cloud Pipeline
-
-# ════════════════════════════════════════════════════════════════════════
-# MINIMAL FIX for the "Image placeholder not replaced" error
-#
-# This pipeline adds 3 new steps that your old pipeline lacked:
-#   1. Resolve EB CNAME before updating Dockerrun
-#   2. Replace ALL 7 placeholders (not just app image)
-#   3. Verify no placeholders remain before eb deploy
-#
-# Copy this ENTIRE file as your .github/workflows/pipeline.yml
-# ════════════════════════════════════════════════════════════════════════
-
-name: SentinelOps-Lite Multi-Cloud Pipeline
+name: sentinelops-lite-multi-cloud
 
 on:
   workflow_dispatch:
