@@ -39,3 +39,15 @@ groups:
           sum(rate(agent_api_calls_total{status="success"}[5m]))
           /
           sum(rate(agent_api_calls_total[5m]))
+
+      - record: agent:tokens:rate5m
+        expr: sum by (agent_name) (rate(agent_token_usage_total[5m]))
+
+      - record: agent:api_calls:rate5m
+        expr: sum by (agent_name) (rate(agent_api_calls_total[5m]))
+
+      - record: app:request_rate:rate5m
+        expr: sum(rate(app_requests_total[5m]))
+
+      - record: app:error_rate:rate5m
+        expr: sum(rate(app_errors_total[5m]))

@@ -124,3 +124,60 @@ groups:
         annotations:
           summary: "Container reported unhealthy"
           description: "container_status gauge dropped to 0."
+  
+        - alert: AgentFailed
+        expr: agent_state{state="failed"} == 1
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "AI Agent {{ $labels.agent_name }} failed"
+          description: "Agent {{ $labels.agent_name }} on {{ $labels.cloud }}/{{ $labels.stage }} is in failed state"
+
+      - alert: AgentHighTokenUsage
+        expr: increase(agent_token_usage_total[1h]) > 50000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "AI Agent {{ $labels.agent_name }} high token usage"
+          description: "Agent {{ $labels.agent_name }} used more than 50K tokens in the last hour"
+
+      - alert: AgentSlowExecution
+        expr: agent_execution_time_seconds > 30
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "AI Agent {{ $labels.agent_name }} slow execution"
+          description: "Agent {{ $labels.agent_name }} took more than 30s to execute"
+
+  - name: sentinelops_app_alerts
+    rules:
+      - alert: AppDown
+        expr: up{job="flask-app"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Flask app is down"
+          description: "The Flask application has been down for more than 1 minute"
+
+      - alert: HighErrorRate
+        expr: rate(app_errors_total[5m]) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High error rate"
+          description: "Error rate is above 0.1/sec for the last 5 minutes"
+
+      - alert: PrometheusDown
+        expr: up{job="prometheus"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Prometheus is down"
+          description: "Prometheus server is unreachable"
+
