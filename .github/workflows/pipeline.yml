@@ -154,7 +154,7 @@ jobs:
         run: pip install awsebcli awscli
 
       # ─── Resolve EB CNAME ───
-      - name: Resolve-eb-cname-aws
+      - name: Resolve EB CNAME (AWS)
         if: env.TARGET_CLOUD == 'aws'
         id: resolve-eb-cname-aws
         run: |
@@ -167,21 +167,20 @@ jobs:
           echo "EB CNAME: ${CNAME}"
           echo "eb_cname=${CNAME}" >> "$GITHUB_OUTPUT"
 
-          PROM_URL="http://${CNAME}/prometheus/"
+          # Only GF_DOMAIN and GF_ROOT_URL still need placeholders
           GF_DOMAIN="${CNAME}"
           GF_ROOT_URL="http://${CNAME}/grafana/"
 
-          echo "prom_url=${PROM_URL}" >> "$GITHUB_OUTPUT"
           echo "gf_domain=${GF_DOMAIN}" >> "$GITHUB_OUTPUT"
           echo "gf_root_url=${GF_ROOT_URL}" >> "$GITHUB_OUTPUT"
 
-      # ─── Replace ALL placeholders using SED (not Python) ───
-      # sed is simpler and more reliable than Python heredoc in YAML
+      # ─── Replace placeholders using SED ───
+      # PROMETHEUS_URL is now hardcoded as http://prometheus:9090/prometheus/ (internal)
+      # Only 6 placeholders remain (not 7)
       - name: Replace placeholders in Dockerrun.aws.json (AWS)
         if: env.TARGET_CLOUD == 'aws'
         run: |
           DOCKERHUB_IMAGE="docker.io/${DOCKERHUB_USERNAME}/${DOCKERHUB_REPOSITORY}:latest"
-          PROM_URL="${{ steps.resolve-eb-cname-aws.outputs.prom_url }}"
           GF_DOMAIN="${{ steps.resolve-eb-cname-aws.outputs.gf_domain }}"
           GF_ROOT_URL="${{ steps.resolve-eb-cname-aws.outputs.gf_root_url }}"
           BUILD_NUM="${{ github.sha }}"
@@ -189,16 +188,15 @@ jobs:
           MONITOR_TOKEN="${{ secrets.MONITOR_TOKEN_AWS }}"
 
           echo "Replacing placeholders..."
-          echo "  IMAGE:          ${DOCKERHUB_IMAGE}"
-          echo "  PROMETHEUS_URL:  ${PROM_URL}"
-          echo "  GF_SERVER_DOMAIN: ${GF_DOMAIN}"
+          echo "  IMAGE:             ${DOCKERHUB_IMAGE}"
+          echo "  GF_SERVER_DOMAIN:  ${GF_DOMAIN}"
           echo "  GF_SERVER_ROOT_URL: ${GF_ROOT_URL}"
-          echo "  BUILD_NUMBER:    ${BUILD_NUM}"
-          echo "  ENVIRONMENT:     ${ENV_NAME}"
-          echo "  MONITOR_TOKEN:   ***SET***"
+          echo "  BUILD_NUMBER:      ${BUILD_NUM}"
+          echo "  ENVIRONMENT:       ${ENV_NAME}"
+          echo "  MONITOR_TOKEN:     ***SET***"
+          echo "  PROMETHEUS_URL:    http://prometheus:9090/prometheus/ (hardcoded internal)"
 
           sed -i "s|replace_with_dockerhub_image_uri|${DOCKERHUB_IMAGE}|g" Dockerrun.aws.json
-          sed -i "s|replace_with_prometheus_url|${PROM_URL}|g" Dockerrun.aws.json
           sed -i "s|replace_with_gf_server_domain|${GF_DOMAIN}|g" Dockerrun.aws.json
           sed -i "s|replace_with_gf_server_root_url|${GF_ROOT_URL}|g" Dockerrun.aws.json
           sed -i "s|replace_with_build_number|${BUILD_NUM}|g" Dockerrun.aws.json
@@ -215,7 +213,6 @@ jobs:
           FOUND_ERROR=0
           for placeholder in \
             "replace_with_dockerhub_image_uri" \
-            "replace_with_prometheus_url" \
             "replace_with_gf_server_domain" \
             "replace_with_gf_server_root_url" \
             "replace_with_build_number" \
@@ -243,18 +240,16 @@ jobs:
           grep 'PROMETHEUS_URL' Dockerrun.aws.json
           grep 'GF_SERVER' Dockerrun.aws.json
 
-      - name: Debug EB deployment files
+      # ─── CRITICAL: Commit sed changes so eb deploy picks them up ───
+      # eb deploy uses git archive HEAD — only committed files are packaged.
+      # Without this step, eb deploy deploys the ORIGINAL file (with placeholders).
+      - name: Commit replaced Dockerrun for EB deploy
         if: env.TARGET_CLOUD == 'aws'
         run: |
-          echo "===== Final Dockerrun.aws.json ====="
-          cat Dockerrun.aws.json
-
-          echo "===== Image lines ====="
-          grep -n '"image"' Dockerrun.aws.json
-
-          echo "===== Monitoring URLs ====="
-          grep -n 'PROMETHEUS_URL' Dockerrun.aws.json || echo "No PROMETHEUS_URL found"
-          grep -n 'GF_SERVER' Dockerrun.aws.json || echo "No GF_SERVER found"
+          git config user.name "Deploy Bot"
+          git config user.email "deploy@bot.local"
+          git add Dockerrun.aws.json
+          git commit -m "Replace placeholders for deploy" || echo "Nothing new to commit"
 
       # ─── Initialize EB CLI ───
       - name: Initialize EB CLI
@@ -265,22 +260,17 @@ jobs:
             --platform "Docker" \
             --no-verify-ssl
 
-      - name: Show deployment files before EB deploy
-        if: env.TARGET_CLOUD == 'aws'
-        run: |
-          echo "===== Dockerrun.aws.json ====="
-          cat Dockerrun.aws.json || true
-
-          echo "===== Images ====="
-          grep -n '"image"' Dockerrun.aws.json || true
-
+      # ─── Deploy to AWS Elastic Beanstalk ───
       - name: Deploy to AWS Elastic Beanstalk
         id: aws_deploy
         if: env.TARGET_CLOUD == 'aws'
         continue-on-error: true
         run: |
-          eb deploy "${AWS_ENV_NAME}" --timeout 20 || true
-          sleep 30
+          eb deploy "${AWS_ENV_NAME}" --timeout 20
+
+          echo "⏳ Waiting 60s for containers to start..."
+          sleep 60
+
           STATUS=$(aws elasticbeanstalk describe-environments \
             --environment-names "${AWS_ENV_NAME}" \
             --query 'Environments[0].Health' \
@@ -295,6 +285,60 @@ jobs:
             echo "❌ Deploy failed! Health: $STATUS"
             exit 1
           fi
+
+      # ─── Fetch EB logs for diagnostics ───
+      - name: Fetch EB environment logs (AWS)
+        if: env.TARGET_CLOUD == 'aws'
+        continue-on-error: true
+        run: |
+          echo "===== Fetching EB logs ====="
+          eb logs "${AWS_ENV_NAME}" --all 2>&1 | head -200 || true
+
+      # ─── Check ECS task status ───
+      - name: Check ECS task status (AWS)
+        if: env.TARGET_CLOUD == 'aws'
+        continue-on-error: true
+        run: |
+          echo "===== ECS Task Status ====="
+          CLUSTER=$(aws ecs list-clusters --query 'clusterArns[0]' --output text 2>/dev/null || echo "none")
+          if [ "$CLUSTER" != "none" ]; then
+            echo "Cluster: ${CLUSTER}"
+            TASKS=$(aws ecs list-tasks --cluster "${CLUSTER}" --query 'taskArns' --output text 2>/dev/null || echo "")
+            if [ -n "$TASKS" ]; then
+              for TASK in $TASKS; do
+                echo "--- Task: ${TASK} ---"
+                aws ecs describe-tasks --cluster "${CLUSTER}" --tasks "${TASK}" \
+                  --query 'tasks[0].[taskDefinitionArn,lastStatus,stoppedReason]' \
+                  --output text 2>/dev/null || true
+              done
+            else
+              echo "No running tasks found."
+            fi
+          else
+            echo "No ECS cluster found (EB may use different naming)."
+          fi
+
+      # ─── Quick health check from runner ───
+      - name: Quick health check (AWS)
+        if: env.TARGET_CLOUD == 'aws'
+        continue-on-error: true
+        run: |
+          CNAME="${{ steps.resolve-eb-cname-aws.outputs.eb_cname }}"
+          echo "Checking http://${CNAME}/ ..."
+          for i in {1..5}; do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" "http://${CNAME}/" || echo "000")
+            echo "  Attempt $i → HTTP $STATUS"
+            if [ "$STATUS" != "000" ]; then
+              break
+            fi
+            sleep 15
+          done
+
+          echo "Checking http://${CNAME}/health ..."
+          curl -s "http://${CNAME}/health" || echo "health endpoint unreachable"
+
+          echo "Checking http://${CNAME}/monitor/status ..."
+          curl -s -o /dev/null -w "HTTP %{http_code}\n" "http://${CNAME}/monitor/status" || echo "monitor/status unreachable"
 
       - name: Run deploy-time error agent for AWS
         if: steps.aws_deploy.outcome == 'failure' && env.TARGET_CLOUD == 'aws'
