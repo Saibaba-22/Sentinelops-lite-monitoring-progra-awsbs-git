@@ -1,5 +1,5 @@
 {
-  "AWSEBDockerrunVersion": "2",
+  "AWSEBDockerrunVersion": 2,
   "containerDefinitions": [
     {
       "name": "nginx",
@@ -13,7 +13,8 @@
       "mountPoints": [
         {
           "sourceVolume": "nginx-conf",
-          "containerPath": "/etc/nginx/conf.d"
+          "containerPath": "/etc/nginx/conf.d",
+          "readOnly": true
         }
       ]
     },
@@ -21,7 +22,7 @@
       "name": "app",
       "image": "replace_with_dockerhub_image_uri",
       "essential": true,
-      "memory": 256,
+      "memory": 384,
       "portMappings": [
         { "hostPort": 5000, "containerPort": 5000 }
       ],
@@ -31,7 +32,8 @@
         { "name": "BUILD_NUMBER", "value": "replace_with_build_number" },
         { "name": "ENVIRONMENT", "value": "replace_with_environment" },
         { "name": "METRICS_INTERVAL", "value": "5" },
-        { "name": "MONITOR_TOKEN", "value": "replace_with_monitor_token" }
+        { "name": "MONITOR_TOKEN", "value": "replace_with_monitor_token" },
+        { "name": "PYTHONPATH", "value": "/app" }
       ],
       "mountPoints": [
         {
@@ -43,7 +45,7 @@
     {
       "name": "prometheus",
       "image": "prom/prometheus:v2.53.0",
-      "essential": false,
+      "essential": true,
       "memory": 256,
       "portMappings": [
         { "hostPort": 9090, "containerPort": 9090 }
@@ -52,18 +54,20 @@
       "mountPoints": [
         {
           "sourceVolume": "prometheus-conf",
-          "containerPath": "/etc/prometheus"
+          "containerPath": "/etc/prometheus",
+          "readOnly": true
         }
       ],
       "command": [
         "--config.file=/etc/prometheus/prometheus.yml",
-        "--web.external-url=/prometheus/"
+        "--web.external-url=/prometheus/",
+        "--web.route-prefix=/prometheus/"
       ]
     },
     {
       "name": "grafana",
       "image": "grafana/grafana:11.1.0",
-      "essential": false,
+      "essential": true,
       "memory": 256,
       "portMappings": [
         { "hostPort": 3000, "containerPort": 3000 }
@@ -82,18 +86,20 @@
       "mountPoints": [
         {
           "sourceVolume": "grafana-provisioning",
-          "containerPath": "/etc/grafana/provisioning"
+          "containerPath": "/etc/grafana/provisioning",
+          "readOnly": true
         },
         {
           "sourceVolume": "grafana-dashboards",
-          "containerPath": "/var/lib/grafana/dashboards"
+          "containerPath": "/var/lib/grafana/dashboards",
+          "readOnly": true
         }
       ]
     },
     {
       "name": "node-exporter",
       "image": "prom/node-exporter:v1.8.0",
-      "essential": false,
+      "essential": true,
       "memory": 64,
       "portMappings": [
         { "hostPort": 9100, "containerPort": 9100 }
@@ -101,11 +107,13 @@
       "mountPoints": [
         {
           "sourceVolume": "host-proc",
-          "containerPath": "/host/proc"
+          "containerPath": "/host/proc",
+          "readOnly": true
         },
         {
           "sourceVolume": "host-sys",
-          "containerPath": "/host/sys"
+          "containerPath": "/host/sys",
+          "readOnly": true
         }
       ],
       "command": [

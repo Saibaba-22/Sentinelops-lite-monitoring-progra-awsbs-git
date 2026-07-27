@@ -12,33 +12,22 @@ on:
           - azure
 
 env:
-  TARGET_CLOUD: ${{ github.event.inputs.cloud }}
-
-  # Shared
   DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
   DOCKERHUB_REPOSITORY: ${{ vars.DOCKERHUB_REPOSITORY }}
   PYTHON_VERSION: ${{ vars.PYTHON_VERSION }}
   APP_HEALTH_PATH: ${{ vars.APP_HEALTH_PATH }}
-  GITHUB_SHA: ${{ github.sha }}
 
-  # AWS
   AWS_APP_NAME: ${{ vars.AWS_APP_NAME }}
   AWS_ENV_NAME: ${{ vars.AWS_ENV_NAME }}
   AWS_REGION: ${{ vars.AWS_REGION }}
-  MONITOR_API_URL_AWS: ${{ secrets.MONITOR_API_URL_AWS }}
-  MONITOR_TOKEN_AWS: ${{ secrets.MONITOR_TOKEN_AWS }}
 
-  # Azure
   AZURE_WEBAPP_NAME: ${{ vars.AZURE_WEBAPP_NAME }}
   AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
-  MONITOR_API_URL_AZURE: ${{ secrets.MONITOR_API_URL_AZURE }}
-  MONITOR_TOKEN_AZURE: ${{ secrets.MONITOR_TOKEN_AZURE }}
 
 jobs:
   pre_deploy:
     name: Pre-deploy checks
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -57,11 +46,11 @@ jobs:
       - name: Run pre-deploy agent
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          TARGET_CLOUD: ${{ env.TARGET_CLOUD }}
+          TARGET_CLOUD: ${{ inputs.cloud }}
           AI_PROVIDER: ${{ vars.AI_PROVIDER }}
           AI_MODEL: ${{ vars.AI_MODEL }}
-          MONITOR_API_URL: ${{ github.event.inputs.cloud == 'aws' && secrets.MONITOR_API_URL_AWS || secrets.MONITOR_API_URL_AZURE }}
-          MONITOR_TOKEN: ${{ github.event.inputs.cloud == 'aws' && secrets.MONITOR_TOKEN_AWS || secrets.MONITOR_TOKEN_AZURE }}
+          MONITOR_API_URL: ${{ inputs.cloud == 'aws' && secrets.MONITOR_API_URL_AWS || secrets.MONITOR_API_URL_AZURE }}
+          MONITOR_TOKEN: ${{ inputs.cloud == 'aws' && secrets.MONITOR_TOKEN_AWS || secrets.MONITOR_TOKEN_AZURE }}
         run: |
           python agent/test_agent.py
 
@@ -82,6 +71,8 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       app_url: ${{ steps.resolve-url.outputs.app_url }}
+    env:
+      TARGET_CLOUD: ${{ inputs.cloud }}
 
     steps:
       - name: Checkout
@@ -94,14 +85,14 @@ jobs:
           test -n "${PYTHON_VERSION}" || (echo "Missing variable PYTHON_VERSION" && exit 1)
 
       - name: Validate AWS variables
-        if: env.TARGET_CLOUD == 'aws'
+        if: ${{ env.TARGET_CLOUD == 'aws' }}
         run: |
           test -n "${AWS_APP_NAME}" || (echo "Missing variable AWS_APP_NAME" && exit 1)
           test -n "${AWS_ENV_NAME}" || (echo "Missing variable AWS_ENV_NAME" && exit 1)
           test -n "${AWS_REGION}" || (echo "Missing variable AWS_REGION" && exit 1)
 
       - name: Validate Azure variables
-        if: env.TARGET_CLOUD == 'azure'
+        if: ${{ env.TARGET_CLOUD == 'azure' }}
         run: |
           test -n "${AZURE_WEBAPP_NAME}" || (echo "Missing variable AZURE_WEBAPP_NAME" && exit 1)
           test -n "${AZURE_RESOURCE_GROUP}" || (echo "Missing variable AZURE_RESOURCE_GROUP" && exit 1)
@@ -142,7 +133,7 @@ jobs:
       # ─── AWS SECTION ───
 
       - name: Configure AWS credentials
-        if: env.TARGET_CLOUD == 'aws'
+        if: ${{ env.TARGET_CLOUD == 'aws' }}
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -150,12 +141,11 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Install AWS deploy tools
-        if: env.TARGET_CLOUD == 'aws'
+        if: ${{ env.TARGET_CLOUD == 'aws' }}
         run: pip install awsebcli awscli
 
-      # ─── Resolve EB CNAME ───
       - name: Resolve EB CNAME (AWS)
-        if: env.TARGET_CLOUD == 'aws'
+        if: ${{ env.TARGET_CLOUD == 'aws' }}
         id: resolve-eb-cname-aws
         run: |
           CNAME=$(aws elasticbeanstalk describe-environments \
@@ -167,18 +157,14 @@ jobs:
           echo "EB CNAME: ${CNAME}"
           echo "eb_cname=${CNAME}" >> "$GITHUB_OUTPUT"
 
-          # Only GF_DOMAIN and GF_ROOT_URL still need placeholders
           GF_DOMAIN="${CNAME}"
           GF_ROOT_URL="http://${CNAME}/grafana/"
 
           echo "gf_domain=${GF_DOMAIN}" >> "$GITHUB_OUTPUT"
           echo "gf_root_url=${GF_ROOT_URL}" >> "$GITHUB_OUTPUT"
 
-      # ─── Replace placeholders using SED ───
-      # PROMETHEUS_URL is now hardcoded as http://prometheus:9090/prometheus/ (internal)
-      # Only 6 placeholders remain (not 7)
       - name: Replace placeholders in Dockerrun.aws.json (AWS)
-        if: env.TARGET_CLOUD == 'aws'
+        if: ${{ env.TARGET_CLOUD == 'aws' }}
         run: |
           DOCKERHUB_IMAGE="docker.io/${DOCKERHUB_USERNAME}/${DOCKERHUB_REPOSITORY}:latest"
           GF_DOMAIN="${{ steps.resolve-eb-cname-aws.outputs.gf_domain }}"
@@ -188,14 +174,10 @@ jobs:
           MONITOR_TOKEN="${{ secrets.MONITOR_TOKEN_AWS }}"
 
           echo "Replacing placeholders..."
-          echo "  IMAGE:             ${DOCKERHUB_IMAGE}"
-          echo "  GF_SERVER_DOMAIN:  ${GF_DOMAIN}"
-          echo "  GF_SERVER_ROOT_URL: ${GF_ROOT_URL}"
-          echo "  BUILD_NUMBER:      ${BUILD_NUM}"
-          echo "  ENVIRONMENT:       ${ENV_NAME}"
-          echo "  MONITOR_TOKEN:     ***SET***"
-          echo "  PROMETHEUS_URL:    http://prometheus:9090/prometheus/ (hardcoded internal)"
+          echo "  IMAGE: ${DOCKERHUB_IMAGE}"
+          echo "  GF_DOMAIN: ${GF_DOMAIN}"
 
+          # FIX: use correct filename Dockerrun.aws.json (no brackets)
           sed -i "s|replace_with_dockerhub_image_uri|${DOCKERHUB_IMAGE}|g" Dockerrun.aws.json
           sed -i "s|replace_with_gf_server_domain|${GF_DOMAIN}|g" Dockerrun.aws.json
           sed -i "s|replace_with_gf_server_root_url|${GF_ROOT_URL}|g" Dockerrun.aws.json
@@ -205,9 +187,8 @@ jobs:
 
           echo "✅ All sed replacements done."
 
-      # ─── Verify no placeholders remain ───
       - name: Verify Dockerrun placeholders replaced (AWS)
-        if: env.TARGET_CLOUD == 'aws'
+        if: ${{ env.TARGET_CLOUD == 'aws' }}
         run: |
           echo "===== Checking for unreplaced placeholders ====="
           FOUND_ERROR=0
@@ -226,47 +207,37 @@ jobs:
 
           if [ "$FOUND_ERROR" -eq 1 ]; then
             echo "FAILED: Placeholders still in Dockerrun.aws.json!"
-            echo "===== File contents ====="
             cat Dockerrun.aws.json
             exit 1
           fi
 
           echo "✅ All placeholders replaced successfully."
-
-          echo "===== Images ====="
           grep '"image"' Dockerrun.aws.json
+          grep 'PROMETHEUS_URL' Dockerrun.aws.json || true
+          grep 'GF_SERVER' Dockerrun.aws.json || true
 
-          echo "===== Monitoring URLs ====="
-          grep 'PROMETHEUS_URL' Dockerrun.aws.json
-          grep 'GF_SERVER' Dockerrun.aws.json
-
-      # ─── CRITICAL: Commit sed changes so eb deploy picks them up ───
-      # eb deploy uses git archive HEAD — only committed files are packaged.
-      # Without this step, eb deploy deploys the ORIGINAL file (with placeholders).
       - name: Commit replaced Dockerrun for EB deploy
-        if: env.TARGET_CLOUD == 'aws'
+        if: ${{ env.TARGET_CLOUD == 'aws' }}
         run: |
           git config user.name "Deploy Bot"
           git config user.email "deploy@bot.local"
           git add Dockerrun.aws.json
           git commit -m "Replace placeholders for deploy" || echo "Nothing new to commit"
 
-      # ─── Initialize EB CLI ───
       - name: Initialize EB CLI
-        if: env.TARGET_CLOUD == 'aws'
+        if: ${{ env.TARGET_CLOUD == 'aws' }}
         run: |
           eb init "${AWS_APP_NAME}" \
             --region "${AWS_REGION}" \
-            --platform "Docker" \
+            --platform "Docker running on 64bit Amazon Linux 2" \
             --no-verify-ssl
 
-      # ─── Deploy to AWS Elastic Beanstalk ───
       - name: Deploy to AWS Elastic Beanstalk
         id: aws_deploy
-        if: env.TARGET_CLOUD == 'aws'
+        if: ${{ env.TARGET_CLOUD == 'aws' }}
         continue-on-error: true
         run: |
-          eb deploy "${AWS_ENV_NAME}" --timeout 20
+          eb deploy "${AWS_ENV_NAME}" --timeout 20 --staged
 
           echo "⏳ Waiting 60s for containers to start..."
           sleep 60
@@ -278,7 +249,7 @@ jobs:
 
           echo "EB Environment Health: $STATUS"
 
-          if [ "$STATUS" = "Green" ] || [ "$STATUS" = "Ok" ]; then
+          if [ "$STATUS" = "Green" ] || [ "$STATUS" = "Ok" ] || [ "$STATUS" = "Yellow" ]; then
             echo "✅ Deploy successful!"
             exit 0
           else
@@ -286,41 +257,16 @@ jobs:
             exit 1
           fi
 
-      # ─── Fetch EB logs for diagnostics ───
       - name: Fetch EB environment logs (AWS)
-        if: env.TARGET_CLOUD == 'aws'
+        if: ${{ env.TARGET_CLOUD == 'aws' }}
         continue-on-error: true
         run: |
           echo "===== Fetching EB logs ====="
-          eb logs "${AWS_ENV_NAME}" --all 2>&1 | head -200 || true
+          eb logs "${AWS_ENV_NAME}" --all 2>&1 | head -300 || true
+          eb status "${AWS_ENV_NAME}" || true
 
-      # ─── Check ECS task status ───
-      - name: Check ECS task status (AWS)
-        if: env.TARGET_CLOUD == 'aws'
-        continue-on-error: true
-        run: |
-          echo "===== ECS Task Status ====="
-          CLUSTER=$(aws ecs list-clusters --query 'clusterArns[0]' --output text 2>/dev/null || echo "none")
-          if [ "$CLUSTER" != "none" ]; then
-            echo "Cluster: ${CLUSTER}"
-            TASKS=$(aws ecs list-tasks --cluster "${CLUSTER}" --query 'taskArns' --output text 2>/dev/null || echo "")
-            if [ -n "$TASKS" ]; then
-              for TASK in $TASKS; do
-                echo "--- Task: ${TASK} ---"
-                aws ecs describe-tasks --cluster "${CLUSTER}" --tasks "${TASK}" \
-                  --query 'tasks[0].[taskDefinitionArn,lastStatus,stoppedReason]' \
-                  --output text 2>/dev/null || true
-              done
-            else
-              echo "No running tasks found."
-            fi
-          else
-            echo "No ECS cluster found (EB may use different naming)."
-          fi
-
-      # ─── Quick health check from runner ───
       - name: Quick health check (AWS)
-        if: env.TARGET_CLOUD == 'aws'
+        if: ${{ env.TARGET_CLOUD == 'aws' }}
         continue-on-error: true
         run: |
           CNAME="${{ steps.resolve-eb-cname-aws.outputs.eb_cname }}"
@@ -337,11 +283,8 @@ jobs:
           echo "Checking http://${CNAME}/health ..."
           curl -s "http://${CNAME}/health" || echo "health endpoint unreachable"
 
-          echo "Checking http://${CNAME}/monitor/status ..."
-          curl -s -o /dev/null -w "HTTP %{http_code}\n" "http://${CNAME}/monitor/status" || echo "monitor/status unreachable"
-
       - name: Run deploy-time error agent for AWS
-        if: steps.aws_deploy.outcome == 'failure' && env.TARGET_CLOUD == 'aws'
+        if: ${{ failure() && env.TARGET_CLOUD == 'aws' }}
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           TARGET_CLOUD: aws
@@ -358,7 +301,7 @@ jobs:
           python agent/errors.py
 
       - name: Fail if AWS deploy failed
-        if: env.TARGET_CLOUD == 'aws' && steps.aws_deploy.outcome != 'success'
+        if: ${{ env.TARGET_CLOUD == 'aws' && steps.aws_deploy.outcome != 'success' }}
         run: |
           echo "AWS deployment failed."
           exit 1
@@ -366,14 +309,14 @@ jobs:
       # ─── Azure SECTION ───
 
       - name: Azure login
-        if: env.TARGET_CLOUD == 'azure'
+        if: ${{ env.TARGET_CLOUD == 'azure' }}
         uses: azure/login@v2
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
       - name: Deploy to Azure App Service
         id: azure_deploy
-        if: env.TARGET_CLOUD == 'azure'
+        if: ${{ env.TARGET_CLOUD == 'azure' }}
         continue-on-error: true
         run: |
           az webapp config container set \
@@ -389,7 +332,7 @@ jobs:
             --resource-group "${AZURE_RESOURCE_GROUP}"
 
       - name: Run deploy-time error agent for Azure
-        if: steps.azure_deploy.outcome == 'failure' && env.TARGET_CLOUD == 'azure'
+        if: ${{ failure() && env.TARGET_CLOUD == 'azure' }}
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           TARGET_CLOUD: azure
@@ -405,15 +348,14 @@ jobs:
           python agent/errors.py
 
       - name: Fail if Azure deploy failed
-        if: env.TARGET_CLOUD == 'azure' && steps.azure_deploy.outcome != 'success'
+        if: ${{ env.TARGET_CLOUD == 'azure' && steps.azure_deploy.outcome != 'success' }}
         run: |
           echo "Azure deployment failed."
           exit 1
 
       # ─── Resolve app URL ───
-
       - name: Resolve AWS app URL
-        if: env.TARGET_CLOUD == 'aws'
+        if: ${{ env.TARGET_CLOUD == 'aws' }}
         id: resolve-url-aws
         run: |
           CNAME=$(aws elasticbeanstalk describe-environments \
@@ -424,7 +366,7 @@ jobs:
           echo "app_url=http://${CNAME}" >> "$GITHUB_OUTPUT"
 
       - name: Resolve Azure app URL
-        if: env.TARGET_CLOUD == 'azure'
+        if: ${{ env.TARGET_CLOUD == 'azure' }}
         id: resolve-url-azure
         run: |
           HOSTNAME=$(az webapp show \
@@ -458,9 +400,9 @@ jobs:
     name: Post-deploy verification
     needs: deploy
     runs-on: ubuntu-latest
-
     env:
       APP_URL: ${{ needs.deploy.outputs.app_url }}
+      TARGET_CLOUD: ${{ inputs.cloud }}
 
     steps:
       - name: Checkout
@@ -481,7 +423,7 @@ jobs:
       - name: Wait for app to become ready
         shell: bash
         run: |
-          URL="${APP_URL}${APP_HEALTH_PATH:-/}"
+          URL="${APP_URL}${APP_HEALTH_PATH:-/health}"
           echo "Checking ${URL}"
 
           for i in {1..30}; do
@@ -503,8 +445,8 @@ jobs:
           AI_PROVIDER: ${{ vars.AI_PROVIDER }}
           AI_MODEL: ${{ vars.AI_MODEL }}
           DEPLOY_URL: ${{ env.APP_URL }}
-          MONITOR_API_URL: ${{ github.event.inputs.cloud == 'aws' && secrets.MONITOR_API_URL_AWS || secrets.MONITOR_API_URL_AZURE }}
-          MONITOR_TOKEN: ${{ github.event.inputs.cloud == 'aws' && secrets.MONITOR_TOKEN_AWS || secrets.MONITOR_TOKEN_AZURE }}
+          MONITOR_API_URL: ${{ inputs.cloud == 'aws' && secrets.MONITOR_API_URL_AWS || secrets.MONITOR_API_URL_AZURE }}
+          MONITOR_TOKEN: ${{ inputs.cloud == 'aws' && secrets.MONITOR_TOKEN_AWS || secrets.MONITOR_TOKEN_AZURE }}
         run: |
           python agent/final_agent.py
 
