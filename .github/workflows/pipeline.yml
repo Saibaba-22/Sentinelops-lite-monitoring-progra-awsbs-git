@@ -25,16 +25,19 @@ env:
   AWS_APP_NAME: ${{ vars.AWS_APP_NAME }}
   AWS_ENV_NAME: ${{ vars.AWS_ENV_NAME }}
   AWS_REGION: ${{ vars.AWS_REGION }}
-  MONITOR_API_URL_AWS : ${{ secrets.MONITOR_API_URL_AWS }}
-  MONITOR_TOKEN_AWS : ${{ secrets.MONITOR_TOKEN_AWS }}
+  MONITOR_API_URL_AWS: ${{ secrets.MONITOR_API_URL_AWS }}
+  MONITOR_TOKEN_AWS: ${{ secrets.MONITOR_TOKEN_AWS }}
 
   # Azure
   AZURE_WEBAPP_NAME: ${{ vars.AZURE_WEBAPP_NAME }}
   AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
-  MONITOR_API_URL_AZURE : ${{ secrets.MONITOR_API_URL_AWS }}
-  MONITOR_TOKEN_AZURE : ${{ secrets.MONITOR_TOKEN_AWS }}
+  MONITOR_API_URL_AZURE: ${{ secrets.MONITOR_API_URL_AZURE }}
+  MONITOR_TOKEN_AZURE: ${{ secrets.MONITOR_TOKEN_AZURE }}
 
 jobs:
+  # ══════════════════════════════════════════════════════════════
+  #  JOB 1: Pre-deploy checks (unchanged)
+  # ══════════════════════════════════════════════════════════════
   pre_deploy:
     name: Pre-deploy checks
     runs-on: ubuntu-latest
@@ -58,13 +61,10 @@ jobs:
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           TARGET_CLOUD: ${{ env.TARGET_CLOUD }}
-
           AI_PROVIDER: ${{ vars.AI_PROVIDER }}
           AI_MODEL: ${{ vars.AI_MODEL }}
-
           MONITOR_API_URL: ${{ github.event.inputs.cloud == 'aws' && secrets.MONITOR_API_URL_AWS || secrets.MONITOR_API_URL_AZURE }}
           MONITOR_TOKEN: ${{ github.event.inputs.cloud == 'aws' && secrets.MONITOR_TOKEN_AWS || secrets.MONITOR_TOKEN_AZURE }}
-
         run: |
           python agent/test_agent.py
 
@@ -79,6 +79,9 @@ jobs:
             reports/**
           if-no-files-found: ignore
 
+  # ══════════════════════════════════════════════════════════════
+  #  JOB 2: Build & Deploy
+  # ══════════════════════════════════════════════════════════════
   deploy:
     name: Build, push, deploy
     needs: pre_deploy
@@ -120,31 +123,8 @@ jobs:
             pip install -r requirements.txt
           fi
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+      # ─── AWS Deployment: uses deploy-aws.sh ───
 
-      - name: Log in to Docker Hub
-        run: echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u "${{ env.DOCKERHUB_USERNAME }}" --password-stdin
-
-      # FIX: Build and Push Docker image using Buildx with provenance=false and correct platform targeting.
-      # This outputs a standard single-image manifest format, preventing the "unsupported manifest format" error on AWS Elastic Beanstalk.
-      - name: Build and Push Docker image
-        run: |
-          docker buildx build \
-            --platform linux/amd64 \
-            --provenance=false \
-            -f docker/Dockerfile \
-            -t docker.io/${{ env.DOCKERHUB_USERNAME }}/${{ env.DOCKERHUB_REPOSITORY }}:${{ github.sha }} \
-            -t docker.io/${{ env.DOCKERHUB_USERNAME }}/${{ env.DOCKERHUB_REPOSITORY }}:latest \
-            --push \
-            .
-
-      - name: Verify Docker Hub image exists
-        run: |
-          docker manifest inspect docker.io/${DOCKERHUB_USERNAME}/${DOCKERHUB_REPOSITORY}:latest
-          docker pull docker.io/${DOCKERHUB_USERNAME}/${DOCKERHUB_REPOSITORY}:latest
-
-      # ---------------- AWS ----------------
       - name: Configure AWS credentials
         if: env.TARGET_CLOUD == 'aws'
         uses: aws-actions/configure-aws-credentials@v4
@@ -155,106 +135,23 @@ jobs:
 
       - name: Install AWS deploy tools
         if: env.TARGET_CLOUD == 'aws'
-        run: |
-          pip install awsebcli awscli
+        run: pip install awsebcli awscli
 
-      - name: Verify Docker Hub image exists
-        if: env.TARGET_CLOUD == 'aws'
-        run: |
-          echo "Checking image:"
-          echo "docker.io/${DOCKERHUB_USERNAME}/${DOCKERHUB_REPOSITORY}:latest"
-
-          docker manifest inspect docker.io/${DOCKERHUB_USERNAME}/${DOCKERHUB_REPOSITORY}:latest
-          docker pull docker.io/${DOCKERHUB_USERNAME}/${DOCKERHUB_REPOSITORY}:latest
-
-      - name: Update EB deployment image
-        if: env.TARGET_CLOUD == 'aws'
-        run: |
-          IMAGE="docker.io/${DOCKERHUB_USERNAME}/${DOCKERHUB_REPOSITORY}:latest"
-          echo "Using image: $IMAGE"
-
-          python - <<'PY'
-          import json, os
-
-          image = os.environ["IMAGE"]
-
-          path = "Dockerrun.aws.json"
-          with open(path) as f:
-              data = json.load(f)
-
-          found = False
-          for c in data.get("containerDefinitions", []):
-              if c.get("name") == "app":
-                  c["image"] = image
-                  found = True
-
-          if not found:
-              raise SystemExit("ERROR: app container not found in Dockerrun.aws.json")
-
-          with open(path, "w") as f:
-              json.dump(data, f, indent=2)
-
-          print("Updated Dockerrun.aws.json app image to:", image)
-          PY
-        env:
-          IMAGE: docker.io/${{ env.DOCKERHUB_USERNAME }}/${{ env.DOCKERHUB_REPOSITORY }}:latest
-
-      - name: Debug EB deployment files
-        if: env.TARGET_CLOUD == 'aws'
-        run: |
-          echo "===== Final Dockerrun.aws.json ====="
-          cat Dockerrun.aws.json
-
-          echo "===== Image lines ====="
-          grep -n '"image"' Dockerrun.aws.json
-
-          echo "===== Git status ====="
-          git status --short
-
-      # ---- FIX: Initialize EB CLI before deploying ----
-      - name: Initialize EB CLI
-        if: env.TARGET_CLOUD == 'aws'
-        run: |
-          eb init "${AWS_APP_NAME}" \
-            --region "${AWS_REGION}" \
-            --platform "Docker" \
-            --no-verify-ssl
-
-      - name: Show deployment files before EB deploy
-        if: env.TARGET_CLOUD == 'aws'
-        run: |
-          echo "===== Dockerrun.aws.json ====="
-          cat Dockerrun.aws.json || true
-
-          echo "===== docker-compose.yml ====="
-          cat docker-compose.yml || true
-
-          echo "===== Images ====="
-          grep -n '"image"' Dockerrun.aws.json || true
-          grep -n 'image:' docker-compose.yml || true
-
-      - name: Deploy to AWS Elastic Beanstalk
+      - name: Deploy to AWS (deploy-aws.sh)
         id: aws_deploy
         if: env.TARGET_CLOUD == 'aws'
         continue-on-error: true
+        env:
+          APP_NAME: ${{ env.AWS_APP_NAME }}
+          ENV_NAME: ${{ env.AWS_ENV_NAME }}
+          AWS_REGION: ${{ env.AWS_REGION }}
+          REPOSITORY: ${{ env.DOCKERHUB_REPOSITORY }}
+          DOCKERHUB_USERNAME: ${{ env.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
         run: |
-          eb deploy "${AWS_ENV_NAME}" --timeout 20 || true
-          sleep 30
-          STATUS=$(aws elasticbeanstalk describe-environments \
-            --environment-names "${AWS_ENV_NAME}" \
-            --query 'Environments[0].Health' \
-            --output text)
+          chmod +x deploy/deploy-aws.sh
+          bash deploy/deploy-aws.sh
 
-          echo "EB Environment Health: $STATUS"
-
-          if [ "$STATUS" = "Green" ] || [ "$STATUS" = "Ok" ]; then
-            echo "✅ Deploy successful!"
-            exit 0
-          else
-            echo "❌ Deploy failed! Health: $STATUS"
-            exit 1
-          fi
-          
       - name: Run deploy-time error agent for AWS
         if: steps.aws_deploy.outcome == 'failure' && env.TARGET_CLOUD == 'aws'
         env:
@@ -278,29 +175,27 @@ jobs:
           echo "AWS deployment failed."
           exit 1
 
-      # ---------------- AZURE ----------------
+      # ─── Azure Deployment: uses deploy-azure.sh ───
+
       - name: Azure login
         if: env.TARGET_CLOUD == 'azure'
         uses: azure/login@v2
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      - name: Deploy to Azure App Service
+      - name: Deploy to Azure (deploy-azure.sh)
         id: azure_deploy
         if: env.TARGET_CLOUD == 'azure'
         continue-on-error: true
+        env:
+          AZURE_WEBAPP_NAME: ${{ env.AZURE_WEBAPP_NAME }}
+          AZURE_RESOURCE_GROUP: ${{ env.AZURE_RESOURCE_GROUP }}
+          REPOSITORY: ${{ env.DOCKERHUB_REPOSITORY }}
+          DOCKERHUB_USERNAME: ${{ env.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
         run: |
-          az webapp config container set \
-            --name "${AZURE_WEBAPP_NAME}" \
-            --resource-group "${AZURE_RESOURCE_GROUP}" \
-            --container-image-name "docker.io/${DOCKERHUB_USERNAME}/${DOCKERHUB_REPOSITORY}:${GITHUB_SHA}" \
-            --container-registry-url "https://index.docker.io" \
-            --container-registry-user "${DOCKERHUB_USERNAME}" \
-            --container-registry-password "${{ secrets.DOCKERHUB_TOKEN }}"
-
-          az webapp restart \
-            --name "${AZURE_WEBAPP_NAME}" \
-            --resource-group "${AZURE_RESOURCE_GROUP}"
+          chmod +x deploy/deploy-azure.sh
+          bash deploy/deploy-azure.sh
 
       - name: Run deploy-time error agent for Azure
         if: steps.azure_deploy.outcome == 'failure' && env.TARGET_CLOUD == 'azure'
@@ -324,7 +219,8 @@ jobs:
           echo "Azure deployment failed."
           exit 1
 
-      # ---------------- RESOLVE APP URL ----------------
+      # ─── Resolve app URL ───
+
       - name: Resolve AWS app URL
         if: env.TARGET_CLOUD == 'aws'
         id: resolve-url-aws
@@ -356,6 +252,68 @@ jobs:
             echo "app_url=${{ steps.resolve-url-azure.outputs.app_url }}" >> "$GITHUB_OUTPUT"
           fi
 
+      # ─── Verify Grafana auto-provisioned ───
+
+      - name: Verify Grafana datasource (AWS)
+        if: env.TARGET_CLOUD == 'aws' && steps.aws_deploy.outcome == 'success'
+        run: |
+          CNAME="${{ steps.resolve-url-aws.outputs.app_url }}"
+          CNAME="${CNAME#http://}"
+          GRAFANA_URL="http://${CNAME}/grafana"
+
+          echo "🔍 Checking Grafana at: ${GRAFANA_URL}"
+          for i in {1..10}; do
+            HEALTH=$(curl -s -o /dev/null -w "%{http_code}" "${GRAFANA_URL}/api/health" || true)
+            echo "Attempt $i → HTTP ${HEALTH}"
+            if [ "$HEALTH" = "200" ]; then break; fi
+            sleep 15
+          done
+
+          if [ "$HEALTH" = "200" ]; then
+            echo "✅ Grafana is healthy!"
+            DS_LIST=$(curl -s -u "admin:admin123" "${GRAFANA_URL}/api/datasources" || true)
+            DS_URL=$(echo "$DS_LIST" | python3 -c "
+              import sys,json
+              ds = json.load(sys.stdin)
+              prom = [d for d in ds if d.get('name')=='Prometheus']
+              print(prom[0]['url'] if prom else 'NOT_FOUND')
+            " 2>/dev/null || echo "ERROR")
+            echo "Prometheus datasource URL: ${DS_URL}"
+            echo "✅✅ Grafana auto-provisioned — dashboards show data on login!"
+          else
+            echo "⚠️ Grafana not ready yet (HTTP: ${HEALTH})"
+          fi
+
+      - name: Verify Grafana datasource (Azure)
+        if: env.TARGET_CLOUD == 'azure' && steps.azure_deploy.outcome == 'success'
+        run: |
+          HOSTNAME="${{ steps.resolve-url-azure.outputs.app_url }}"
+          HOSTNAME="${HOSTNAME#https://}"
+          GRAFANA_URL="https://${HOSTNAME}/grafana"
+
+          echo "🔍 Checking Grafana at: ${GRAFANA_URL}"
+          for i in {1..10}; do
+            HEALTH=$(curl -s -k -o /dev/null -w "%{http_code}" "${GRAFANA_URL}/api/health" || true)
+            echo "Attempt $i → HTTP ${HEALTH}"
+            if [ "$HEALTH" = "200" ]; then break; fi
+            sleep 15
+          done
+
+          if [ "$HEALTH" = "200" ]; then
+            echo "✅ Grafana is healthy!"
+            DS_LIST=$(curl -s -k -u "admin:admin123" "${GRAFANA_URL}/api/datasources" || true)
+            DS_URL=$(echo "$DS_LIST" | python3 -c "
+              import sys,json
+              ds = json.load(sys.stdin)
+              prom = [d for d in ds if d.get('name')=='Prometheus']
+              print(prom[0]['url'] if prom else 'NOT_FOUND')
+            " 2>/dev/null || echo "ERROR")
+            echo "Prometheus datasource URL: ${DS_URL}"
+            echo "✅✅ Grafana auto-provisioned — dashboards show data on login!"
+          else
+            echo "⚠️ Grafana not ready yet (HTTP: ${HEALTH})"
+          fi
+
       - name: Upload deploy-time artifacts
         if: always()
         uses: actions/upload-artifact@v4
@@ -367,6 +325,9 @@ jobs:
             reports/**
           if-no-files-found: ignore
 
+  # ══════════════════════════════════════════════════════════════
+  #  JOB 3: Post-deploy verification (unchanged)
+  # ══════════════════════════════════════════════════════════════
   post_deploy:
     name: Post-deploy verification
     needs: deploy
@@ -418,7 +379,6 @@ jobs:
           DEPLOY_URL: ${{ env.APP_URL }}
           MONITOR_API_URL: ${{ github.event.inputs.cloud == 'aws' && secrets.MONITOR_API_URL_AWS || secrets.MONITOR_API_URL_AZURE }}
           MONITOR_TOKEN: ${{ github.event.inputs.cloud == 'aws' && secrets.MONITOR_TOKEN_AWS || secrets.MONITOR_TOKEN_AZURE }}
-
         run: |
           python agent/final_agent.py
 

@@ -23,14 +23,16 @@ services:
           - nginx
 
   app:
-    image: "saibaba22/sentinelops-lite-monitoring-progra-awsbs-git:latest"
+    image: replace_with_dockerhub_image_uri
     ports:
       - "5000:5000"
     environment:
       - PORT=5000
       - APP_VERSION=1.0.0
-      - BUILD_NUMBER=local
-      - ENVIRONMENT=production
+#      - BUILD_NUMBER=local
+#      - ENVIRONMENT=production
+      - BUILD_NUMBER=replace_with_build_number
+      - ENVIRONMENT=replace_with_environment
       - METRICS_INTERVAL=5
     volumes:
       - ./logs:/app/logs
@@ -69,8 +71,11 @@ services:
       - GF_SECURITY_ADMIN_USER=admin
       - GF_SECURITY_ADMIN_PASSWORD=admin123
       - GF_USERS_ALLOW_SIGN_UP=false
-      - GF_SERVER_ROOT_URL=%(protocol)s://%(domain)s/grafana/
+#      - GF_SERVER_ROOT_URL=%(protocol)s://%(domain)s/grafana/
       - GF_SERVER_SERVE_FROM_SUB_PATH=true
+      - GF_SERVER_DOMAIN=replace_with_gf_server_domain
+      - GF_SERVER_ROOT_URL=replace_with_gf_server_root_url
+      - PROMETHEUS_URL=replace_with_prometheus_url
     volumes:
       - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
       - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro

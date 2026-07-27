@@ -19,7 +19,7 @@
     },
     {
       "name": "app",
-      "image": "saibaba22/sentinelops-lite-monitoring-progra-awsbs-git:latest",
+      "image": "replace_with_dockerhub_image_uri",
       "essential": true,
       "memory": 256,
       "portMappings": [
@@ -28,8 +28,11 @@
       "environment": [
         { "name": "PORT", "value": "5000" },
         { "name": "APP_VERSION", "value": "1.0.0" },
-        { "name": "BUILD_NUMBER", "value": "local" },
-        { "name": "ENVIRONMENT", "value": "production" },
+/*      { "name": "BUILD_NUMBER", "value": "local" },
+        { "name": "ENVIRONMENT", "value": "production" },*/
+         
+        { "name": "BUILD_NUMBER", "value": "replace_with_build_number" },
+        { "name": "ENVIRONMENT", "value": "replace_with_environment" }, 
         { "name": "METRICS_INTERVAL", "value": "5" }
       ],
       "mountPoints": [
@@ -72,9 +75,11 @@
         { "name": "GF_SECURITY_ADMIN_USER", "value": "admin" },
         { "name": "GF_SECURITY_ADMIN_PASSWORD", "value": "admin123" },
         { "name": "GF_USERS_ALLOW_SIGN_UP", "value": "false" },
-        { "name": "GF_SERVER_DOMAIN", "value": "agent.eba-wu4pmszn.us-east-1.elasticbeanstalk.com" },
-        { "name": "GF_SERVER_ROOT_URL", "value": "http://agent.eba-wu4pmszn.us-east-1.elasticbeanstalk.com/grafana/" },
-        { "name": "GF_SERVER_SERVE_FROM_SUB_PATH", "value": "true" }
+
+        { "name": "GF_SERVER_DOMAIN", "value": "replace_with_gf_server_domain" },
+        { "name": "GF_SERVER_ROOT_URL", "value": "replace_with_gf_server_root_url" },
+        { "name": "GF_SERVER_SERVE_FROM_SUB_PATH", "value": "true" },
+        { "name": "PROMETHEUS_URL", "value": "replace_with_prometheus_url" }
       ],
       "mountPoints": [
         {
