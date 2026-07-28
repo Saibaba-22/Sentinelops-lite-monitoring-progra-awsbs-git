@@ -6,6 +6,7 @@ import html
 import json
 import os
 import time
+from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Any
 
@@ -66,6 +67,39 @@ STAGE_AGENT_MAP = {
 AI_RPM_LIMIT = int(os.getenv("AI_RPM_LIMIT", "15"))
 AI_TPM_LIMIT = int(os.getenv("AI_TPM_LIMIT", "250000"))
 AI_RPD_LIMIT = int(os.getenv("AI_RPD_LIMIT", "500"))
+
+# ---------------------------------------------------------------------------
+# In-memory rate tracking for accurate RPM / TPM / RPD calculation.
+#
+# Prometheus increase() needs 2+ scrapes inside the window and breaks on
+# counter resets (app restarts).  By recording every POST locally we can
+# compute exact rates regardless of scrape cadence or restarts.
+# ---------------------------------------------------------------------------
+# Each entry: (epoch_seconds, requests_count, tokens_count)
+_rate_history: dict[str, list[tuple[float, int, int]]] = defaultdict(list)
+_RATE_HISTORY_MAX_AGE = 86400  # keep 24 h of data per agent
+
+
+def _record_rate(agent_name: str, req_count: int, token_count: int) -> None:
+    """Record a POST for in-memory rate calculation."""
+    now = time.time()
+    bucket = _rate_history[agent_name]
+    bucket.append((now, max(0, req_count), max(0, token_count)))
+    # prune old entries
+    cutoff = now - _RATE_HISTORY_MAX_AGE
+    _rate_history[agent_name] = [e for e in bucket if e[0] > cutoff]
+
+
+def _calc_rates(agent_name: str) -> dict[str, int]:
+    """Return {rpm, tpm, rph, rpd, tok_day} from in-memory history."""
+    now = time.time()
+    entries = _rate_history.get(agent_name, [])
+    rpm = sum(r for t, r, _ in entries if t > now - 60)
+    tpm = sum(tok for t, _, tok in entries if t > now - 60)
+    rph = sum(r for t, r, _ in entries if t > now - 3600)
+    rpd = sum(r for t, r, _ in entries if t > now - 86400)
+    tok_day = sum(tok for t, _, tok in entries if t > now - 86400)
+    return {"rpm": rpm, "tpm": tpm, "rph": rph, "rpd": rpd, "tok_day": tok_day}
 
 
 def _prometheus_base_url() -> str:
@@ -204,19 +238,20 @@ def _agent_snapshot() -> tuple[list[dict[str, Any]], bool]:
     total_requests = _vector_by_agent(
         "sum by (agent_name) (agent_api_calls_total)"
     )
-    requests_minute = _vector_by_agent(
+    # Prometheus-based rates (may be 0 after restarts or with sparse scrapes)
+    prom_requests_minute = _vector_by_agent(
         "sum by (agent_name) (increase(agent_api_calls_total[1m]))"
     )
-    tokens_minute = _vector_by_agent(
+    prom_tokens_minute = _vector_by_agent(
         "sum by (agent_name) (increase(agent_token_usage_total[1m]))"
     )
-    requests_hour = _vector_by_agent(
+    prom_requests_hour = _vector_by_agent(
         "sum by (agent_name) (increase(agent_api_calls_total[1h]))"
     )
-    requests_day = _vector_by_agent(
+    prom_requests_day = _vector_by_agent(
         "sum by (agent_name) (increase(agent_api_calls_total[24h]))"
     )
-    tokens_day = _vector_by_agent(
+    prom_tokens_day = _vector_by_agent(
         "sum by (agent_name) (increase(agent_token_usage_total[24h]))"
     )
     last_runs = _vector_by_agent(
@@ -251,36 +286,81 @@ def _agent_snapshot() -> tuple[list[dict[str, Any]], bool]:
         total_request_value = round(
             total_requests.get(name, saved.get("requests", 0))
         )
-        minute_value = round(requests_minute.get(name, 0))
-        token_minute_value = round(tokens_minute.get(name, 0))
-        hour_value = round(requests_hour.get(name, 0))
-        day_value = round(requests_day.get(name, 0))
         total_token_value = round(
             total_tokens.get(name, saved.get("total_tokens", 0))
         )
-        tokens_day_value = round(tokens_day.get(name, 0))
 
-        # A newly created counter has no previous sample, so Prometheus can
-        # return zero for increase() even though the real total is one or more.
-        last_epoch = _safe_number(last_run, float, 0)
-        if isinstance(last_run, str) and last_run:
-            try:
-                last_epoch = datetime.strptime(
-                    last_run, "%Y-%m-%dT%H:%M:%SZ"
-                ).replace(tzinfo=timezone.utc).timestamp()
-            except ValueError:
-                last_epoch = 0
-        if total_request_value > 0 and last_epoch:
-            age = max(0, time.time() - last_epoch)
-            if minute_value == 0 and age <= 60:
-                minute_value = total_request_value
-                token_minute_value = total_token_value
-            if hour_value == 0 and age <= 3600:
-                hour_value = total_request_value
-            if day_value == 0 and age <= 86400:
+        # ------------------------------------------------------------------
+        # Rate calculation: prefer in-memory rates (accurate, restart-safe),
+        # fall back to Prometheus increase(), then to persisted estimates.
+        # ------------------------------------------------------------------
+        mem_rates = _calc_rates(name)
+
+        # RPM: in-memory > prometheus > 0
+        if mem_rates["rpm"] > 0:
+            minute_value = mem_rates["rpm"]
+        elif round(prom_requests_minute.get(name, 0)) > 0:
+            minute_value = round(prom_requests_minute.get(name, 0))
+        else:
+            minute_value = 0
+
+        # TPM: in-memory > prometheus > 0
+        if mem_rates["tpm"] > 0:
+            token_minute_value = mem_rates["tpm"]
+        elif round(prom_tokens_minute.get(name, 0)) > 0:
+            token_minute_value = round(prom_tokens_minute.get(name, 0))
+        else:
+            token_minute_value = 0
+
+        # Requests per hour
+        if mem_rates["rph"] > 0:
+            hour_value = mem_rates["rph"]
+        elif round(prom_requests_hour.get(name, 0)) > 0:
+            hour_value = round(prom_requests_hour.get(name, 0))
+        else:
+            hour_value = 0
+
+        # Requests per day: in-memory > prometheus > persisted estimate
+        if mem_rates["rpd"] > 0:
+            day_value = mem_rates["rpd"]
+        elif round(prom_requests_day.get(name, 0)) > 0:
+            day_value = round(prom_requests_day.get(name, 0))
+        else:
+            # Last-resort: if the agent has totals and last_run within 24 h,
+            # use the persisted totals as a rough estimate.
+            last_epoch = _safe_number(saved.get("last_run_epoch", 0), float)
+            if not last_epoch and isinstance(last_run, str) and last_run:
+                try:
+                    last_epoch = datetime.strptime(
+                        last_run, "%Y-%m-%dT%H:%M:%SZ"
+                    ).replace(tzinfo=timezone.utc).timestamp()
+                except ValueError:
+                    last_epoch = 0
+            age = max(0, time.time() - last_epoch) if last_epoch else 0
+            if total_request_value > 0 and 0 < age <= 86400:
                 day_value = total_request_value
-            if tokens_day_value == 0 and age <= 86400:
+            else:
+                day_value = 0
+
+        # Tokens per day
+        if mem_rates["tok_day"] > 0:
+            tokens_day_value = mem_rates["tok_day"]
+        elif round(prom_tokens_day.get(name, 0)) > 0:
+            tokens_day_value = round(prom_tokens_day.get(name, 0))
+        else:
+            last_epoch = _safe_number(saved.get("last_run_epoch", 0), float)
+            if not last_epoch and isinstance(last_run, str) and last_run:
+                try:
+                    last_epoch = datetime.strptime(
+                        last_run, "%Y-%m-%dT%H:%M:%SZ"
+                    ).replace(tzinfo=timezone.utc).timestamp()
+                except ValueError:
+                    last_epoch = 0
+            age = max(0, time.time() - last_epoch) if last_epoch else 0
+            if total_token_value > 0 and 0 < age <= 86400:
                 tokens_day_value = total_token_value
+            else:
+                tokens_day_value = 0
 
         # Render the raw epoch (from Prometheus) as a human-readable timestamp.
         if isinstance(last_run, (int, float)) and last_run:
@@ -307,7 +387,7 @@ def _agent_snapshot() -> tuple[list[dict[str, Any]], bool]:
                 if reported else "—",
                 "prompt_tokens": round(prompt_tokens.get(name, saved.get("prompt_tokens", 0))),
                 "completion_tokens": round(completion_tokens.get(name, saved.get("completion_tokens", 0))),
-                "total_tokens": round(total_tokens.get(name, saved.get("total_tokens", 0))),
+                "total_tokens": total_token_value,
                 "requests_total": total_request_value,
                 "requests_minute": minute_value,
                 "tokens_minute": token_minute_value,
@@ -386,7 +466,7 @@ def prometheus_redirect():
 
 @application.get("/api/status")
 def api_status():
-    return jsonify(collectors.build_status())
+    return jsonify([collectors.build_status()])
 
 
 @application.get("/api/agent-metrics")
@@ -536,6 +616,10 @@ def monitor_status_post():
     response_time = _safe_number(
         data.get("api_response_time_seconds", 0), float
     )
+
+    # Record for in-memory rate tracking BEFORE setting Prometheus metrics
+    _record_rate(agent_name, requests_count, total)
+
     _set_agent_metrics(
         agent_name=agent_name,
         stage=stage,
@@ -570,6 +654,7 @@ def monitor_status_post():
         "execution_time_seconds": execution,
         "api_response_time_seconds": response_time,
         "last_run": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "last_run_epoch": time.time(),
     }
     agent_state_store.save(stored)
     return jsonify(
@@ -599,12 +684,14 @@ const put=(id,value)=>{const el=document.getElementById(id);if(el)el.textContent
 const fmt=n=>Number(n||0).toLocaleString();
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 
+
 function spark(values){
   if(!values||values.length<2)return '<div class="meta">No request history yet</div>';
   let w=430,h=48,min=Math.min(...values),max=Math.max(...values),range=max-min||1;
   let pts=values.map((v,i)=>`${(i/(values.length-1))*w},${h-((v-min)/range)*h}`).join(' ');
   return `<svg viewBox="0 0 ${w} ${h}" width="100%" height="48" preserveAspectRatio="none"><polyline points="${pts}" fill="none" stroke="#53e0d0" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
 }
+
 
 function compact(n){
   n=Number(n||0);
@@ -613,12 +700,14 @@ function compact(n){
   return n.toLocaleString();
 }
 
+
 function card(a,maxDay,maxToken){
   let status=String(a.status||'not reported').toLowerCase(),
       rpdPct=a.rpd_limit?Math.min(100,(a.requests_day/a.rpd_limit)*100):0,
       tokPct=maxToken?Math.min(100,(a.total_tokens/maxToken)*100):0;
   return `<article class="card agent"><div class="head"><div><div class="name">${esc(a.agent_name)}</div><div class="details">${esc(a.provider)} · ${esc(a.model)} · ${esc(a.cloud)} · ${esc(a.stage)}</div></div><span class="badge ${a.has_prometheus_data?'':'not'}">${esc(status)}</span>${a.demo?'<span class="badge" style="color:#fbbf24;border-color:#fbbf2455;margin-left:6px">DEMO</span>':''}</div><div class="metrics"><div class="metric"><span>Total tokens</span><b>${compact(a.total_tokens)}</b></div><div class="metric"><span>Total requests</span><b>${compact(a.requests_total)}</b></div><div class="metric"><span>Last run</span><b style="font-size:12px">${esc(a.last_run||'—')}</b></div><div class="metric"><span>Prompt tokens</span><b>${compact(a.prompt_tokens)}</b></div><div class="metric"><span>Completion tokens</span><b>${compact(a.completion_tokens)}</b></div><div class="metric"><span>Tokens / day</span><b>${compact(a.tokens_day)}</b></div></div><div class="quota-title">Quota usage · current / limit</div><div class="quota-grid"><div class="quota"><span>RPM</span><strong>${compact(a.requests_minute)} / ${compact(a.rpm_limit)}</strong></div><div class="quota"><span>TPM</span><strong>${compact(a.tokens_minute)} / ${compact(a.tpm_limit)}</strong></div><div class="quota"><span>RPD</span><strong>${compact(a.requests_day)} / ${compact(a.rpd_limit)}</strong></div></div><div class="visual"><div class="semi" style="--pct:${rpdPct}"><strong>${compact(a.requests_day)} / ${compact(a.rpd_limit)}</strong></div><div class="bars"><div class="barrow"><span>RPM</span><div class="bar"><i style="width:${Math.min(100,(Number(a.requests_minute||0)/Math.max(1,Number(a.rpm_limit||1)))*100)}%"></i></div><b>${compact(a.requests_minute)}</b></div><div class="barrow"><span>TPM</span><div class="bar"><i style="width:${Math.min(100,(Number(a.tokens_minute||0)/Math.max(1,Number(a.tpm_limit||1)))*100)}%"></i></div><b>${compact(a.tokens_minute)}</b></div><div class="barrow"><span>RPD</span><div class="bar"><i style="width:${rpdPct}%"></i></div><b>${compact(a.requests_day)}</b></div></div></div><div class="spark">${spark(a.request_history)}</div><div class="meta" style="margin-top:12px">Decision: ${esc(a.decision)}</div></article>`;
 }
+
 
 async function refresh(){
   try{
@@ -666,7 +755,13 @@ def set_active_counts(sessions: int, users: int) -> None:
 
 
 def _restore_agent_metrics() -> None:
-    """Restore real persisted reports into a fresh Prometheus registry."""
+    """Restore real persisted reports into a fresh Prometheus registry.
+
+    Only restores gauge-like metrics (state, decision, model info, timestamps).
+    Counters are NOT restored via _value.set() because that causes Prometheus
+    to see counter resets which breaks increase() calculations for RPM/TPM/RPD.
+    Counter totals are preserved in the persisted JSON and displayed directly.
+    """
     try:
         stored = agent_state_store.load()
         for name, data in stored.get("agents", {}).items():
@@ -691,26 +786,20 @@ def _restore_agent_metrics() -> None:
             agent_api_key_count.labels(**labels, provider=provider).set(
                 _safe_number(data.get("api_key_count", 0), int)
             )
-            provider_labels = {**labels, "provider": provider, "model": model}
-            agent_prompt_tokens_total.labels(**provider_labels)._value.set(
-                _safe_number(data.get("prompt_tokens", 0), int)
-            )
-            agent_completion_tokens_total.labels(**provider_labels)._value.set(
-                _safe_number(data.get("completion_tokens", 0), int)
-            )
-            agent_token_usage_total.labels(**provider_labels)._value.set(
-                _safe_number(data.get("total_tokens", 0), int)
-            )
-            agent_api_calls_total.labels(
-                **provider_labels, status="success"
-            )._value.set(_safe_number(data.get("requests", 0), int))
             agent_execution_time_seconds.labels(**labels).set(
                 _safe_number(data.get("execution_time_seconds", 0), float)
             )
+            # Restore last_run timestamp so dashboards show correct last-run time
+            last_epoch = _safe_number(data.get("last_run_epoch", 0), float)
+            if not last_epoch and data.get("last_run"):
+                try:
+                    last_epoch = datetime.strptime(
+                        str(data["last_run"]), "%Y-%m-%dT%H:%M:%SZ"
+                    ).replace(tzinfo=timezone.utc).timestamp()
+                except ValueError:
+                    last_epoch = time.time()
             agent_last_run_timestamp_seconds.labels(**labels).set(
-                _safe_number(data.get("last_run_epoch", 0), float)
-                if data.get("last_run_epoch")
-                else time.time()
+                last_epoch if last_epoch else time.time()
             )
     except Exception:
         application.logger.exception("Could not restore agent metrics")
@@ -779,6 +868,7 @@ def _seed_demo_agents() -> None:
                 "execution_time_seconds": profile["execution_time_seconds"],
                 "api_response_time_seconds": profile["api_response_time_seconds"],
                 "last_run": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "last_run_epoch": time.time(),
                 "demo": True,
             }
             _set_agent_metrics(
@@ -797,6 +887,9 @@ def _seed_demo_agents() -> None:
                 execution_time=profile["execution_time_seconds"],
                 response_time=profile["api_response_time_seconds"],
             )
+            # Also record in in-memory rate tracker so demo agents show
+            # non-zero RPM/TPM/RPD immediately after seeding
+            _record_rate(name, profile["requests"], profile["total_tokens"])
             changed = True
         if changed:
             stored["agents"] = agents
