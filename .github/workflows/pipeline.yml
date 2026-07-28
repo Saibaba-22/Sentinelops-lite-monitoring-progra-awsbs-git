@@ -1,4 +1,4 @@
-name: SentinelOps-Lite Multi-cloud pipeline
+name: SentinelOps-Lite multi-cloud pipeline
 
 on:
   workflow_dispatch:
@@ -81,9 +81,12 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Validate Docker Hub configuration
+        env:
+          DOCKERHUB_TOKEN_VALUE: ${{ secrets.DOCKERHUB_TOKEN }}
         run: |
           test -n "$DOCKERHUB_USERNAME" || { echo "Missing repository variable DOCKERHUB_USERNAME"; exit 1; }
           test -n "$DOCKERHUB_REPOSITORY" || { echo "Missing repository variable DOCKERHUB_REPOSITORY or REPOSITORY"; exit 1; }
+          test -n "$DOCKERHUB_TOKEN_VALUE" || { echo "Missing repository secret DOCKERHUB_TOKEN"; exit 1; }
 
       - name: Set image names
         id: image-names
@@ -151,7 +154,7 @@ jobs:
           cache-to: type=gha,mode=max,scope=grafana
 
       - name: Scan application image
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1
         continue-on-error: true
         with:
           image-ref: docker.io/${{ env.DOCKERHUB_USERNAME }}/${{ env.DOCKERHUB_REPOSITORY }}:${{ github.sha }}
@@ -213,11 +216,18 @@ jobs:
             --application-name "$AWS_APP_NAME" \
             --environment-names "$AWS_ENV_NAME" \
             --query 'Environments[0].CNAME' --output text)
+          PLATFORM=$(aws elasticbeanstalk describe-environments \
+            --application-name "$AWS_APP_NAME" \
+            --environment-names "$AWS_ENV_NAME" \
+            --query 'Environments[0].SolutionStackName' --output text)
           test -n "$CNAME" && test "$CNAME" != "None" || { echo "AWS environment has no CNAME"; exit 1; }
+          test -n "$PLATFORM" && test "$PLATFORM" != "None" || { echo "AWS environment platform could not be resolved"; exit 1; }
           BASE_URL="${AWS_BASE_URL:-http://${CNAME}}"
           echo "cname=$CNAME" >> "$GITHUB_OUTPUT"
+          echo "platform=$PLATFORM" >> "$GITHUB_OUTPUT"
           echo "app_url=$BASE_URL" >> "$GITHUB_OUTPUT"
           echo "AWS app URL: $BASE_URL"
+          echo "AWS platform: $PLATFORM"
 
       - name: Set Elastic Beanstalk environment properties
         env:
@@ -273,7 +283,9 @@ jobs:
 
       - name: Initialize EB CLI and select environment
         run: |
-          eb init "$AWS_APP_NAME" --region "$AWS_REGION" --platform "Docker running on 64bit Amazon Linux 2"
+          eb init "$AWS_APP_NAME" \
+            --region "$AWS_REGION" \
+            --platform "${{ steps.aws-host.outputs.platform }}"
           eb use "$AWS_ENV_NAME"
 
       - name: Deploy AWS bundle
