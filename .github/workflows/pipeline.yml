@@ -290,6 +290,16 @@ jobs:
             --environment-name "$AWS_ENV_NAME" \
             --option-settings file:///tmp/eb-options.json >/dev/null
 
+          echo "Waiting for the Elastic Beanstalk configuration update to finish..."
+          aws elasticbeanstalk wait environment-updated \
+            --application-name "$AWS_APP_NAME" \
+            --environment-names "$AWS_ENV_NAME"
+          STATUS=$(aws elasticbeanstalk describe-environments \
+            --application-name "$AWS_APP_NAME" \
+            --environment-names "$AWS_ENV_NAME" \
+            --query 'Environments[0].Status' --output text)
+          test "$STATUS" = "Ready" || { echo "Elastic Beanstalk is not Ready: $STATUS"; exit 1; }
+
       - name: Render AWS ECS Dockerrun manifest
         if: ${{ contains(steps.aws-host.outputs.platform, 'running ECS') }}
         env:
@@ -478,6 +488,7 @@ jobs:
             --environment-name "$AWS_ENV_NAME" \
             --max-items 50 \
             --output table > reports/aws-eb-events.txt 2>&1 || true
+          eb logs "$AWS_ENV_NAME" --all > reports/aws-eb-logs.txt 2>&1 || true
           echo "===== EB STATUS ====="
           cat reports/aws-eb-status.txt || true
           echo "===== EB HEALTH ====="
