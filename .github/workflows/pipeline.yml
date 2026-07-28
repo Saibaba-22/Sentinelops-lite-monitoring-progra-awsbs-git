@@ -11,6 +11,7 @@ on:
           - aws
           - azure
           - both
+        default: aws
       ai_review:
         description: Run optional Gemini summaries (not required for deployment)
         required: true
@@ -465,9 +466,40 @@ jobs:
           AI_PROVIDER: ${{ vars.AI_PROVIDER || 'gemini' }}
         run: python agent/errors.py
 
+      - name: Collect AWS deployment diagnostics
+        if: always()
+        continue-on-error: true
+        run: |
+          mkdir -p reports
+          eb status "$AWS_ENV_NAME" > reports/aws-eb-status.txt 2>&1 || true
+          eb health "$AWS_ENV_NAME" > reports/aws-eb-health.txt 2>&1 || true
+          aws elasticbeanstalk describe-events \
+            --application-name "$AWS_APP_NAME" \
+            --environment-name "$AWS_ENV_NAME" \
+            --max-items 50 \
+            --output table > reports/aws-eb-events.txt 2>&1 || true
+          echo "===== EB STATUS ====="
+          cat reports/aws-eb-status.txt || true
+          echo "===== EB HEALTH ====="
+          cat reports/aws-eb-health.txt || true
+          echo "===== EB EVENTS ====="
+          cat reports/aws-eb-events.txt || true
+
+      - name: Upload AWS deployment diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: aws-deployment-diagnostics
+          path: |
+            reports/**
+            errors_report.txt
+          if-no-files-found: ignore
+
       - name: Fail AWS job after diagnostics
         if: ${{ steps.aws_deploy.outcome != 'success' }}
-        run: exit 1
+        run: |
+          echo "AWS deployment failed. Review the Deploy AWS bundle log and aws-deployment-diagnostics artifact."
+          exit 1
 
   deploy_azure:
     name: Deploy to Azure App Service
