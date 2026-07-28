@@ -333,7 +333,6 @@ jobs:
           CNAME: ${{ steps.aws-host.outputs.cname }}
           MONITOR_TOKEN: ${{ secrets.MONITOR_TOKEN_AWS }}
           GRAFANA_ADMIN_PASSWORD: ${{ secrets.GRAFANA_ADMIN_PASSWORD }}
-          GRAFANA_IMAGE: docker.io/${{ env.DOCKERHUB_USERNAME }}/${{ env.DOCKERHUB_REPOSITORY }}:grafana-${{ github.sha }}
         run: |
           test -f Dockerrun.aws.json || { echo "Missing Dockerrun.aws.json for the ECS environment"; exit 1; }
           touch .ebignore
@@ -372,13 +371,8 @@ jobs:
               set_env(app, name, value)
 
           grafana = get_container("grafana")
-          grafana["image"] = os.environ["GRAFANA_IMAGE"]
-          # The monitoring files are baked into the image. Do not let an
-          # empty/old host mount hide the dashboard inside the image.
-          grafana["mountPoints"] = [
-              mount for mount in grafana.get("mountPoints", [])
-              if mount.get("sourceVolume") not in {"grafana-provisioning", "grafana-dashboards"}
-          ]
+          # AWS ECS uses the official Grafana image and mounts the dashboard
+          # and provisioning files from the application bundle.
           for name, value in {
               "GF_SECURITY_ADMIN_USER": "admin",
               "GF_SECURITY_ADMIN_PASSWORD": os.environ["GRAFANA_ADMIN_PASSWORD"],
@@ -529,6 +523,19 @@ jobs:
             --max-items 50 \
             --output table > reports/aws-eb-events.txt 2>&1 || true
           eb logs "$AWS_ENV_NAME" --all > reports/aws-eb-logs.txt 2>&1 || true
+          ENV_ID=$(aws elasticbeanstalk describe-environments \
+            --application-name "$AWS_APP_NAME" \
+            --environment-names "$AWS_ENV_NAME" \
+            --query 'Environments[0].EnvironmentId' --output text)
+          CLUSTER=$(aws ecs list-clusters --query 'clusterArns[]' --output text | tr '\\t' '\\n' | grep "/awseb-${AWS_ENV_NAME}-${ENV_ID#e-}" | head -1 || true)
+          if [ -n "$CLUSTER" ]; then
+            TASK=$(aws ecs list-tasks --cluster "$CLUSTER" --desired-status STOPPED --max-items 1 --query 'taskArns[0]' --output text)
+            if [ -n "$TASK" ] && [ "$TASK" != "None" ]; then
+              aws ecs describe-tasks --cluster "$CLUSTER" --tasks "$TASK" \
+                --query 'tasks[0].{stopReason:stopReason,containers:containers[].{name:name,status:lastStatus,exitCode:exitCode,reason:reason}}' \
+                --output json > reports/aws-ecs-task.json 2>&1 || true
+            fi
+          fi
           echo "===== EB STATUS ====="
           cat reports/aws-eb-status.txt || true
           echo "===== EB HEALTH ====="
@@ -537,6 +544,8 @@ jobs:
           cat reports/aws-eb-events.txt || true
           echo "===== EB LOG TAIL ====="
           tail -300 reports/aws-eb-logs.txt || true
+          echo "===== ECS TASK DETAILS ====="
+          cat reports/aws-ecs-task.json 2>/dev/null || true
 
       - name: Upload AWS deployment diagnostics
         if: always()
