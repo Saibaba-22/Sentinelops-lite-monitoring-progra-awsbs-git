@@ -1,12 +1,14 @@
-"""SentinelOps-Lite Flask application and AI-agent monitor receiver."""
+"""SentinelOps-Lite Flask application and modern AI-agent monitor."""
 
 from __future__ import annotations
 
 import html
 import os
 import time
+from datetime import datetime, timezone
 from typing import Any
 
+import requests
 from flask import Flask, Response, jsonify, redirect, request, url_for
 from werkzeug.exceptions import HTTPException
 
@@ -61,6 +63,220 @@ STAGE_AGENT_MAP = {
 }
 
 
+def _prometheus_base_url() -> str:
+    return os.getenv(
+        "PROMETHEUS_URL", "http://prometheus:9090/prometheus"
+    ).rstrip("/")
+
+
+def _prom_query(query: str) -> list[dict[str, Any]]:
+    try:
+        response = requests.get(
+            f"{_prometheus_base_url()}/api/v1/query",
+            params={"query": query},
+            timeout=5,
+        )
+        response.raise_for_status()
+        body = response.json()
+        if body.get("status") != "success":
+            return []
+        return body.get("data", {}).get("result", []) or []
+    except (requests.RequestException, ValueError, TypeError):
+        return []
+
+
+def _prom_range(query: str) -> dict[str, list[float]]:
+    """Return six-hour agent series for the small SVG sparklines."""
+    end = time.time()
+    start = end - 6 * 60 * 60
+    try:
+        response = requests.get(
+            f"{_prometheus_base_url()}/api/v1/query_range",
+            params={
+                "query": query,
+                "start": start,
+                "end": end,
+                "step": 300,
+            },
+            timeout=6,
+        )
+        response.raise_for_status()
+        body = response.json()
+        results = body.get("data", {}).get("result", []) or []
+        output: dict[str, list[float]] = {}
+        for item in results:
+            name = item.get("metric", {}).get("agent_name")
+            if not name:
+                continue
+            values = []
+            for pair in item.get("values", []):
+                try:
+                    values.append(float(pair[1]))
+                except (IndexError, TypeError, ValueError):
+                    values.append(0.0)
+            output[name] = values
+        return output
+    except (requests.RequestException, ValueError, TypeError):
+        return {}
+
+
+def _vector_by_agent(query: str) -> dict[str, float]:
+    values: dict[str, float] = {}
+    for item in _prom_query(query):
+        labels = item.get("metric", {})
+        name = labels.get("agent_name")
+        if not name:
+            continue
+        try:
+            values[name] = float(item.get("value", [0, 0])[1])
+        except (IndexError, TypeError, ValueError):
+            values[name] = 0.0
+    return values
+
+
+def _states_by_agent() -> dict[str, str]:
+    values: dict[str, str] = {}
+    for item in _prom_query("agent_state == 1"):
+        labels = item.get("metric", {})
+        name = labels.get("agent_name")
+        if name:
+            values[name] = labels.get("state", "unknown")
+    return values
+
+
+def _models_by_agent() -> dict[str, dict[str, str]]:
+    values: dict[str, dict[str, str]] = {}
+    for item in _prom_query("agent_model_info"):
+        labels = item.get("metric", {})
+        name = labels.get("agent_name")
+        if name:
+            values[name] = {
+                "provider": labels.get("provider", "unknown"),
+                "model": labels.get("model", "unknown"),
+            }
+    return values
+
+
+def _load_state() -> dict[str, Any]:
+    try:
+        path = os.getenv(
+            "AGENT_STATE_FILE", os.path.join(BASE_DIR, "logs", "agent_stats.json")
+        )
+        with open(path, encoding="utf-8") as handle:
+            value = __import__("json").load(handle)
+        return value if isinstance(value, dict) else {}
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
+def _safe_number(value: Any, converter=float, default=0):
+    try:
+        return max(default, converter(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _agent_snapshot() -> tuple[list[dict[str, Any]], bool]:
+    persisted = _load_state().get("agents", {})
+    if not isinstance(persisted, dict):
+        persisted = {}
+
+    total_tokens = _vector_by_agent(
+        "sum by (agent_name) (agent_token_usage_total)"
+    )
+    prompt_tokens = _vector_by_agent(
+        "sum by (agent_name) (agent_prompt_tokens_total)"
+    )
+    completion_tokens = _vector_by_agent(
+        "sum by (agent_name) (agent_completion_tokens_total)"
+    )
+    total_requests = _vector_by_agent(
+        "sum by (agent_name) (agent_api_calls_total)"
+    )
+    requests_minute = _vector_by_agent(
+        "sum by (agent_name) (increase(agent_api_calls_total[1m]))"
+    )
+    requests_day = _vector_by_agent(
+        "sum by (agent_name) (increase(agent_api_calls_total[24h]))"
+    )
+    tokens_day = _vector_by_agent(
+        "sum by (agent_name) (increase(agent_token_usage_total[24h]))"
+    )
+    last_runs = _vector_by_agent(
+        "max by (agent_name) (agent_last_run_timestamp_seconds)"
+    )
+    states = _states_by_agent()
+    models = _models_by_agent()
+    history = _prom_range(
+        "sum by (agent_name) (rate(agent_api_calls_total[5m])) * 60"
+    )
+
+    discovered = set(KNOWN_AGENTS)
+    discovered.update(persisted.keys())
+    discovered.update(total_tokens.keys())
+    discovered.update(total_requests.keys())
+    discovered.update(states.keys())
+
+    agents = []
+    for name in sorted(discovered):
+        saved = persisted.get(name, {})
+        if not isinstance(saved, dict):
+            saved = {}
+        model = models.get(name, {})
+        has_prometheus_data = bool(
+            name in states or name in total_tokens or name in total_requests
+        )
+        last_run: Any = last_runs.get(name, 0)
+        if not last_run:
+            last_run = saved.get("last_run")
+
+        agents.append(
+            {
+                "agent_name": name,
+                "status": states.get(
+                    name, saved.get("status", "not reported")
+                )
+                if has_prometheus_data or saved.get("last_run")
+                else "not reported",
+                "decision": saved.get("decision", "none"),
+                "stage": saved.get("stage", "—")
+                if has_prometheus_data or saved.get("last_run")
+                else "—",
+                "cloud": saved.get("cloud", "—")
+                if has_prometheus_data or saved.get("last_run")
+                else "—",
+                "provider": model.get(
+                    "provider", saved.get("provider", "—")
+                )
+                if has_prometheus_data or saved.get("last_run")
+                else "—",
+                "model": model.get("model", saved.get("model", "—"))
+                if has_prometheus_data or saved.get("last_run")
+                else "—",
+                "prompt_tokens": round(
+                    prompt_tokens.get(name, saved.get("prompt_tokens", 0))
+                ),
+                "completion_tokens": round(
+                    completion_tokens.get(name, saved.get("completion_tokens", 0))
+                ),
+                "total_tokens": round(
+                    total_tokens.get(name, saved.get("total_tokens", 0))
+                ),
+                "requests_total": round(
+                    total_requests.get(name, saved.get("requests", 0))
+                ),
+                "requests_minute": round(requests_minute.get(name, 0)),
+                "requests_day": round(requests_day.get(name, 0)),
+                "tokens_day": round(tokens_day.get(name, 0)),
+                "last_run": last_run or None,
+                "has_prometheus_data": has_prometheus_data,
+                "request_history": history.get(name, []),
+            }
+        )
+
+    return agents, bool(_prom_query("up"))
+
+
 @application.before_request
 def _start_timer() -> None:
     request._start_time = time.perf_counter()
@@ -68,18 +284,15 @@ def _start_timer() -> None:
 
 @application.after_request
 def _record_metrics(response):
-    # Prometheus scrapes should not increment the application's request counters.
     if request.path == "/metrics":
         return response
-
-    duration = time.perf_counter() - getattr(request, "_start_time", time.perf_counter())
-    method = request.method
-    endpoint = request.path
-    status = str(response.status_code)
+    duration = time.perf_counter() - getattr(
+        request, "_start_time", time.perf_counter()
+    )
+    method, endpoint, status = request.method, request.path, str(response.status_code)
     app_requests_total.labels(method, endpoint, status).inc()
     app_request_duration_seconds.labels(method, endpoint).observe(duration)
     http_status_codes_total.labels(code=status).inc()
-
     APP_STATS["total_requests"] += 1
     APP_STATS["total_request_time"] += duration
     if response.status_code >= 500:
@@ -110,7 +323,6 @@ def metrics():
 
 @application.get("/health")
 def health():
-    """HTML health response kept compatible with the existing test suite."""
     return Response(
         "<html><body><strong>healthy</strong></body></html>",
         mimetype="text/html",
@@ -127,78 +339,60 @@ def api_status():
     return jsonify(collectors.build_status())
 
 
-@application.get("/agent/status")
-def agent_status():
-    state_data = agent_state_store.load()
-    agents = state_data.get("agents", {})
-    latest = max(
-        agents.values(),
-        key=lambda item: str(item.get("last_run") or ""),
-        default={},
-    )
-    latest_status = latest or {}
+@application.get("/api/agent-metrics")
+def api_agent_metrics():
+    agents, connected = _agent_snapshot()
     return jsonify(
-        status=str(latest_status.get("status", state_data.get("status", "idle"))).capitalize(),
-        decision=latest_status.get("decision", state_data.get("decision", "none")),
-        provider=latest_status.get("provider", "gemini"),
-        model=latest_status.get("model", "gemini-2.5-flash"),
-        prompt_tokens=latest_status.get("prompt_tokens", 0),
-        completion_tokens=latest_status.get("completion_tokens", 0),
-        total_tokens=latest_status.get("total_tokens", 0),
-        tokens=latest_status.get("total_tokens", 0),
-        requests=latest_status.get("requests", 0),
-        api_key_count=latest_status.get("api_key_count", 0),
-        api_keys=latest_status.get("api_key_count", 0),
-        last_run=latest_status.get("last_run"),
-        execution_time_seconds=latest_status.get("execution_time_seconds", 0),
+        generated_at=datetime.now(timezone.utc).isoformat(),
+        prometheus_url=_prometheus_base_url(),
+        prometheus_connected=connected,
         agents=agents,
     )
 
 
 @application.get("/api/agents")
 def api_agents():
-    """Return every known agent, including agents that have not reported yet."""
+    agents, connected = _agent_snapshot()
+    return jsonify(
+        generated_at=datetime.now(timezone.utc).isoformat(),
+        prometheus_connected=connected,
+        agents=agents,
+    )
+
+
+@application.get("/agent/status")
+def agent_status():
     state = agent_state_store.load()
-    agents = state.setdefault("agents", {})
-    for name in KNOWN_AGENTS:
-        agents.setdefault(
-            name,
-            {
-                "agent_name": name,
-                "status": "idle",
-                "decision": "none",
-                "stage": "unknown",
-                "cloud": "unknown",
-                "provider": "unknown",
-                "model": "unknown",
-                "prompt_tokens": 0,
-                "completion_tokens": 0,
-                "total_tokens": 0,
-                "requests": 0,
-                "api_key_count": 0,
-                "execution_time_seconds": 0,
-                "last_run": None,
-            },
-        )
-    return jsonify(agents=agents)
+    agents = state.get("agents", {})
+    latest = max(
+        agents.values(), key=lambda item: str(item.get("last_run") or ""), default={}
+    )
+    return jsonify(
+        status=str(latest.get("status", state.get("status", "idle"))).capitalize(),
+        decision=latest.get("decision", state.get("decision", "none")),
+        provider=latest.get("provider", "gemini"),
+        model=latest.get("model", "gemini-2.5-flash"),
+        prompt_tokens=latest.get("prompt_tokens", 0),
+        completion_tokens=latest.get("completion_tokens", 0),
+        total_tokens=latest.get("total_tokens", 0),
+        tokens=latest.get("total_tokens", 0),
+        requests=latest.get("requests", 0),
+        api_key_count=latest.get("api_key_count", 0),
+        last_run=latest.get("last_run"),
+        execution_time_seconds=latest.get("execution_time_seconds", 0),
+        agents=agents,
+    )
 
 
 def _normalise_agent_name(data: dict[str, Any], stage: str) -> str:
-    supplied = (
+    value = (
         data.get("agent_name")
         or request.headers.get("X-Agent-Name")
         or os.getenv("AGENT_NAME")
         or STAGE_AGENT_MAP.get(stage)
         or "unknown_agent"
     )
-    return str(supplied).strip().lower().replace(" ", "_")[:80]
-
-
-def _non_negative(value: Any, converter, default=0):
-    try:
-        return max(default, converter(value))
-    except (TypeError, ValueError):
-        return default
+    return str(value).strip().lower().replace(" ", "_")[:80]
 
 
 def _set_agent_metrics(
@@ -219,16 +413,13 @@ def _set_agent_metrics(
     response_time: float,
 ) -> None:
     labels = {"agent_name": agent_name, "stage": stage, "cloud": cloud}
-
     for item in AGENT_STATES:
         agent_state.labels(**labels, state=item).set(float(item == status))
     for item in AGENT_DECISIONS:
         agent_last_decision.labels(**labels, decision=item).set(float(item == decision))
-
     agent_model_info.labels(**labels).info({"provider": provider, "model": model})
     agent_api_key_count.labels(**labels, provider=provider).set(api_key_count)
     agent_last_run_timestamp_seconds.labels(**labels).set(time.time())
-
     if requests_count:
         agent_api_calls_total.labels(
             **labels,
@@ -248,7 +439,6 @@ def _set_agent_metrics(
         agent_token_usage_total.labels(
             **labels, provider=provider, model=model
         ).inc(total_tokens)
-
     if status not in ("idle", "running"):
         result = "approved" if status in ("approved", "healthy") else status
         agent_tasks_total.labels(**labels, result=result).inc()
@@ -262,17 +452,12 @@ def _set_agent_metrics(
 
 @application.post("/monitor/status")
 def monitor_status_post():
-    """Receive and persist one status event from a CI agent."""
-    expected_token = os.getenv("MONITOR_TOKEN", "")
-    supplied_token = request.headers.get("X-Monitor-Token", "")
-    if expected_token and supplied_token != expected_token:
+    expected = os.getenv("MONITOR_TOKEN", "")
+    if expected and request.headers.get("X-Monitor-Token", "") != expected:
         return jsonify(ok=False, error="unauthorized"), 401
-
     data = request.get_json(silent=True) or {}
     stage = str(
-        data.get("stage")
-        or request.headers.get("X-Agent-Stage")
-        or "unknown"
+        data.get("stage") or request.headers.get("X-Agent-Stage") or "unknown"
     ).strip().lower()[:80]
     agent_name = _normalise_agent_name(data, stage)
     cloud = str(
@@ -284,31 +469,23 @@ def monitor_status_post():
     ).strip().lower()[:40]
     provider = str(data.get("provider", "unknown")).strip().lower()[:40]
     model = str(data.get("model", "unknown")).strip()[:120]
-
     status = str(data.get("status", "idle")).strip().lower()
     if status not in AGENT_STATES:
         status = "failed"
     decision = str(data.get("decision", status)).strip().lower()
     if decision not in AGENT_DECISIONS:
         decision = "none"
-
-    prompt_tokens = _non_negative(data.get("prompt_tokens", 0), int)
-    completion_tokens = _non_negative(data.get("completion_tokens", 0), int)
-    total_tokens = _non_negative(
-        data.get("total_tokens", prompt_tokens + completion_tokens), int
-    )
-    # Accept both names so old and new monitor clients work.
-    requests_count = _non_negative(
+    prompt = _safe_number(data.get("prompt_tokens", 0), int)
+    completion = _safe_number(data.get("completion_tokens", 0), int)
+    total = _safe_number(data.get("total_tokens", prompt + completion), int)
+    requests_count = _safe_number(
         data.get("requests", data.get("requests_count", 0)), int
     )
-    api_key_count = _non_negative(data.get("api_key_count", 0), int)
-    execution_time = _non_negative(
-        data.get("execution_time_seconds", 0), float
-    )
-    response_time = _non_negative(
+    keys = _safe_number(data.get("api_key_count", 0), int)
+    execution = _safe_number(data.get("execution_time_seconds", 0), float)
+    response_time = _safe_number(
         data.get("api_response_time_seconds", 0), float
     )
-
     _set_agent_metrics(
         agent_name=agent_name,
         stage=stage,
@@ -317,15 +494,14 @@ def monitor_status_post():
         model=model,
         status=status,
         decision=decision,
-        prompt_tokens=prompt_tokens,
-        completion_tokens=completion_tokens,
-        total_tokens=total_tokens,
+        prompt_tokens=prompt,
+        completion_tokens=completion,
+        total_tokens=total,
         requests_count=requests_count,
-        api_key_count=api_key_count,
-        execution_time=execution_time,
+        api_key_count=keys,
+        execution_time=execution,
         response_time=response_time,
     )
-
     stored = agent_state_store.load()
     stored.setdefault("agents", {})
     stored["agents"][agent_name] = {
@@ -336,17 +512,16 @@ def monitor_status_post():
         "decision": decision,
         "provider": provider,
         "model": model,
-        "prompt_tokens": prompt_tokens,
-        "completion_tokens": completion_tokens,
-        "total_tokens": total_tokens,
+        "prompt_tokens": prompt,
+        "completion_tokens": completion,
+        "total_tokens": total,
         "requests": requests_count,
-        "api_key_count": api_key_count,
-        "execution_time_seconds": execution_time,
+        "api_key_count": keys,
+        "execution_time_seconds": execution,
         "api_response_time_seconds": response_time,
         "last_run": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
     agent_state_store.save(stored)
-
     return jsonify(
         ok=True,
         agent=agent_name,
@@ -359,70 +534,22 @@ def monitor_status_post():
 
 @application.get("/monitor/status")
 def monitor_status_get():
-    state = agent_state_store.load()
-    agents = state.setdefault("agents", {})
-    for name in KNOWN_AGENTS:
-        agents.setdefault(
-            name,
-            {
-                "agent_name": name,
-                "status": "idle",
-                "decision": "none",
-                "stage": "unknown",
-                "cloud": "unknown",
-                "provider": "unknown",
-                "model": "unknown",
-                "prompt_tokens": 0,
-                "completion_tokens": 0,
-                "total_tokens": 0,
-                "requests": 0,
-                "api_key_count": 0,
-                "execution_time_seconds": 0,
-                "last_run": None,
-            },
-        )
-
-    app_status = collectors.build_status()["application"]
-    rows = []
-    for name, data in agents.items():
-        safe = {key: html.escape(str(value)) for key, value in data.items()}
-        rows.append(
-            "<tr>"
-            f"<td><strong>{html.escape(name)}</strong></td>"
-            f"<td>{safe.get('status', 'idle')}</td>"
-            f"<td>{safe.get('decision', 'none')}</td>"
-            f"<td>{safe.get('stage', 'unknown')}</td>"
-            f"<td>{safe.get('cloud', 'unknown')}</td>"
-            f"<td>{safe.get('provider', 'unknown')} / {safe.get('model', 'unknown')}</td>"
-            f"<td>{safe.get('total_tokens', '0')}</td>"
-            f"<td>{safe.get('requests', '0')}</td>"
-            f"<td>{safe.get('last_run', 'never')}</td>"
-            "</tr>"
-        )
-
-    page = f"""<!doctype html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>SentinelOps-Lite Monitor</title><meta http-equiv="refresh" content="10">
+    page = r"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SentinelOps AI Agent Monitor</title>
 <style>
-body{{font-family:system-ui;background:#0f172a;color:#e2e8f0;padding:24px}}
-h1{{color:#38bdf8}}table{{width:100%;border-collapse:collapse;background:#1e293b}}
-th,td{{padding:10px;text-align:left;border-bottom:1px solid #334155}}
-th{{color:#38bdf8}}.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px}}
-.card{{background:#1e293b;padding:16px;border-radius:8px}}.value{{font-size:24px;font-weight:700}}
-a{{color:#38bdf8;margin-right:14px}}
-</style></head><body>
-<h1>SentinelOps-Lite Monitor</h1><p>Refreshes every 10 seconds.</p>
-<div class="grid">
-<div class="card">Requests<div class="value">{app_status.get('total_requests', 0)}</div></div>
-<div class="card">Success<div class="value">{app_status.get('success_requests', 0)}</div></div>
-<div class="card">Failed<div class="value">{app_status.get('failed_requests', 0)}</div></div>
-<div class="card">Exceptions<div class="value">{app_status.get('exceptions', 0)}</div></div>
-</div>
-<h2>AI agent status</h2>
-<table><thead><tr><th>Agent</th><th>Status</th><th>Decision</th><th>Stage</th><th>Cloud</th><th>Provider / Model</th><th>Tokens</th><th>Requests</th><th>Last run</th></tr></thead>
-<tbody>{''.join(rows)}</tbody></table>
-<p><a href="/api/agents">All agents JSON</a><a href="/agent/status">Latest agent JSON</a><a href="/metrics">Prometheus metrics</a><a href="/grafana/">Grafana</a><a href="/health">Health</a></p>
-</body></html>"""
+:root{--bg:#070b18;--panel:#11182b;--panel2:#17213a;--line:#263452;--text:#edf4ff;--muted:#8ea0c0;--blue:#56b4ff;--cyan:#53e0d0;--green:#4ade80;--amber:#fbbf24;--red:#fb7185}
+*{box-sizing:border-box}body{margin:0;min-height:100vh;font:14px/1.5 system-ui,sans-serif;color:var(--text);background:radial-gradient(circle at 10% 0%,#143159 0,transparent 35%),var(--bg)}.wrap{max-width:1500px;margin:auto;padding:30px}.top{display:flex;justify-content:space-between;align-items:end;gap:20px;margin-bottom:25px}h1{margin:0;font-size:clamp(26px,4vw,44px);letter-spacing:-.05em}.sub,.meta{color:var(--muted)}.live{display:flex;gap:9px;align-items:center;color:var(--muted)}.dot{width:10px;height:10px;border-radius:50%;background:var(--green);box-shadow:0 0 15px var(--green)}.dot.off{background:var(--red);box-shadow:0 0 15px var(--red)}.summary{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:20px}.card{background:linear-gradient(145deg,#151f38,#0e1528);border:1px solid var(--line);border-radius:18px;padding:20px;box-shadow:0 16px 45px #0005}.label{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.12em}.num{font-size:32px;font-weight:800;margin-top:4px}.agents{display:grid;grid-template-columns:repeat(auto-fit,minmax(390px,1fr));gap:16px}.agent{position:relative;overflow:hidden}.agent:before{content:"";position:absolute;top:0;left:0;right:0;height:3px;background:linear-gradient(90deg,var(--blue),var(--cyan))}.head{display:flex;justify-content:space-between;gap:12px}.name{font-size:21px;font-weight:750}.badge{border:1px solid #ffffff25;border-radius:999px;padding:4px 10px;color:var(--cyan);font-size:11px;text-transform:uppercase}.badge.not{color:var(--muted)}.details{margin-top:4px;color:var(--muted);font-size:12px}.metrics{display:grid;grid-template-columns:repeat(3,1fr);gap:9px;margin-top:18px}.metric{background:#0a1020aa;border:1px solid #ffffff0d;border-radius:12px;padding:11px}.metric span{display:block;color:var(--muted);font-size:10px}.metric b{display:block;font-size:19px;margin-top:3px}.visual{display:grid;grid-template-columns:150px 1fr;gap:20px;align-items:center;margin-top:17px}.semi{height:76px;width:150px;overflow:hidden;position:relative}.semi:before{content:"";position:absolute;width:150px;height:150px;border-radius:50%;background:conic-gradient(var(--blue) calc(var(--pct)*1%),#263452 0);transform:rotate(-90deg)}.semi:after{content:"";position:absolute;left:20px;top:20px;width:110px;height:110px;border-radius:50%;background:var(--panel)}.semi strong{position:absolute;z-index:2;left:0;right:0;top:32px;text-align:center;font-size:18px}.bars{display:grid;gap:8px}.barrow{display:grid;grid-template-columns:78px 1fr 50px;gap:7px;align-items:center;color:var(--muted);font-size:11px}.bar{height:7px;background:#263452;border-radius:20px;overflow:hidden}.bar i{display:block;height:100%;background:linear-gradient(90deg,var(--blue),var(--cyan));border-radius:20px}.spark{margin-top:17px;background:#0a1020aa;border:1px solid #ffffff0d;border-radius:12px;padding:8px}.notice{margin:15px 0;padding:13px 16px;border:1px solid #fbbf2435;background:#fbbf2410;border-radius:12px;color:#fcd879}.empty{text-align:center;color:var(--muted);padding:35px}.footer{color:var(--muted);margin-top:20px;font-size:12px}@media(max-width:800px){.wrap{padding:18px}.top{display:block}.live{margin-top:15px}.summary{grid-template-columns:repeat(2,1fr)}.agents{grid-template-columns:1fr}}@media(max-width:470px){.metrics{grid-template-columns:repeat(2,1fr)}.visual{grid-template-columns:1fr}}
+</style></head><body><div class="wrap">
+<header class="top"><div><h1>SentinelOps <span style="color:var(--blue)">AI Agents</span></h1><div class="sub">Real Prometheus totals, requests and 24-hour activity</div></div><div class="live"><i id="dot" class="dot"></i><span id="connection">Connecting...</span></div></header>
+<section class="summary"><div class="card"><div class="label">Reporting agents</div><div id="agents" class="num">—</div></div><div class="card"><div class="label">Total tokens</div><div id="tokens" class="num">—</div></div><div class="card"><div class="label">Requests / minute</div><div id="minute" class="num">—</div></div><div class="card"><div class="label">Requests / 24 hours</div><div id="day" class="num">—</div></div></section>
+<div id="notice" class="notice" hidden></div><section id="cards" class="agents"><div class="card empty">Loading real agent metrics...</div></section><div class="footer">Refreshes every 10 seconds · Source: Prometheus with persisted status fallback</div></div>
+<script>
+const fmt=n=>Number(n||0).toLocaleString();const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+function spark(values){if(!values||values.length<2)return '<div class="meta">No request history yet</div>';let w=430,h=48,min=Math.min(...values),max=Math.max(...values),range=max-min||1;let pts=values.map((v,i)=>`${(i/(values.length-1))*w},${h-((v-min)/range)*h}`).join(' ');return `<svg viewBox="0 0 ${w} ${h}" width="100%" height="48" preserveAspectRatio="none"><polyline points="${pts}" fill="none" stroke="#53e0d0" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg>`}
+function card(a,maxDay,maxToken){let status=String(a.status||'not reported').toLowerCase(),pct=maxDay?Math.min(100,(a.requests_day/maxDay)*100):0,tokPct=maxToken?Math.min(100,(a.total_tokens/maxToken)*100):0;return `<article class="card agent"><div class="head"><div><div class="name">${esc(a.agent_name)}</div><div class="details">${esc(a.provider)} · ${esc(a.model)} · ${esc(a.cloud)} · ${esc(a.stage)}</div></div><span class="badge ${a.has_prometheus_data?'': 'not'}">${esc(status)}</span></div><div class="metrics"><div class="metric"><span>Total tokens</span><b>${fmt(a.total_tokens)}</b></div><div class="metric"><span>Total requests</span><b>${fmt(a.requests_total)}</b></div><div class="metric"><span>Last run</span><b style="font-size:12px">${esc(a.last_run||'—')}</b></div><div class="metric"><span>Prompt tokens</span><b>${fmt(a.prompt_tokens)}</b></div><div class="metric"><span>Completion tokens</span><b>${fmt(a.completion_tokens)}</b></div><div class="metric"><span>Tokens / day</span><b>${fmt(a.tokens_day)}</b></div></div><div class="visual"><div class="semi" style="--pct:${pct}"><strong>${fmt(a.requests_day)}</strong></div><div class="bars"><div class="barrow"><span>Requests/min</span><div class="bar"><i style="width:${Math.min(100,Number(a.requests_minute||0)*10)}%"></i></div><b>${fmt(a.requests_minute)}</b></div><div class="barrow"><span>Requests/day</span><div class="bar"><i style="width:${pct}%"></i></div><b>${fmt(a.requests_day)}</b></div><div class="barrow"><span>Tokens</span><div class="bar"><i style="width:${tokPct}%"></i></div><b>${fmt(a.total_tokens)}</b></div></div></div><div class="spark">${spark(a.request_history)}</div><div class="meta" style="margin-top:12px">Decision: ${esc(a.decision)}</div></article>`}
+async function refresh(){try{let r=await fetch('/api/agent-metrics',{cache:'no-store'}),d=await r.json(),list=d.agents||[],real=list.filter(a=>a.has_prometheus_data),maxDay=Math.max(0,...list.map(a=>Number(a.requests_day||0))),maxToken=Math.max(0,...list.map(a=>Number(a.total_tokens||0)));document.getElementById('dot').classList.toggle('off',!d.prometheus_connected);document.getElementById('connection').textContent=d.prometheus_connected?'Prometheus connected':'Prometheus unavailable';document.getElementById('agents').textContent=fmt(real.length);document.getElementById('tokens').textContent=fmt(list.reduce((n,a)=>n+Number(a.total_tokens||0),0));document.getElementById('minute').textContent=fmt(list.reduce((n,a)=>n+Number(a.requests_minute||0),0));document.getElementById('day').textContent=fmt(list.reduce((n,a)=>n+Number(a.requests_day||0),0));let n=document.getElementById('notice');n.hidden=real.length>0;if(!real.length)n.textContent='Prometheus is connected, but no real AI-agent samples have been reported yet.';document.getElementById('cards').innerHTML=list.map(a=>card(a,maxDay,maxToken)).join('')}catch(e){document.getElementById('dot').classList.add('off');document.getElementById('connection').textContent='Dashboard API unavailable';document.getElementById('notice').hidden=false;document.getElementById('notice').textContent=String(e)}}refresh();setInterval(refresh,10000);
+</script></body></html>"""
     return Response(page, mimetype="text/html")
 
 
@@ -439,19 +566,10 @@ def set_active_counts(sessions: int, users: int) -> None:
 
 
 def _restore_agent_metrics() -> None:
-    """Restore persisted agent state into the fresh Prometheus registry.
-
-    The HTML monitor reads logs/agent_stats.json directly, but Prometheus
-    metrics are in memory. Without this restore, /monitor/status can show
-    data while Grafana remains empty after a container restart.
-    """
+    """Restore real persisted reports into a fresh Prometheus registry."""
     try:
         stored = agent_state_store.load()
-        agents = stored.get("agents", {})
-        for name in KNOWN_AGENTS:
-            data = agents.get(name, {})
-            # Do not create fake idle Prometheus series for agents that have
-            # never reported. Grafana should show only real agent activity.
+        for name, data in stored.get("agents", {}).items():
             if not data.get("last_run"):
                 continue
             stage = str(data.get("stage") or "unknown")
@@ -465,47 +583,29 @@ def _restore_agent_metrics() -> None:
             if decision not in AGENT_DECISIONS:
                 decision = "none"
             labels = {"agent_name": name, "stage": stage, "cloud": cloud}
-
             for item in AGENT_STATES:
                 agent_state.labels(**labels, state=item).set(float(item == status))
             for item in AGENT_DECISIONS:
                 agent_last_decision.labels(**labels, decision=item).set(float(item == decision))
             agent_model_info.labels(**labels).info({"provider": provider, "model": model})
-            agent_api_key_count.labels(
-                **labels, provider=provider
-            ).set(_non_negative(data.get("api_key_count", 0), int))
-
-            last_run = data.get("last_run")
-            if last_run:
-                try:
-                    from calendar import timegm
-                    from datetime import datetime
-                    parsed = datetime.strptime(last_run, "%Y-%m-%dT%H:%M:%SZ")
-                    agent_last_run_timestamp_seconds.labels(**labels).set(timegm(parsed.timetuple()))
-                except (TypeError, ValueError, OverflowError):
-                    pass
-
+            agent_api_key_count.labels(**labels, provider=provider).set(
+                _safe_number(data.get("api_key_count", 0), int)
+            )
             provider_labels = {**labels, "provider": provider, "model": model}
             agent_prompt_tokens_total.labels(**provider_labels)._value.set(
-                _non_negative(data.get("prompt_tokens", 0), int)
+                _safe_number(data.get("prompt_tokens", 0), int)
             )
             agent_completion_tokens_total.labels(**provider_labels)._value.set(
-                _non_negative(data.get("completion_tokens", 0), int)
+                _safe_number(data.get("completion_tokens", 0), int)
             )
             agent_token_usage_total.labels(**provider_labels)._value.set(
-                _non_negative(data.get("total_tokens", 0), int)
+                _safe_number(data.get("total_tokens", 0), int)
             )
-            request_count = _non_negative(data.get("requests", 0), int)
-            if request_count:
-                agent_api_calls_total.labels(
-                    **provider_labels,
-                    status="failed" if status == "failed" else "success",
-                )._value.set(request_count)
             agent_execution_time_seconds.labels(**labels).set(
-                _non_negative(data.get("execution_time_seconds", 0), float)
+                _safe_number(data.get("execution_time_seconds", 0), float)
             )
     except Exception:
-        application.logger.exception("Could not restore persisted agent metrics")
+        application.logger.exception("Could not restore agent metrics")
 
 
 _restore_agent_metrics()
