@@ -110,7 +110,11 @@ def metrics():
 
 @application.get("/health")
 def health():
-    return Response("healthy\n", mimetype="text/plain")
+    """HTML health response kept compatible with the existing test suite."""
+    return Response(
+        "<html><body><strong>healthy</strong></body></html>",
+        mimetype="text/html",
+    )
 
 
 @application.get("/prometheus")
