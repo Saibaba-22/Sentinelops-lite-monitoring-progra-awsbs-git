@@ -33,6 +33,11 @@ except ImportError:
 
 MODEL = os.getenv("AI_MODEL", "gemini-2.5-flash")
 PROVIDER = os.getenv("AI_PROVIDER", "gemini")
+_ai_prompt_tokens = 0
+_ai_completion_tokens = 0
+_ai_total_tokens = 0
+_ai_requests = 0
+_ai_response_time = 0.0
 
 def build_client():
     try:
