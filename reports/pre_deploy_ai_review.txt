@@ -1,6 +1,8 @@
-Based on the provided information, there is **only one pre-deploy issue identified**, not three. This issue is critical as it can impact CI and new developer onboarding.
+Based on the provided information, there is only **one** pre-deploy issue identified, not three.
 
-**1. Missing Environment Variables**
-*   **FILE/LINE:** `.env.example` (Line: N/A)
-*   **Issue:** The `.env.example` file is missing the `API_KEY` and `KEY` variables, which are required for the project. This means CI pipelines and new developers will not have a clear guide for setting up their environment variables, potentially leading to build failures or misconfigurations.
-*   **Fix:** Add `API_KEY` and `KEY` to the `.env.example` file.
+Here is the summary of that critical issue:
+
+1.  **FILE:** `.env.example`
+    **LINE:** N/A
+    **ISSUE:** The `.env.example` file is missing declarations for required environment variables `KEY` and `API_KEY`. This omission can cause CI/CD pipelines and new developers to miss these crucial variables, leading to setup or deployment failures.
+    **FIX:** Add `KEY` and `API_KEY` to the `.env.example` file.

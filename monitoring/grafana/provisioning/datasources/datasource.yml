@@ -8,7 +8,8 @@ datasources:
 #    url: http://prometheus:9090
 #    url: http://host.docker.internal:9090
     #url: http://172.17.0.1:9090/prometheus
-    url: $__env{PROMETHEUS_URL}
+    #url: $__env{PROMETHEUS_URL}
+    url: http://prometheus:9090/prometheus/
     isDefault: true
     editable: true
     jsonData:

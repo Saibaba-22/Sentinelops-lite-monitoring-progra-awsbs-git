@@ -1,25 +1,30 @@
-"""
-Live status collectors.
+"""JSON status snapshots used by the dashboard and API."""
 
-Builds the JSON snapshot served by ``/api/status`` (and used by the HTML
-dashboard). Combines a fresh psutil reading with the mirrored ``APP_STATS``
-counters and the persisted AI-agent state.
-"""
+from __future__ import annotations
+
+import socket
 import time
 from datetime import datetime, timezone
+
 import psutil
 
-from monitoring.metrics import ( APP_STATS, START_TIME, DEPLOYMENT_VERSION, BUILD_NUMBER, ENVIRONMENT)
 from monitoring import agent_state as agent_state_store
+from monitoring.metrics import (
+    APP_STATS,
+    BUILD_NUMBER,
+    DEPLOYMENT_VERSION,
+    ENVIRONMENT,
+    START_TIME,
+)
 
-def _system_snapshot():
+
+def system_snapshot() -> dict:
     mem = psutil.virtual_memory()
     disk = psutil.disk_usage("/")
     net = psutil.net_io_counters()
-    load = {}
     try:
-        l1, l5, l15 = psutil.getloadavg()
-        load = {"1m": l1, "5m": l5, "15m": l15}
+        load1, load5, load15 = psutil.getloadavg()
+        load = {"1m": load1, "5m": load5, "15m": load15}
     except Exception:
         load = {"1m": 0, "5m": 0, "15m": 0}
     boot = psutil.boot_time()
@@ -42,14 +47,13 @@ def _system_snapshot():
         "boot_time": datetime.fromtimestamp(boot, tz=timezone.utc).isoformat(),
         "process_count": len(psutil.pids()),
         "logged_in_users": logged_in,
-        "hostname": psutil.users() and __import__("socket").gethostname() or "",
+        "hostname": socket.gethostname(),
     }
 
-def _application_snapshot():
+
+def application_snapshot() -> dict:
     total = APP_STATS["total_requests"]
     failed = APP_STATS["failed_requests"]
-    error_rate = (failed / total) if total else 0.0
-    avg_rt = (APP_STATS["total_request_time"] / total) if total else 0.0
     return {
         "status": "running",
         "health": "ok",
@@ -57,19 +61,24 @@ def _application_snapshot():
         "total_requests": total,
         "success_requests": APP_STATS["success_requests"],
         "failed_requests": failed,
-        "error_rate": round(error_rate, 4),
+        "error_rate": round(failed / total, 4) if total else 0.0,
         "active_sessions": APP_STATS["active_sessions"],
         "active_users": APP_STATS["active_users"],
-        "avg_response_time_seconds": round(avg_rt, 4),
+        "avg_response_time_seconds": round(
+            APP_STATS["total_request_time"] / total, 4
+        )
+        if total
+        else 0.0,
         "exceptions": APP_STATS["exceptions"],
         "restart_count": APP_STATS.get("restart_count", 0),
     }
 
-def _agent_snapshot():
-    state = agent_state_store.load()
-    return state.get("agents", {})
 
-def _deployment_snapshot():
+def agent_snapshot() -> dict:
+    return agent_state_store.load().get("agents", {})
+
+
+def deployment_snapshot() -> dict:
     return {
         "version": DEPLOYMENT_VERSION,
         "build_number": BUILD_NUMBER,
@@ -78,12 +87,12 @@ def _deployment_snapshot():
         "container_status": 1,
     }
 
-def build_status():
-    """Return the full aggregated status snapshot as a dict."""
+
+def build_status() -> dict:
     return {
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "application": _application_snapshot(),
-        "system": _system_snapshot(),
-        "agent": _agent_snapshot(),
-        "deployment": _deployment_snapshot(),
+        "application": application_snapshot(),
+        "system": system_snapshot(),
+        "agent": agent_snapshot(),
+        "deployment": deployment_snapshot(),
     }

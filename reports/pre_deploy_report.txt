@@ -1,8 +1,8 @@
 FILE: .env.example
 LINE: N/A
-PRESENT_ERROR: Vars missing: API_KEY, KEY
+PRESENT_ERROR: Vars missing: KEY, API_KEY
 EXPECTED_VALUE: .env.example lists all required vars
 WHY: CI / new devs will miss required env vars
-SOLUTION: Add API_KEY, KEY to .env.example
+SOLUTION: Add KEY, API_KEY to .env.example
 
 ---
