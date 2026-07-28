@@ -134,13 +134,17 @@ def _vector_by_agent(query: str) -> dict[str, float]:
     return values
 
 
-def _states_by_agent() -> dict[str, str]:
-    values: dict[str, str] = {}
+def _states_by_agent() -> dict[str, dict[str, str]]:
+    values: dict[str, dict[str, str]] = {}
     for item in _prom_query("agent_state == 1"):
         labels = item.get("metric", {})
         name = labels.get("agent_name")
         if name:
-            values[name] = labels.get("state", "unknown")
+            values[name] = {
+                "state": labels.get("state", "unknown"),
+                "stage": labels.get("stage", "—"),
+                "cloud": labels.get("cloud", "—"),
+            }
     return values
 
 
@@ -151,8 +155,10 @@ def _models_by_agent() -> dict[str, dict[str, str]]:
         name = labels.get("agent_name")
         if name:
             values[name] = {
-                "provider": labels.get("provider", "unknown"),
-                "model": labels.get("model", "unknown"),
+                "provider": labels.get("provider", "—"),
+                "model": labels.get("model", "—"),
+                "stage": labels.get("stage", "—"),
+                "cloud": labels.get("cloud", "—"),
             }
     return values
 
@@ -193,8 +199,8 @@ def _agent_snapshot() -> tuple[list[dict[str, Any]], bool]:
     total_requests = _vector_by_agent(
         "sum by (agent_name) (agent_api_calls_total)"
     )
-    requests_minute = _vector_by_agent(
-        "sum by (agent_name) (increase(agent_api_calls_total[1m]))"
+    requests_hour = _vector_by_agent(
+        "sum by (agent_name) (increase(agent_api_calls_total[1h]))"
     )
     requests_day = _vector_by_agent(
         "sum by (agent_name) (increase(agent_api_calls_total[24h]))"
@@ -223,6 +229,7 @@ def _agent_snapshot() -> tuple[list[dict[str, Any]], bool]:
         if not isinstance(saved, dict):
             saved = {}
         model = models.get(name, {})
+        state_info = states.get(name, {})
         has_prometheus_data = bool(
             name in states or name in total_tokens or name in total_requests
         )
@@ -230,43 +237,50 @@ def _agent_snapshot() -> tuple[list[dict[str, Any]], bool]:
         if not last_run:
             last_run = saved.get("last_run")
 
+        total_request_value = round(
+            total_requests.get(name, saved.get("requests", 0))
+        )
+        hour_value = round(requests_hour.get(name, 0))
+        day_value = round(requests_day.get(name, 0))
+
+        # A newly created counter has no previous sample, so Prometheus can
+        # return zero for increase() even though the real total is one or more.
+        last_epoch = _safe_number(last_run, float, 0)
+        if isinstance(last_run, str) and last_run:
+            try:
+                last_epoch = datetime.strptime(
+                    last_run, "%Y-%m-%dT%H:%M:%SZ"
+                ).replace(tzinfo=timezone.utc).timestamp()
+            except ValueError:
+                last_epoch = 0
+        if total_request_value > 0 and last_epoch:
+            age = max(0, time.time() - last_epoch)
+            if hour_value == 0 and age <= 3600:
+                hour_value = total_request_value
+            if day_value == 0 and age <= 86400:
+                day_value = total_request_value
+
+        reported = has_prometheus_data or bool(saved.get("last_run"))
         agents.append(
             {
                 "agent_name": name,
-                "status": states.get(
-                    name, saved.get("status", "not reported")
-                )
-                if has_prometheus_data or saved.get("last_run")
-                else "not reported",
+                "status": state_info.get("state", saved.get("status", "not reported"))
+                if reported else "not reported",
                 "decision": saved.get("decision", "none"),
-                "stage": saved.get("stage", "—")
-                if has_prometheus_data or saved.get("last_run")
-                else "—",
-                "cloud": saved.get("cloud", "—")
-                if has_prometheus_data or saved.get("last_run")
-                else "—",
-                "provider": model.get(
-                    "provider", saved.get("provider", "—")
-                )
-                if has_prometheus_data or saved.get("last_run")
-                else "—",
+                "stage": state_info.get("stage", model.get("stage", saved.get("stage", "—")))
+                if reported else "—",
+                "cloud": state_info.get("cloud", model.get("cloud", saved.get("cloud", "—")))
+                if reported else "—",
+                "provider": model.get("provider", saved.get("provider", "—"))
+                if reported else "—",
                 "model": model.get("model", saved.get("model", "—"))
-                if has_prometheus_data or saved.get("last_run")
-                else "—",
-                "prompt_tokens": round(
-                    prompt_tokens.get(name, saved.get("prompt_tokens", 0))
-                ),
-                "completion_tokens": round(
-                    completion_tokens.get(name, saved.get("completion_tokens", 0))
-                ),
-                "total_tokens": round(
-                    total_tokens.get(name, saved.get("total_tokens", 0))
-                ),
-                "requests_total": round(
-                    total_requests.get(name, saved.get("requests", 0))
-                ),
-                "requests_minute": round(requests_minute.get(name, 0)),
-                "requests_day": round(requests_day.get(name, 0)),
+                if reported else "—",
+                "prompt_tokens": round(prompt_tokens.get(name, saved.get("prompt_tokens", 0))),
+                "completion_tokens": round(completion_tokens.get(name, saved.get("completion_tokens", 0))),
+                "total_tokens": round(total_tokens.get(name, saved.get("total_tokens", 0))),
+                "requests_total": total_request_value,
+                "requests_hour": hour_value,
+                "requests_day": day_value,
                 "tokens_day": round(tokens_day.get(name, 0)),
                 "last_run": last_run or None,
                 "has_prometheus_data": has_prometheus_data,
@@ -542,13 +556,13 @@ def monitor_status_get():
 *{box-sizing:border-box}body{margin:0;min-height:100vh;font:14px/1.5 system-ui,sans-serif;color:var(--text);background:radial-gradient(circle at 10% 0%,#143159 0,transparent 35%),var(--bg)}.wrap{max-width:1500px;margin:auto;padding:30px}.top{display:flex;justify-content:space-between;align-items:end;gap:20px;margin-bottom:25px}h1{margin:0;font-size:clamp(26px,4vw,44px);letter-spacing:-.05em}.sub,.meta{color:var(--muted)}.live{display:flex;gap:9px;align-items:center;color:var(--muted)}.dot{width:10px;height:10px;border-radius:50%;background:var(--green);box-shadow:0 0 15px var(--green)}.dot.off{background:var(--red);box-shadow:0 0 15px var(--red)}.summary{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:20px}.card{background:linear-gradient(145deg,#151f38,#0e1528);border:1px solid var(--line);border-radius:18px;padding:20px;box-shadow:0 16px 45px #0005}.label{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.12em}.num{font-size:32px;font-weight:800;margin-top:4px}.agents{display:grid;grid-template-columns:repeat(auto-fit,minmax(390px,1fr));gap:16px}.agent{position:relative;overflow:hidden}.agent:before{content:"";position:absolute;top:0;left:0;right:0;height:3px;background:linear-gradient(90deg,var(--blue),var(--cyan))}.head{display:flex;justify-content:space-between;gap:12px}.name{font-size:21px;font-weight:750}.badge{border:1px solid #ffffff25;border-radius:999px;padding:4px 10px;color:var(--cyan);font-size:11px;text-transform:uppercase}.badge.not{color:var(--muted)}.details{margin-top:4px;color:var(--muted);font-size:12px}.metrics{display:grid;grid-template-columns:repeat(3,1fr);gap:9px;margin-top:18px}.metric{background:#0a1020aa;border:1px solid #ffffff0d;border-radius:12px;padding:11px}.metric span{display:block;color:var(--muted);font-size:10px}.metric b{display:block;font-size:19px;margin-top:3px}.visual{display:grid;grid-template-columns:150px 1fr;gap:20px;align-items:center;margin-top:17px}.semi{height:76px;width:150px;overflow:hidden;position:relative}.semi:before{content:"";position:absolute;width:150px;height:150px;border-radius:50%;background:conic-gradient(var(--blue) calc(var(--pct)*1%),#263452 0);transform:rotate(-90deg)}.semi:after{content:"";position:absolute;left:20px;top:20px;width:110px;height:110px;border-radius:50%;background:var(--panel)}.semi strong{position:absolute;z-index:2;left:0;right:0;top:32px;text-align:center;font-size:18px}.bars{display:grid;gap:8px}.barrow{display:grid;grid-template-columns:78px 1fr 50px;gap:7px;align-items:center;color:var(--muted);font-size:11px}.bar{height:7px;background:#263452;border-radius:20px;overflow:hidden}.bar i{display:block;height:100%;background:linear-gradient(90deg,var(--blue),var(--cyan));border-radius:20px}.spark{margin-top:17px;background:#0a1020aa;border:1px solid #ffffff0d;border-radius:12px;padding:8px}.notice{margin:15px 0;padding:13px 16px;border:1px solid #fbbf2435;background:#fbbf2410;border-radius:12px;color:#fcd879}.empty{text-align:center;color:var(--muted);padding:35px}.footer{color:var(--muted);margin-top:20px;font-size:12px}@media(max-width:800px){.wrap{padding:18px}.top{display:block}.live{margin-top:15px}.summary{grid-template-columns:repeat(2,1fr)}.agents{grid-template-columns:1fr}}@media(max-width:470px){.metrics{grid-template-columns:repeat(2,1fr)}.visual{grid-template-columns:1fr}}
 </style></head><body><div class="wrap">
 <header class="top"><div><h1>SentinelOps <span style="color:var(--blue)">AI Agents</span></h1><div class="sub">Real Prometheus totals, requests and 24-hour activity</div></div><div class="live"><i id="dot" class="dot"></i><span id="connection">Connecting...</span></div></header>
-<section class="summary"><div class="card"><div class="label">Reporting agents</div><div id="agents" class="num">—</div></div><div class="card"><div class="label">Total tokens</div><div id="tokens" class="num">—</div></div><div class="card"><div class="label">Requests / minute</div><div id="minute" class="num">—</div></div><div class="card"><div class="label">Requests / 24 hours</div><div id="day" class="num">—</div></div></section>
+<section class="summary"><div class="card"><div class="label">Reporting agents</div><div id="agents" class="num">—</div></div><div class="card"><div class="label">Total tokens</div><div id="tokens" class="num">—</div></div><div class="card"><div class="label">Requests / hour</div><div id="hour" class="num">—</div></div><div class="card"><div class="label">Requests / 24 hours</div><div id="day" class="num">—</div></div></section>
 <div id="notice" class="notice" hidden></div><section id="cards" class="agents"><div class="card empty">Loading real agent metrics...</div></section><div class="footer">Refreshes every 10 seconds · Source: Prometheus with persisted status fallback</div></div>
 <script>
 const fmt=n=>Number(n||0).toLocaleString();const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 function spark(values){if(!values||values.length<2)return '<div class="meta">No request history yet</div>';let w=430,h=48,min=Math.min(...values),max=Math.max(...values),range=max-min||1;let pts=values.map((v,i)=>`${(i/(values.length-1))*w},${h-((v-min)/range)*h}`).join(' ');return `<svg viewBox="0 0 ${w} ${h}" width="100%" height="48" preserveAspectRatio="none"><polyline points="${pts}" fill="none" stroke="#53e0d0" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg>`}
-function card(a,maxDay,maxToken){let status=String(a.status||'not reported').toLowerCase(),pct=maxDay?Math.min(100,(a.requests_day/maxDay)*100):0,tokPct=maxToken?Math.min(100,(a.total_tokens/maxToken)*100):0;return `<article class="card agent"><div class="head"><div><div class="name">${esc(a.agent_name)}</div><div class="details">${esc(a.provider)} · ${esc(a.model)} · ${esc(a.cloud)} · ${esc(a.stage)}</div></div><span class="badge ${a.has_prometheus_data?'': 'not'}">${esc(status)}</span></div><div class="metrics"><div class="metric"><span>Total tokens</span><b>${fmt(a.total_tokens)}</b></div><div class="metric"><span>Total requests</span><b>${fmt(a.requests_total)}</b></div><div class="metric"><span>Last run</span><b style="font-size:12px">${esc(a.last_run||'—')}</b></div><div class="metric"><span>Prompt tokens</span><b>${fmt(a.prompt_tokens)}</b></div><div class="metric"><span>Completion tokens</span><b>${fmt(a.completion_tokens)}</b></div><div class="metric"><span>Tokens / day</span><b>${fmt(a.tokens_day)}</b></div></div><div class="visual"><div class="semi" style="--pct:${pct}"><strong>${fmt(a.requests_day)}</strong></div><div class="bars"><div class="barrow"><span>Requests/min</span><div class="bar"><i style="width:${Math.min(100,Number(a.requests_minute||0)*10)}%"></i></div><b>${fmt(a.requests_minute)}</b></div><div class="barrow"><span>Requests/day</span><div class="bar"><i style="width:${pct}%"></i></div><b>${fmt(a.requests_day)}</b></div><div class="barrow"><span>Tokens</span><div class="bar"><i style="width:${tokPct}%"></i></div><b>${fmt(a.total_tokens)}</b></div></div></div><div class="spark">${spark(a.request_history)}</div><div class="meta" style="margin-top:12px">Decision: ${esc(a.decision)}</div></article>`}
-async function refresh(){try{let r=await fetch('/api/agent-metrics',{cache:'no-store'}),d=await r.json(),list=d.agents||[],real=list.filter(a=>a.has_prometheus_data),maxDay=Math.max(0,...list.map(a=>Number(a.requests_day||0))),maxToken=Math.max(0,...list.map(a=>Number(a.total_tokens||0)));document.getElementById('dot').classList.toggle('off',!d.prometheus_connected);document.getElementById('connection').textContent=d.prometheus_connected?'Prometheus connected':'Prometheus unavailable';document.getElementById('agents').textContent=fmt(real.length);document.getElementById('tokens').textContent=fmt(list.reduce((n,a)=>n+Number(a.total_tokens||0),0));document.getElementById('minute').textContent=fmt(list.reduce((n,a)=>n+Number(a.requests_minute||0),0));document.getElementById('day').textContent=fmt(list.reduce((n,a)=>n+Number(a.requests_day||0),0));let n=document.getElementById('notice');n.hidden=real.length>0;if(!real.length)n.textContent='Prometheus is connected, but no real AI-agent samples have been reported yet.';document.getElementById('cards').innerHTML=list.map(a=>card(a,maxDay,maxToken)).join('')}catch(e){document.getElementById('dot').classList.add('off');document.getElementById('connection').textContent='Dashboard API unavailable';document.getElementById('notice').hidden=false;document.getElementById('notice').textContent=String(e)}}refresh();setInterval(refresh,10000);
+function card(a,maxDay,maxToken){let status=String(a.status||'not reported').toLowerCase(),pct=maxDay?Math.min(100,(a.requests_day/maxDay)*100):0,tokPct=maxToken?Math.min(100,(a.total_tokens/maxToken)*100):0;return `<article class="card agent"><div class="head"><div><div class="name">${esc(a.agent_name)}</div><div class="details">${esc(a.provider)} · ${esc(a.model)} · ${esc(a.cloud)} · ${esc(a.stage)}</div></div><span class="badge ${a.has_prometheus_data?'': 'not'}">${esc(status)}</span></div><div class="metrics"><div class="metric"><span>Total tokens</span><b>${fmt(a.total_tokens)}</b></div><div class="metric"><span>Total requests</span><b>${fmt(a.requests_total)}</b></div><div class="metric"><span>Last run</span><b style="font-size:12px">${esc(a.last_run||'—')}</b></div><div class="metric"><span>Prompt tokens</span><b>${fmt(a.prompt_tokens)}</b></div><div class="metric"><span>Completion tokens</span><b>${fmt(a.completion_tokens)}</b></div><div class="metric"><span>Tokens / day</span><b>${fmt(a.tokens_day)}</b></div></div><div class="visual"><div class="semi" style="--pct:${pct}"><strong>${fmt(a.requests_day)}</strong></div><div class="bars"><div class="barrow"><span>Requests/hour</span><div class="bar"><i style="width:${Math.min(100,Number(a.requests_hour||0)*10)}%"></i></div><b>${fmt(a.requests_hour)}</b></div><div class="barrow"><span>Requests/day</span><div class="bar"><i style="width:${pct}%"></i></div><b>${fmt(a.requests_day)}</b></div><div class="barrow"><span>Tokens</span><div class="bar"><i style="width:${tokPct}%"></i></div><b>${fmt(a.total_tokens)}</b></div></div></div><div class="spark">${spark(a.request_history)}</div><div class="meta" style="margin-top:12px">Decision: ${esc(a.decision)}</div></article>`}
+async function refresh(){try{let r=await fetch('/api/agent-metrics',{cache:'no-store'}),d=await r.json(),list=d.agents||[],real=list.filter(a=>a.has_prometheus_data),maxDay=Math.max(0,...list.map(a=>Number(a.requests_day||0))),maxToken=Math.max(0,...list.map(a=>Number(a.total_tokens||0)));document.getElementById('dot').classList.toggle('off',!d.prometheus_connected);document.getElementById('connection').textContent=d.prometheus_connected?'Prometheus connected':'Prometheus unavailable';document.getElementById('agents').textContent=fmt(real.length);document.getElementById('tokens').textContent=fmt(list.reduce((n,a)=>n+Number(a.total_tokens||0),0));document.getElementById('hour').textContent=fmt(list.reduce((n,a)=>n+Number(a.requests_hour||0),0));document.getElementById('day').textContent=fmt(list.reduce((n,a)=>n+Number(a.requests_day||0),0));let n=document.getElementById('notice');n.hidden=d.prometheus_connected && real.length>0;if(!d.prometheus_connected)n.textContent='The app cannot reach Prometheus. Add the Prometheus ECS link and PROMETHEUS_URL to the app container.';else if(!real.length)n.textContent='Prometheus is connected, but no real AI-agent samples have been reported yet.';document.getElementById('cards').innerHTML=list.map(a=>card(a,maxDay,maxToken)).join('')}catch(e){document.getElementById('dot').classList.add('off');document.getElementById('connection').textContent='Dashboard API unavailable';document.getElementById('notice').hidden=false;document.getElementById('notice').textContent=String(e)}}refresh();setInterval(refresh,10000);
 </script></body></html>"""
     return Response(page, mimetype="text/html")
 
