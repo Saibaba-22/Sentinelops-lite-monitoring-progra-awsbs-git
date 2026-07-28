@@ -466,7 +466,7 @@ def prometheus_redirect():
 
 @application.get("/api/status")
 def api_status():
-    return jsonify([collectors.build_status()])
+    return jsonify(collectors.build_status())
 
 
 @application.get("/api/agent-metrics")
