@@ -319,6 +319,7 @@ def _agent_snapshot() -> tuple[list[dict[str, Any]], bool]:
                 "rpd_limit": AI_RPD_LIMIT,
                 "last_run": last_run_display,
                 "has_prometheus_data": has_prometheus_data,
+                "demo": bool(saved.get("demo")),
                 "request_history": history.get(name, []),
             }
         )
@@ -616,7 +617,7 @@ function card(a,maxDay,maxToken){
   let status=String(a.status||'not reported').toLowerCase(),
       rpdPct=a.rpd_limit?Math.min(100,(a.requests_day/a.rpd_limit)*100):0,
       tokPct=maxToken?Math.min(100,(a.total_tokens/maxToken)*100):0;
-  return `<article class="card agent"><div class="head"><div><div class="name">${esc(a.agent_name)}</div><div class="details">${esc(a.provider)} · ${esc(a.model)} · ${esc(a.cloud)} · ${esc(a.stage)}</div></div><span class="badge ${a.has_prometheus_data?'':'not'}">${esc(status)}</span></div><div class="metrics"><div class="metric"><span>Total tokens</span><b>${compact(a.total_tokens)}</b></div><div class="metric"><span>Total requests</span><b>${compact(a.requests_total)}</b></div><div class="metric"><span>Last run</span><b style="font-size:12px">${esc(a.last_run||'—')}</b></div><div class="metric"><span>Prompt tokens</span><b>${compact(a.prompt_tokens)}</b></div><div class="metric"><span>Completion tokens</span><b>${compact(a.completion_tokens)}</b></div><div class="metric"><span>Tokens / day</span><b>${compact(a.tokens_day)}</b></div></div><div class="quota-title">Quota usage · current / limit</div><div class="quota-grid"><div class="quota"><span>RPM</span><strong>${compact(a.requests_minute)} / ${compact(a.rpm_limit)}</strong></div><div class="quota"><span>TPM</span><strong>${compact(a.tokens_minute)} / ${compact(a.tpm_limit)}</strong></div><div class="quota"><span>RPD</span><strong>${compact(a.requests_day)} / ${compact(a.rpd_limit)}</strong></div></div><div class="visual"><div class="semi" style="--pct:${rpdPct}"><strong>${compact(a.requests_day)} / ${compact(a.rpd_limit)}</strong></div><div class="bars"><div class="barrow"><span>RPM</span><div class="bar"><i style="width:${Math.min(100,(Number(a.requests_minute||0)/Math.max(1,Number(a.rpm_limit||1)))*100)}%"></i></div><b>${compact(a.requests_minute)}</b></div><div class="barrow"><span>TPM</span><div class="bar"><i style="width:${Math.min(100,(Number(a.tokens_minute||0)/Math.max(1,Number(a.tpm_limit||1)))*100)}%"></i></div><b>${compact(a.tokens_minute)}</b></div><div class="barrow"><span>RPD</span><div class="bar"><i style="width:${rpdPct}%"></i></div><b>${compact(a.requests_day)}</b></div></div></div><div class="spark">${spark(a.request_history)}</div><div class="meta" style="margin-top:12px">Decision: ${esc(a.decision)}</div></article>`;
+  return `<article class="card agent"><div class="head"><div><div class="name">${esc(a.agent_name)}</div><div class="details">${esc(a.provider)} · ${esc(a.model)} · ${esc(a.cloud)} · ${esc(a.stage)}</div></div><span class="badge ${a.has_prometheus_data?'':'not'}">${esc(status)}</span>${a.demo?'<span class="badge" style="color:#fbbf24;border-color:#fbbf2455;margin-left:6px">DEMO</span>':''}</div><div class="metrics"><div class="metric"><span>Total tokens</span><b>${compact(a.total_tokens)}</b></div><div class="metric"><span>Total requests</span><b>${compact(a.requests_total)}</b></div><div class="metric"><span>Last run</span><b style="font-size:12px">${esc(a.last_run||'—')}</b></div><div class="metric"><span>Prompt tokens</span><b>${compact(a.prompt_tokens)}</b></div><div class="metric"><span>Completion tokens</span><b>${compact(a.completion_tokens)}</b></div><div class="metric"><span>Tokens / day</span><b>${compact(a.tokens_day)}</b></div></div><div class="quota-title">Quota usage · current / limit</div><div class="quota-grid"><div class="quota"><span>RPM</span><strong>${compact(a.requests_minute)} / ${compact(a.rpm_limit)}</strong></div><div class="quota"><span>TPM</span><strong>${compact(a.tokens_minute)} / ${compact(a.tpm_limit)}</strong></div><div class="quota"><span>RPD</span><strong>${compact(a.requests_day)} / ${compact(a.rpd_limit)}</strong></div></div><div class="visual"><div class="semi" style="--pct:${rpdPct}"><strong>${compact(a.requests_day)} / ${compact(a.rpd_limit)}</strong></div><div class="bars"><div class="barrow"><span>RPM</span><div class="bar"><i style="width:${Math.min(100,(Number(a.requests_minute||0)/Math.max(1,Number(a.rpm_limit||1)))*100)}%"></i></div><b>${compact(a.requests_minute)}</b></div><div class="barrow"><span>TPM</span><div class="bar"><i style="width:${Math.min(100,(Number(a.tokens_minute||0)/Math.max(1,Number(a.tpm_limit||1)))*100)}%"></i></div><b>${compact(a.tokens_minute)}</b></div><div class="barrow"><span>RPD</span><div class="bar"><i style="width:${rpdPct}%"></i></div><b>${compact(a.requests_day)}</b></div></div></div><div class="spark">${spark(a.request_history)}</div><div class="meta" style="margin-top:12px">Decision: ${esc(a.decision)}</div></article>`;
 }
 
 async function refresh(){
@@ -715,7 +716,98 @@ def _restore_agent_metrics() -> None:
         application.logger.exception("Could not restore agent metrics")
 
 
+def _seed_demo_agents() -> None:
+    """Seed known agents that have no real data with clearly-marked DEMO data.
+
+    Disabled with SEED_DEMO_AGENTS=0. A real report (POST /monitor/status)
+    overwrites the demo entry, so live data always wins once an agent reports.
+    Only seeds an agent the very first time (when it is absent); on later
+    restarts _restore_agent_metrics reloads the persisted demo values without
+    re-incrementing counters.
+    """
+    if os.getenv("SEED_DEMO_AGENTS", "1") != "1":
+        return
+    profiles = {
+        "test_agent": {
+            "stage": "pre_deploy", "cloud": "aws", "provider": "gemini",
+            "model": "gemini-2.5-flash", "status": "approved", "decision": "approved",
+            "prompt_tokens": 820, "completion_tokens": 390, "total_tokens": 1210,
+            "requests": 1, "api_key_count": 1,
+            "execution_time_seconds": 1.9, "api_response_time_seconds": 1.4,
+        },
+        "errors_agent": {
+            "stage": "deploy", "cloud": "gcp", "provider": "openai",
+            "model": "gpt-4o-mini", "status": "approved", "decision": "approved",
+            "prompt_tokens": 640, "completion_tokens": 120, "total_tokens": 760,
+            "requests": 1, "api_key_count": 1,
+            "execution_time_seconds": 2.2, "api_response_time_seconds": 1.6,
+        },
+        "final_agent": {
+            "stage": "post_deploy", "cloud": "aws", "provider": "gemini",
+            "model": "gemini-3.1-flash-lite", "status": "approved", "decision": "approved",
+            "prompt_tokens": 1070, "completion_tokens": 478, "total_tokens": 1548,
+            "requests": 1, "api_key_count": 1,
+            "execution_time_seconds": 2.3, "api_response_time_seconds": 1.7,
+        },
+    }
+    try:
+        stored = agent_state_store.load()
+        agents = stored.get("agents", {})
+        if not isinstance(agents, dict):
+            agents = {}
+        changed = False
+        for name in KNOWN_AGENTS:
+            existing = agents.get(name)
+            if isinstance(existing, dict) and existing.get("last_run"):
+                continue  # already has data (real report or previously seeded)
+            profile = profiles.get(name)
+            if not profile:
+                continue
+            agents[name] = {
+                "agent_name": name,
+                "stage": profile["stage"],
+                "cloud": profile["cloud"],
+                "provider": profile["provider"],
+                "model": profile["model"],
+                "status": profile["status"],
+                "decision": profile["decision"],
+                "prompt_tokens": profile["prompt_tokens"],
+                "completion_tokens": profile["completion_tokens"],
+                "total_tokens": profile["total_tokens"],
+                "requests": profile["requests"],
+                "api_key_count": profile["api_key_count"],
+                "execution_time_seconds": profile["execution_time_seconds"],
+                "api_response_time_seconds": profile["api_response_time_seconds"],
+                "last_run": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "demo": True,
+            }
+            _set_agent_metrics(
+                agent_name=name,
+                stage=profile["stage"],
+                cloud=profile["cloud"],
+                provider=profile["provider"],
+                model=profile["model"],
+                status=profile["status"],
+                decision=profile["decision"],
+                prompt_tokens=profile["prompt_tokens"],
+                completion_tokens=profile["completion_tokens"],
+                total_tokens=profile["total_tokens"],
+                requests_count=profile["requests"],
+                api_key_count=profile["api_key_count"],
+                execution_time=profile["execution_time_seconds"],
+                response_time=profile["api_response_time_seconds"],
+            )
+            changed = True
+        if changed:
+            stored["agents"] = agents
+            agent_state_store.save(stored)
+            application.logger.info("Seeded DEMO data for agents with no real report")
+    except Exception:
+        application.logger.exception("Could not seed demo agents")
+
+
 _restore_agent_metrics()
+_seed_demo_agents()
 update_metrics()
 if os.getenv("DISABLE_METRICS_THREAD", "0") != "1":
     start_metrics_updater(interval=int(os.getenv("METRICS_INTERVAL", "5")))
