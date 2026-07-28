@@ -58,6 +58,9 @@ jobs:
           AI_PROVIDER: ${{ vars.AI_PROVIDER || 'gemini' }}
           RUN_AI_REVIEW: ${{ inputs.ai_review && '1' || '0' }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          TARGET_CLOUD: ${{ inputs.cloud }}
+          MONITOR_API_URL: ${{ inputs.cloud == 'azure' && secrets.MONITOR_API_URL_AZURE || secrets.MONITOR_API_URL_AWS }}
+          MONITOR_TOKEN: ${{ inputs.cloud == 'azure' && secrets.MONITOR_TOKEN_AZURE || secrets.MONITOR_TOKEN_AWS }}
         run: python agent/test_agent.py
 
       - name: Upload pre-check reports
