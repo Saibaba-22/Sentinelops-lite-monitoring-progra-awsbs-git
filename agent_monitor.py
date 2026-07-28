@@ -90,15 +90,37 @@ def _record_rate(agent_name: str, req_count: int, token_count: int) -> None:
     _rate_history[agent_name] = [e for e in bucket if e[0] > cutoff]
 
 
-def _calc_rates(agent_name: str) -> dict[str, int]:
-    """Return {rpm, tpm, rph, rpd, tok_day} from in-memory history."""
+def _calc_rates(agent_name: str) -> dict[str, float]:
+    """Return {rpm, tpm, rph, rpd, tok_day} from in-memory history.
+    
+    Calculates average rates over sliding windows:
+    - RPM: average requests per minute over last 5 minutes
+    - TPM: average tokens per minute over last 5 minutes
+    - RPH: requests in last hour
+    - RPD: requests in last 24 hours
+    - tok_day: tokens in last 24 hours
+    """
     now = time.time()
     entries = _rate_history.get(agent_name, [])
-    rpm = sum(r for t, r, _ in entries if t > now - 60)
-    tpm = sum(tok for t, _, tok in entries if t > now - 60)
+    
+    # RPM/TPM: average over last 5 minutes (300 seconds)
+    recent_5min = [(t, r, tok) for t, r, tok in entries if t > now - 300]
+    if recent_5min:
+        rpm = sum(r for _, r, _ in recent_5min) / 5.0  # average per minute
+        tpm = sum(tok for _, _, tok in recent_5min) / 5.0
+    else:
+        rpm = 0.0
+        tpm = 0.0
+    
+    # RPH: requests in last hour
     rph = sum(r for t, r, _ in entries if t > now - 3600)
+    
+    # RPD: requests in last 24 hours
     rpd = sum(r for t, r, _ in entries if t > now - 86400)
+    
+    # Tokens per day
     tok_day = sum(tok for t, _, tok in entries if t > now - 86400)
+    
     return {"rpm": rpm, "tpm": tpm, "rph": rph, "rpd": rpd, "tok_day": tok_day}
 
 
@@ -296,71 +318,79 @@ def _agent_snapshot() -> tuple[list[dict[str, Any]], bool]:
         # ------------------------------------------------------------------
         mem_rates = _calc_rates(name)
 
-        # RPM: in-memory > prometheus > 0
-        if mem_rates["rpm"] > 0:
-            minute_value = mem_rates["rpm"]
+        # Compute last_run epoch for fallback estimation
+        last_epoch = _safe_number(saved.get("last_run_epoch", 0), float)
+        if not last_epoch:
+            # Try Prometheus timestamp
+            prom_epoch = last_runs.get(name, 0)
+            if prom_epoch:
+                last_epoch = float(prom_epoch)
+        if not last_epoch and isinstance(last_run, str) and last_run:
+            try:
+                last_epoch = datetime.strptime(
+                    last_run, "%Y-%m-%dT%H:%M:%SZ"
+                ).replace(tzinfo=timezone.utc).timestamp()
+            except ValueError:
+                last_epoch = 0
+        age = max(0, time.time() - last_epoch) if last_epoch else 0
+
+        # --- RPM (requests per minute) ---
+        # Priority: persisted observed rate > in-memory > prometheus > estimate
+        if saved.get("observed_rpm", 0) > 0 and 0 < age <= 86400:
+            # Use last observed rate (persisted across restarts, stable display)
+            minute_value = int(saved["observed_rpm"])
+        elif mem_rates["rpm"] >= 0.5:
+            minute_value = round(mem_rates["rpm"])
         elif round(prom_requests_minute.get(name, 0)) > 0:
             minute_value = round(prom_requests_minute.get(name, 0))
+        elif total_request_value > 0 and 0 < age <= 300:
+            # Agent ran very recently: use its request count as the RPM
+            minute_value = max(1, total_request_value)
         else:
             minute_value = 0
 
-        # TPM: in-memory > prometheus > 0
-        if mem_rates["tpm"] > 0:
-            token_minute_value = mem_rates["tpm"]
+        # --- TPM (tokens per minute) ---
+        if saved.get("observed_tpm", 0) > 0 and 0 < age <= 86400:
+            # Use last observed rate (persisted across restarts, stable display)
+            token_minute_value = int(saved["observed_tpm"])
+        elif mem_rates["tpm"] >= 0.5:
+            token_minute_value = round(mem_rates["tpm"])
         elif round(prom_tokens_minute.get(name, 0)) > 0:
             token_minute_value = round(prom_tokens_minute.get(name, 0))
+        elif total_token_value > 0 and 0 < age <= 300:
+            token_minute_value = max(1, total_token_value)
         else:
             token_minute_value = 0
 
-        # Requests per hour
+        # --- Requests per hour ---
         if mem_rates["rph"] > 0:
-            hour_value = mem_rates["rph"]
+            hour_value = round(mem_rates["rph"])
         elif round(prom_requests_hour.get(name, 0)) > 0:
             hour_value = round(prom_requests_hour.get(name, 0))
+        elif total_request_value > 0 and 0 < age <= 3600:
+            hour_value = total_request_value
         else:
             hour_value = 0
 
-        # Requests per day: in-memory > prometheus > persisted estimate
+        # --- Requests per day ---
         if mem_rates["rpd"] > 0:
-            day_value = mem_rates["rpd"]
+            day_value = round(mem_rates["rpd"])
         elif round(prom_requests_day.get(name, 0)) > 0:
             day_value = round(prom_requests_day.get(name, 0))
+        elif total_request_value > 0 and 0 < age <= 86400:
+            day_value = total_request_value
         else:
-            # Last-resort: if the agent has totals and last_run within 24 h,
-            # use the persisted totals as a rough estimate.
-            last_epoch = _safe_number(saved.get("last_run_epoch", 0), float)
-            if not last_epoch and isinstance(last_run, str) and last_run:
-                try:
-                    last_epoch = datetime.strptime(
-                        last_run, "%Y-%m-%dT%H:%M:%SZ"
-                    ).replace(tzinfo=timezone.utc).timestamp()
-                except ValueError:
-                    last_epoch = 0
-            age = max(0, time.time() - last_epoch) if last_epoch else 0
-            if total_request_value > 0 and 0 < age <= 86400:
-                day_value = total_request_value
-            else:
-                day_value = 0
+            day_value = 0
 
-        # Tokens per day
+        # --- Tokens per day ---
         if mem_rates["tok_day"] > 0:
-            tokens_day_value = mem_rates["tok_day"]
+            tokens_day_value = round(mem_rates["tok_day"])
         elif round(prom_tokens_day.get(name, 0)) > 0:
             tokens_day_value = round(prom_tokens_day.get(name, 0))
+        elif total_token_value > 0 and 0 < age <= 86400:
+            tokens_day_value = total_token_value
         else:
-            last_epoch = _safe_number(saved.get("last_run_epoch", 0), float)
-            if not last_epoch and isinstance(last_run, str) and last_run:
-                try:
-                    last_epoch = datetime.strptime(
-                        last_run, "%Y-%m-%dT%H:%M:%SZ"
-                    ).replace(tzinfo=timezone.utc).timestamp()
-                except ValueError:
-                    last_epoch = 0
-            age = max(0, time.time() - last_epoch) if last_epoch else 0
-            if total_token_value > 0 and 0 < age <= 86400:
-                tokens_day_value = total_token_value
-            else:
-                tokens_day_value = 0
+            tokens_day_value = 0
 
         # Render the raw epoch (from Prometheus) as a human-readable timestamp.
         if isinstance(last_run, (int, float)) and last_run:
@@ -620,6 +650,20 @@ def monitor_status_post():
     # Record for in-memory rate tracking BEFORE setting Prometheus metrics
     _record_rate(agent_name, requests_count, total)
 
+    # Calculate observed rates at this moment for persistent display.
+    # We use the actual request/token counts from this reporting cycle
+    # (not burst rates) because quota monitoring cares about how much
+    # was consumed, not how fast it was consumed.
+    mem_rates_now = _calc_rates(agent_name)
+    observed_rpm = max(
+        round(mem_rates_now["rpm"]),
+        requests_count,  # requests in this reporting cycle
+    )
+    observed_tpm = max(
+        round(mem_rates_now["tpm"]),
+        total,  # tokens in this reporting cycle
+    )
+
     _set_agent_metrics(
         agent_name=agent_name,
         stage=stage,
@@ -655,6 +699,8 @@ def monitor_status_post():
         "api_response_time_seconds": response_time,
         "last_run": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "last_run_epoch": time.time(),
+        "observed_rpm": observed_rpm,
+        "observed_tpm": observed_tpm,
     }
     agent_state_store.save(stored)
     return jsonify(
@@ -852,6 +898,10 @@ def _seed_demo_agents() -> None:
             profile = profiles.get(name)
             if not profile:
                 continue
+            # Calculate observed rates for demo display:
+            # Use the actual request/token counts (not burst rates)
+            demo_rpm = max(1, profile["requests"])
+            demo_tpm = max(1, profile["total_tokens"])
             agents[name] = {
                 "agent_name": name,
                 "stage": profile["stage"],
@@ -869,6 +919,8 @@ def _seed_demo_agents() -> None:
                 "api_response_time_seconds": profile["api_response_time_seconds"],
                 "last_run": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                 "last_run_epoch": time.time(),
+                "observed_rpm": demo_rpm,
+                "observed_tpm": demo_tpm,
                 "demo": True,
             }
             _set_agent_metrics(
