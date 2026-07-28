@@ -104,6 +104,25 @@ jobs:
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
 
+      - name: Validate Prometheus and AWS manifests
+        if: ${{ inputs.cloud == 'aws' || inputs.cloud == 'both' }}
+        run: |
+          test -f monitoring/prometheus/prometheus.yml || { echo "Missing monitoring/prometheus/prometheus.yml"; exit 1; }
+          test -f monitoring/prometheus/alert.rules.yml || { echo "Missing monitoring/prometheus/alert.rules.yml"; exit 1; }
+          test -f monitoring/prometheus/recording.rules.yml || { echo "Missing monitoring/prometheus/recording.rules.yml"; exit 1; }
+          test -f Dockerrun.aws.json || { echo "Missing Dockerrun.aws.json"; exit 1; }
+          python -m json.tool Dockerrun.aws.json >/dev/null
+          docker pull prom/prometheus:v2.53.0
+          docker run --rm --entrypoint /bin/promtool \
+            -v "$PWD/monitoring/prometheus:/etc/prometheus:ro" \
+            prom/prometheus:v2.53.0 check config /etc/prometheus/prometheus.yml
+          docker run --rm --entrypoint /bin/promtool \
+            -v "$PWD/monitoring/prometheus:/etc/prometheus:ro" \
+            prom/prometheus:v2.53.0 check rules /etc/prometheus/alert.rules.yml
+          docker run --rm --entrypoint /bin/promtool \
+            -v "$PWD/monitoring/prometheus:/etc/prometheus:ro" \
+            prom/prometheus:v2.53.0 check rules /etc/prometheus/recording.rules.yml
+
       - name: Build and push application image
         uses: docker/build-push-action@v6
         with:
@@ -462,6 +481,13 @@ jobs:
             --query 'Environments[0].Health' --output text)
           echo "AWS health: $HEALTH"
           case "$HEALTH" in Green|Yellow|Ok) ;; *) exit 1 ;; esac
+
+      - name: Collect AWS logs before diagnosis
+        if: ${{ steps.aws_deploy.outcome == 'failure' }}
+        continue-on-error: true
+        run: |
+          mkdir -p reports
+          eb logs "$AWS_ENV_NAME" --all > reports/aws-eb-logs.txt 2>&1 || true
 
       - name: Diagnose AWS deployment failure
         if: ${{ steps.aws_deploy.outcome == 'failure' }}
