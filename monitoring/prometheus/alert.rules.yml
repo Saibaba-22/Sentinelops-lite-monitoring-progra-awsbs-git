@@ -1,183 +1,61 @@
-# SentinelOps-Lite — Prometheus alerting rules
 groups:
-  - name: infrastructure
+  - name: sentinelops-availability
+    interval: 30s
     rules:
-      - alert: InstanceDown
-        expr: up == 0
-        for: 1m
-        labels:
-          severity: critical
-        annotations:
-          summary: "Instance {{ $labels.instance }} down"
-          description: "{{ $labels.instance }} of job {{ $labels.job }} has been down for more than 1 minute."
-
-      - alert: HighCpuUsage
-        expr: 100 - (avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 80
-        for: 5m
-        labels:
-          severity: warning
-        annotations:
-          summary: "High CPU on {{ $labels.instance }}"
-          description: "CPU usage is above 80% for 5 minutes."
-
-      - alert: HighMemoryUsage
-        expr: (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes) * 100 < 10
-        for: 5m
-        labels:
-          severity: warning
-        annotations:
-          summary: "High memory on {{ $labels.instance }}"
-          description: "Less than 10% memory available."
-
-      - alert: HighDiskUsage
-        expr: (node_filesystem_avail_bytes{fstype!~"tmpfs|overlay"} / node_filesystem_size_bytes) * 100 < 10
-        for: 5m
-        labels:
-          severity: warning
-        annotations:
-          summary: "Low disk on {{ $labels.instance }} ({{ $labels.mountpoint }})"
-          description: "Less than 10% disk space remaining."
-
-      - alert: HighLoadAverage
-        expr: node_load1 > 2 * count by (instance) (node_cpu_seconds_total{mode="idle"})
-        for: 5m
-        labels:
-          severity: warning
-        annotations:
-          summary: "High load average on {{ $labels.instance }}"
-          description: "1m load average exceeds twice the CPU core count."
-
-  - name: application
-    rules:
-      - alert: AppDown
+      - alert: SentinelOpsApplicationDown
         expr: up{job="flask-app"} == 0
-        for: 1m
+        for: 2m
         labels:
           severity: critical
+          service: sentinelops-lite
         annotations:
-          summary: "SentinelOps-Lite application is down"
-          description: "The Flask application has not been reachable for 1 minute."
+          summary: SentinelOps application is unavailable
+          description: Prometheus cannot scrape the Flask application for at least two minutes.
 
-      - alert: AppHighErrorRate
-        expr: sum(rate(app_errors_total[5m])) / sum(rate(app_requests_total[5m])) > 0.05
+      - alert: SentinelOpsNodeExporterDown
+        expr: up{job="node-exporter"} == 0
+        for: 2m
+        labels:
+          severity: warning
+          service: node-exporter
+        annotations:
+          summary: Node Exporter is unavailable
+          description: Prometheus cannot scrape Node Exporter for at least two minutes.
+
+      - alert: SentinelOpsPrometheusTargetDown
+        expr: sum by (job) (up == 0) > 0
         for: 5m
         labels:
           severity: warning
+          service: monitoring
         annotations:
-          summary: "High application error rate"
-          description: "Error rate is above 5% over the last 5 minutes."
+          summary: A Prometheus target is down
+          description: At least one target in the {{ $labels.job }} job has been down for five minutes.
 
-      - alert: AppHighLatency
-        expr: histogram_quantile(0.95, sum(rate(app_request_duration_seconds_bucket[5m])) by (le)) > 1
-        for: 5m
-        labels:
-          severity: warning
-        annotations:
-          summary: "High application latency (p95 > 1s)"
-          description: "95th percentile request duration exceeds 1 second."
-
-      - alert: AppHighMemory
-        expr: python_process_resident_memory_bytes > 1073741824
-        for: 5m
-        labels:
-          severity: warning
-        annotations:
-          summary: "Python process using > 1GiB RSS"
-          description: "The application process RSS exceeded 1 GiB."
-
-  - name: ai-agent
+  - name: sentinelops-application
+    interval: 30s
     rules:
-      - alert: AgentFailed
-        expr: agent_state{state="failed"} == 1
-        for: 1m
-        labels:
-          severity: critical
-        annotations:
-          summary: "AI Agent is in FAILED state"
-          description: "The AI agent reported a failed state."
-
-      - alert: AgentRejected
-        expr: agent_state{state="rejected"} == 1
-        for: 1m
-        labels:
-          severity: warning
-        annotations:
-          summary: "AI Agent REJECTED the release"
-          description: "The release-approval agent rejected the deployment."
-
-      - alert: AgentNoDecision
-        expr: increase(agent_total_decisions[1h]) == 0
-        for: 5m
-        labels:
-          severity: info
-        annotations:
-          summary: "No AI agent decisions in the last hour"
-          description: "The agent has not produced any decisions recently."
-
-  - name: deployment
-    rules:
-      - alert: ContainerUnhealthy
-        expr: container_status == 0
-        for: 1m
-        labels:
-          severity: critical
-        annotations:
-          summary: "Container reported unhealthy"
-          description: "container_status gauge dropped to 0."
-  
-        - alert: AgentFailed
-        expr: agent_state{state="failed"} == 1
-        for: 1m
-        labels:
-          severity: critical
-        annotations:
-          summary: "AI Agent {{ $labels.agent_name }} failed"
-          description: "Agent {{ $labels.agent_name }} on {{ $labels.cloud }}/{{ $labels.stage }} is in failed state"
-
-      - alert: AgentHighTokenUsage
-        expr: increase(agent_token_usage_total[1h]) > 50000
+      - alert: SentinelOpsHighErrorRate
+        expr: |
+          (
+            sum(rate(app_errors_total[5m]))
+            /
+            clamp_min(sum(rate(app_requests_total[5m])), 1)
+          ) > 0.05
         for: 5m
         labels:
           severity: warning
+          service: sentinelops-lite
         annotations:
-          summary: "AI Agent {{ $labels.agent_name }} high token usage"
-          description: "Agent {{ $labels.agent_name }} used more than 50K tokens in the last hour"
+          summary: SentinelOps application error rate is high
+          description: The application 5xx error rate has exceeded five percent for five minutes.
 
-      - alert: AgentSlowExecution
-        expr: agent_execution_time_seconds > 30
-        for: 5m
+      - alert: SentinelOpsHighMemoryUsage
+        expr: system_memory_usage_percent > 90
+        for: 10m
         labels:
           severity: warning
+          service: infrastructure
         annotations:
-          summary: "AI Agent {{ $labels.agent_name }} slow execution"
-          description: "Agent {{ $labels.agent_name }} took more than 30s to execute"
-
-  - name: sentinelops_app_alerts
-    rules:
-      - alert: AppDown
-        expr: up{job="flask-app"} == 0
-        for: 1m
-        labels:
-          severity: critical
-        annotations:
-          summary: "Flask app is down"
-          description: "The Flask application has been down for more than 1 minute"
-
-      - alert: HighErrorRate
-        expr: rate(app_errors_total[5m]) > 0.1
-        for: 5m
-        labels:
-          severity: warning
-        annotations:
-          summary: "High error rate"
-          description: "Error rate is above 0.1/sec for the last 5 minutes"
-
-      - alert: PrometheusDown
-        expr: up{job="prometheus"} == 0
-        for: 1m
-        labels:
-          severity: critical
-        annotations:
-          summary: "Prometheus is down"
-          description: "Prometheus server is unreachable"
-
+          summary: Host memory usage is high
+          description: Host memory usage has been above 90 percent for ten minutes.
