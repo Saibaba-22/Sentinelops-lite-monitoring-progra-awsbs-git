@@ -709,6 +709,18 @@ jobs:
           AI_PROVIDER: ${{ vars.AI_PROVIDER || 'gemini' }}
           RUN_AI_REVIEW: ${{ inputs.ai_review && '1' || '0' }}
         run: python agent/final_agent.py
+      - name: Verify real AI-agent metrics
+        run: |
+          for attempt in $(seq 1 6); do
+            if curl -ksS "${APP_URL}/metrics" | grep -q '^agent_last_run_timestamp_seconds'; then
+              echo "Real AI-agent metrics are exposed."
+              exit 0
+            fi
+            echo "Agent metrics not visible yet; retry $attempt/6"
+            sleep 10
+          done
+          echo "No real agent report metrics were exposed at /metrics. Check MONITOR_API_URL and MONITOR_TOKEN."
+          exit 1
       - name: Upload AWS post-deploy reports
         if: always()
         uses: actions/upload-artifact@v4
@@ -760,6 +772,18 @@ jobs:
           AI_PROVIDER: ${{ vars.AI_PROVIDER || 'gemini' }}
           RUN_AI_REVIEW: ${{ inputs.ai_review && '1' || '0' }}
         run: python agent/final_agent.py
+      - name: Verify real AI-agent metrics
+        run: |
+          for attempt in $(seq 1 6); do
+            if curl -ksS "${APP_URL}/metrics" | grep -q '^agent_last_run_timestamp_seconds'; then
+              echo "Real AI-agent metrics are exposed."
+              exit 0
+            fi
+            echo "Agent metrics not visible yet; retry $attempt/6"
+            sleep 10
+          done
+          echo "No real agent report metrics were exposed at /metrics. Check MONITOR_API_URL and MONITOR_TOKEN."
+          exit 1
       - name: Upload Azure post-deploy reports
         if: always()
         uses: actions/upload-artifact@v4

@@ -450,6 +450,10 @@ def _restore_agent_metrics() -> None:
         agents = stored.get("agents", {})
         for name in KNOWN_AGENTS:
             data = agents.get(name, {})
+            # Do not create fake idle Prometheus series for agents that have
+            # never reported. Grafana should show only real agent activity.
+            if not data.get("last_run"):
+                continue
             stage = str(data.get("stage") or "unknown")
             cloud = str(data.get("cloud") or "unknown")
             provider = str(data.get("provider") or "unknown")
