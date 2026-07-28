@@ -11,7 +11,6 @@ on:
           - aws
           - azure
           - both
-        default: aws
       ai_review:
         description: Run optional Gemini summaries (not required for deployment)
         required: true
@@ -140,13 +139,17 @@ jobs:
           cache-from: type=gha,scope=app
           cache-to: type=gha,mode=max,scope=app
 
-      - name: Prepare Azure sidecar Dockerfiles
-        if: ${{ inputs.cloud == 'azure' || inputs.cloud == 'both' }}
+      - name: Prepare monitoring sidecar Dockerfiles
+        if: ${{ inputs.cloud == 'aws' || inputs.cloud == 'azure' || inputs.cloud == 'both' }}
         run: |
           test -f docker/nginx/nginx.conf || { echo "Missing docker/nginx/nginx.conf"; exit 1; }
           test -f monitoring/prometheus/prometheus.yml || { echo "Missing monitoring/prometheus/prometheus.yml"; exit 1; }
-          test -d monitoring/grafana/provisioning || { echo "Missing monitoring/grafana/provisioning"; exit 1; }
-          test -d monitoring/grafana/dashboards || { echo "Missing monitoring/grafana/dashboards"; exit 1; }
+          test -f monitoring/grafana/provisioning/datasources/datasource.yml || { echo "Missing Grafana datasource provisioning"; exit 1; }
+          test -f monitoring/grafana/provisioning/dashboards/dashboard.yml || { echo "Missing Grafana dashboard provisioning"; exit 1; }
+          test -f monitoring/grafana/dashboards/ai-agent-dashboard.json || { echo "Missing ai-agent-dashboard.json"; exit 1; }
+          if grep -qE 'url: *\[' monitoring/grafana/provisioning/datasources/datasource.yml; then
+            echo "Grafana datasource URL contains Markdown link syntax; use url: http://prometheus:9090/prometheus/"; exit 1
+          fi
 
           mkdir -p docker/nginx docker/prometheus docker/grafana
 
@@ -167,8 +170,8 @@ jobs:
           COPY --chown=472:0 monitoring/grafana/dashboards/ /var/lib/grafana/dashboards/
           EOF
 
-      - name: Build and push nginx image for Azure
-        if: ${{ inputs.cloud == 'azure' || inputs.cloud == 'both' }}
+      - name: Build and push nginx monitoring image
+        if: ${{ inputs.cloud == 'aws' || inputs.cloud == 'azure' || inputs.cloud == 'both' }}
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -180,8 +183,8 @@ jobs:
           cache-from: type=gha,scope=nginx
           cache-to: type=gha,mode=max,scope=nginx
 
-      - name: Build and push Prometheus image for Azure
-        if: ${{ inputs.cloud == 'azure' || inputs.cloud == 'both' }}
+      - name: Build and push Prometheus monitoring image
+        if: ${{ inputs.cloud == 'aws' || inputs.cloud == 'azure' || inputs.cloud == 'both' }}
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -193,8 +196,8 @@ jobs:
           cache-from: type=gha,scope=prometheus
           cache-to: type=gha,mode=max,scope=prometheus
 
-      - name: Build and push Grafana image for Azure
-        if: ${{ inputs.cloud == 'azure' || inputs.cloud == 'both' }}
+      - name: Build and push Grafana monitoring image
+        if: ${{ inputs.cloud == 'aws' || inputs.cloud == 'azure' || inputs.cloud == 'both' }}
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -330,6 +333,7 @@ jobs:
           CNAME: ${{ steps.aws-host.outputs.cname }}
           MONITOR_TOKEN: ${{ secrets.MONITOR_TOKEN_AWS }}
           GRAFANA_ADMIN_PASSWORD: ${{ secrets.GRAFANA_ADMIN_PASSWORD }}
+          GRAFANA_IMAGE: docker.io/${{ env.DOCKERHUB_USERNAME }}/${{ env.DOCKERHUB_REPOSITORY }}:grafana-${{ github.sha }}
         run: |
           test -f Dockerrun.aws.json || { echo "Missing Dockerrun.aws.json for the ECS environment"; exit 1; }
           touch .ebignore
@@ -368,6 +372,13 @@ jobs:
               set_env(app, name, value)
 
           grafana = get_container("grafana")
+          grafana["image"] = os.environ["GRAFANA_IMAGE"]
+          # The monitoring files are baked into the image. Do not let an
+          # empty/old host mount hide the dashboard inside the image.
+          grafana["mountPoints"] = [
+              mount for mount in grafana.get("mountPoints", [])
+              if mount.get("sourceVolume") not in {"grafana-provisioning", "grafana-dashboards"}
+          ]
           for name, value in {
               "GF_SECURITY_ADMIN_USER": "admin",
               "GF_SECURITY_ADMIN_PASSWORD": os.environ["GRAFANA_ADMIN_PASSWORD"],
