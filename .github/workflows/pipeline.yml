@@ -495,6 +495,8 @@ jobs:
           cat reports/aws-eb-health.txt || true
           echo "===== EB EVENTS ====="
           cat reports/aws-eb-events.txt || true
+          echo "===== EB LOG TAIL ====="
+          tail -300 reports/aws-eb-logs.txt || true
 
       - name: Upload AWS deployment diagnostics
         if: always()
