@@ -1,10 +1,14 @@
+# docker/docker-compose.azure.yml
+# Azure App Service multi-container
+# All containers share localhost network namespace
 version: "3.8"
 
 services:
 
   app:
     image: __APP_IMAGE__
-    restart: unless-stopped
+    expose:
+      - "5000"
     environment:
       - PORT=5000
       - APP_VERSION=1.0.0
@@ -13,51 +17,23 @@ services:
       - METRICS_INTERVAL=5
       - MONITOR_TOKEN=__MONITOR_TOKEN__
       - PYTHONPATH=/app
-    expose:
-      - "5000"
-    healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:5000/health || exit 1"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 60s
-    networks:
-      - app-network
 
   nginx:
     image: __NGINX_IMAGE__
-    restart: unless-stopped
     ports:
       - "80:80"
-    depends_on:
-      - app
-      - prometheus
-      - grafana
-      - node-exporter
-    networks:
-      - app-network
 
   prometheus:
     image: __PROMETHEUS_IMAGE__
-    restart: unless-stopped
     expose:
       - "9090"
     command:
       - "--config.file=/etc/prometheus/prometheus.yml"
       - "--web.external-url=/prometheus/"
       - "--web.route-prefix=/prometheus/"
-    healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:9090/prometheus/-/ready || exit 1"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 30s
-    networks:
-      - app-network
 
   grafana:
     image: __GRAFANA_IMAGE__
-    restart: unless-stopped
     expose:
       - "3000"
     environment:
@@ -68,30 +44,13 @@ services:
       - GF_SERVER_ROOT_URL=__GF_SERVER_ROOT_URL__
       - GF_SERVER_SUB_PATH=/grafana/
       - GF_SERVER_SERVE_FROM_SUB_PATH=true
-      - PROMETHEUS_URL=__PROMETHEUS_URL__
-    healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:3000/grafana/api/health || exit 1"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 60s
-    depends_on:
-      - prometheus
-    networks:
-      - app-network
+      - PROMETHEUS_URL=http://localhost:9090/prometheus/
 
   node-exporter:
     image: prom/node-exporter:v1.8.0
-    restart: unless-stopped
     expose:
       - "9100"
     command:
       - "--path.procfs=/proc"
       - "--path.sysfs=/sys"
       - "--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc|rootfs)($$|/)"
-    networks:
-      - app-network
-
-networks:
-  app-network:
-    driver: bridge
