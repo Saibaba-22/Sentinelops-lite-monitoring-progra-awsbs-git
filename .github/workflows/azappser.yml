@@ -1,46 +1,30 @@
-# =============================================================================
-# azure App service pipeline.yml — SentinelOps-Lite CI/CD pipeline (GitHub Actions)
-# Place at .github/workflows/pipeline.yml
-#
-# ALL values are read from GitHub Settings:
-#   Variables (Settings -> Secrets and variables -> Actions -> Variables):
-#     APP_NAME, ENV_NAME, DOCKERHUB_USERNAME, AWS_REGION, PYTHON_VERSION
-#   Secrets (same page -> Secrets):
-#     AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, DOCKERHUB_TOKEN, GEMINI_API_KEY
-#
-# Registry: Docker Hub. The image is pushed to
-#   docker.io/<DOCKERHUB_USERNAME>/sentinelops-lite:latest
-# and Dockerrun.aws.json references it. The Beanstalk URL is auto-discovered.
-# Nothing is hard-coded here.  
-# Variables and Secrets provide at last which need to be provided
-# =============================================================================
-name: SentinelOps-Lite Pipeline (Azure App Service)
+name: SentinelOps-Lite Azure pipeline
 
 on:
-#  push:                # Use only when single pipeline and for azure
-#    branches: [main]
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      ai_review:
+        description: Run optional Gemini summaries (not required for deployment)
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  id-token: write
 
 env:
-# Azure Cloud
-  AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }} # Azure RG
-  AZURE_WEBAPP_NAME: ${{ vars.AZURE_WEBAPP_NAME }}       # Azure App service name
-  APP_HEALTH_PATH: ${{ vars.APP_HEALTH_PATH }}
-
-# Docker Hub
-  DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}  
-  DOCKERHUB_REPOSITORY: ${{ vars.DOCKERHUB_REPOSITORY }}
-  REPOSITORY: ${{ vars.REPOSITORY }}
-
-# Other
-  PYTHON_VERSION: ${{ vars.PYTHON_VERSION }}
-  GITHUB_SHA: ${{ github.sha }}
+  PYTHON_VERSION: ${{ vars.PYTHON_VERSION || '3.11' }}
+  DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
+  DOCKERHUB_REPOSITORY: ${{ vars.DOCKERHUB_REPOSITORY || vars.REPOSITORY }}
+  AZURE_WEBAPP_NAME: ${{ vars.AZURE_WEBAPP_NAME }}
+  AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+  APP_HEALTH_PATH: ${{ vars.APP_HEALTH_PATH || '/health' }}
 
 jobs:
-  review:
-    name: Pre-deploy review
+  precheck:
+    name: Pre-deployment checks
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -49,100 +33,288 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
 
       - name: Install dependencies
-        run: |
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+        run: python -m pip install --upgrade pip && python -m pip install -r requirements.txt
 
-      - name: Run review agent
-        run: |
-          if [ -f review_agent.py ]; then
-            python review_agent.py
-          else
-            echo "review_agent.py not found, skipping." > review_report.txt
-          fi
+      - name: Run deterministic pre-check agent
+        env:
+          PROJECT_PATH: .
+          AI_MODEL: ${{ vars.AI_MODEL || 'gemini-2.5-flash' }}
+          AI_PROVIDER: ${{ vars.AI_PROVIDER || 'gemini' }}
+          RUN_AI_REVIEW: ${{ inputs.ai_review && '1' || '0' }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          TARGET_CLOUD: azure
+          MONITOR_API_URL: ${{ secrets.MONITOR_API_URL_AZURE }}
+          MONITOR_TOKEN: ${{ secrets.MONITOR_TOKEN_AZURE }}
+        run: python agent/test_agent.py
 
-      - name: Upload review report
+      - name: Upload pre-check reports
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: review-report
-          path: review_report.txt
+          name: pre-deploy-reports
+          path: |
+            reports/**
+            errors_report.txt
+          if-no-files-found: ignore
 
-  deploy:
-    name: Build, push, deploy to Azure App Service
-    needs: review
+  build:
+    name: Build and push immutable images
+    needs: precheck
     runs-on: ubuntu-latest
-
     outputs:
-      app_url: ${{ steps.get-url.outputs.app_url }}
-
+      image_base: ${{ steps.image-names.outputs.image_base }}
+      image_tag: ${{ steps.image-names.outputs.image_tag }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Validate Docker Hub configuration
+        env:
+          DOCKERHUB_TOKEN_VALUE: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          test -n "$DOCKERHUB_USERNAME" || { echo "Missing repository variable DOCKERHUB_USERNAME"; exit 1; }
+          test -n "$DOCKERHUB_REPOSITORY" || { echo "Missing repository variable DOCKERHUB_REPOSITORY or REPOSITORY"; exit 1; }
+          test -n "$DOCKERHUB_TOKEN_VALUE" || { echo "Missing repository secret DOCKERHUB_TOKEN"; exit 1; }
 
-      - name: Set up Docker Buildx
+      - name: Set image names
+        id: image-names
+        run: |
+          echo "image_base=docker.io/${DOCKERHUB_USERNAME}/${DOCKERHUB_REPOSITORY}" >> "$GITHUB_OUTPUT"
+          echo "image_tag=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ env.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
 
+      - name: Build and push application image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          push: true
+          platforms: linux/amd64
+          provenance: false
+          tags: |
+            docker.io/${{ env.DOCKERHUB_USERNAME }}/${{ env.DOCKERHUB_REPOSITORY }}:${{ github.sha }}
+            docker.io/${{ env.DOCKERHUB_USERNAME }}/${{ env.DOCKERHUB_REPOSITORY }}:latest
+          cache-from: type=gha,scope=app
+          cache-to: type=gha,mode=max,scope=app
+
+      - name: Prepare monitoring sidecar Dockerfiles
+        run: |
+          test -f docker/nginx/nginx.conf || { echo "Missing docker/nginx/nginx.conf"; exit 1; }
+          test -f monitoring/prometheus/prometheus.yml || { echo "Missing monitoring/prometheus/prometheus.yml"; exit 1; }
+          test -f monitoring/grafana/provisioning/datasources/datasource.yml || { echo "Missing Grafana datasource provisioning"; exit 1; }
+          test -f monitoring/grafana/provisioning/dashboards/dashboard.yml || { echo "Missing Grafana dashboard provisioning"; exit 1; }
+          test -f monitoring/grafana/dashboards/ai-agent-dashboard.json || { echo "Missing ai-agent-dashboard.json"; exit 1; }
+          if grep -qE 'url: *\[' monitoring/grafana/provisioning/datasources/datasource.yml; then
+            echo "Grafana datasource URL contains Markdown link syntax; use url: http://prometheus:9090/prometheus/"; exit 1
+          fi
+
+          mkdir -p docker/nginx docker/prometheus docker/grafana
+
+          cat > docker/nginx/Dockerfile <<'EOF'
+          FROM nginx:1.27-alpine
+          COPY docker/nginx/nginx.conf /etc/nginx/conf.d/default.conf
+          EOF
+
+          cat > docker/prometheus/Dockerfile <<'EOF'
+          FROM prom/prometheus:v2.53.0
+          COPY monitoring/prometheus/ /etc/prometheus/
+          CMD ["--config.file=/etc/prometheus/prometheus.yml", "--web.external-url=/prometheus/", "--web.route-prefix=/prometheus/"]
+          EOF
+
+          cat > docker/grafana/Dockerfile <<'EOF'
+          FROM grafana/grafana:11.1.0
+          COPY --chown=472:0 monitoring/grafana/provisioning/ /etc/grafana/provisioning/
+          COPY --chown=472:0 monitoring/grafana/dashboards/ /var/lib/grafana/dashboards/
+          EOF
+
+      - name: Build and push nginx monitoring image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/nginx/Dockerfile
+          push: true
+          platforms: linux/amd64
+          provenance: false
+          tags: docker.io/${{ env.DOCKERHUB_USERNAME }}/${{ env.DOCKERHUB_REPOSITORY }}:nginx-${{ github.sha }}
+          cache-from: type=gha,scope=nginx
+          cache-to: type=gha,mode=max,scope=nginx
+
+      - name: Build and push Prometheus monitoring image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/prometheus/Dockerfile
+          push: true
+          platforms: linux/amd64
+          provenance: false
+          tags: docker.io/${{ env.DOCKERHUB_USERNAME }}/${{ env.DOCKERHUB_REPOSITORY }}:prometheus-${{ github.sha }}
+          cache-from: type=gha,scope=prometheus
+          cache-to: type=gha,mode=max,scope=prometheus
+
+      - name: Build and push Grafana monitoring image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/grafana/Dockerfile
+          push: true
+          platforms: linux/amd64
+          provenance: false
+          tags: docker.io/${{ env.DOCKERHUB_USERNAME }}/${{ env.DOCKERHUB_REPOSITORY }}:grafana-${{ github.sha }}
+          cache-from: type=gha,scope=grafana
+          cache-to: type=gha,mode=max,scope=grafana
+
+      - name: Scan application image
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1
+        continue-on-error: true
+        with:
+          image-ref: docker.io/${{ env.DOCKERHUB_USERNAME }}/${{ env.DOCKERHUB_REPOSITORY }}:${{ github.sha }}
+          format: table
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: '0'
+
+  deploy_azure:
+    name: Deploy to Azure App Service
+    needs: build
+    runs-on: ubuntu-latest
+    outputs:
+      app_url: ${{ steps.azure-host.outputs.app_url }}
+    env:
+      GRAFANA_ADMIN_PASSWORD: ${{ secrets.GRAFANA_ADMIN_PASSWORD }}
+      MONITOR_TOKEN_AZURE: ${{ secrets.MONITOR_TOKEN_AZURE }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python for deployment agents
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install agent dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Validate Azure configuration
+        env:
+          AZURE_CREDENTIALS_VALUE: ${{ secrets.AZURE_CREDENTIALS }}
+        run: |
+          test -n "$AZURE_WEBAPP_NAME" || { echo "Add repository variable AZURE_WEBAPP_NAME"; exit 1; }
+          test -n "$AZURE_RESOURCE_GROUP" || { echo "Add repository variable AZURE_RESOURCE_GROUP"; exit 1; }
+          test -n "$GRAFANA_ADMIN_PASSWORD" || { echo "Add repository secret GRAFANA_ADMIN_PASSWORD"; exit 1; }
+          test -n "$AZURE_CREDENTIALS_VALUE" || { echo "Add repository secret AZURE_CREDENTIALS"; exit 1; }
+          test -n "$MONITOR_TOKEN_AZURE" || { echo "Add repository secret MONITOR_TOKEN_AZURE"; exit 1; }
+          test -n "$DOCKERHUB_USERNAME" || { echo "Missing variable DOCKERHUB_USERNAME"; exit 1; }
+          test -n "$DOCKERHUB_REPOSITORY" || { echo "Missing variable DOCKERHUB_REPOSITORY or REPOSITORY"; exit 1; }
+
       - name: Azure login
         uses: azure/login@v2
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      - name: Docker Hub login
-        run: echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u "${{ env.DOCKERHUB_USERNAME }}" --password-stdin
-
-      - name: Build Docker image
+      - name: Resolve Azure host
+        id: azure-host
         run: |
-          docker build \
-            -t docker.io/${{ env.DOCKERHUB_USERNAME }}/${{ env.DOCKERHUB_REPOSITORY }}:${{ github.sha }} \
-            -t docker.io/${{ env.DOCKERHUB_USERNAME }}/${{ env.DOCKERHUB_REPOSITORY }}:latest \
-            .
+          HOSTNAME=$(az webapp show --name "$AZURE_WEBAPP_NAME" --resource-group "$AZURE_RESOURCE_GROUP" --query defaultHostName -o tsv)
+          test -n "$HOSTNAME" || { echo "Azure App Service hostname could not be resolved"; exit 1; }
+          echo "hostname=$HOSTNAME" >> "$GITHUB_OUTPUT"
+          echo "app_url=https://${HOSTNAME}" >> "$GITHUB_OUTPUT"
 
-      - name: Push Docker image
+      - name: Configure Azure app settings
+        env:
+          HOSTNAME: ${{ steps.azure-host.outputs.hostname }}
+          MONITOR_TOKEN: ${{ secrets.MONITOR_TOKEN_AZURE }}
+          DOCKERHUB_TOKEN_VALUE: ${{ secrets.DOCKERHUB_TOKEN }}
         run: |
-          docker push docker.io/${{ env.DOCKERHUB_USERNAME }}/${{ env.DOCKERHUB_REPOSITORY }}:${{ github.sha }}
-          docker push docker.io/${{ env.DOCKERHUB_USERNAME }}/${{ env.DOCKERHUB_REPOSITORY }}:latest
+          az webapp config appsettings set \
+            --name "$AZURE_WEBAPP_NAME" \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --settings \
+              WEBSITES_PORT=80 \
+              WEBSITES_CONTAINER_START_TIME_LIMIT=1800 \
+              DOCKER_REGISTRY_SERVER_URL=https://index.docker.io \
+              DOCKER_REGISTRY_SERVER_USERNAME="$DOCKERHUB_USERNAME" \
+              DOCKER_REGISTRY_SERVER_PASSWORD="$DOCKERHUB_TOKEN_VALUE" \
+              BUILD_NUMBER="$GITHUB_SHA" \
+              ENVIRONMENT=production \
+              MONITOR_TOKEN="$MONITOR_TOKEN" \
+              GF_SECURITY_ADMIN_PASSWORD="$GRAFANA_ADMIN_PASSWORD" \
+              GF_SERVER_DOMAIN="$HOSTNAME" \
+              GF_SERVER_ROOT_URL="https://${HOSTNAME}/grafana/"
 
-      - name: Configure Azure Web App container
+      - name: Render Azure Compose bundle
+        env:
+          APP_IMAGE: docker.io/${{ env.DOCKERHUB_USERNAME }}/${{ env.DOCKERHUB_REPOSITORY }}:${{ github.sha }}
+          NGINX_IMAGE: docker.io/${{ env.DOCKERHUB_USERNAME }}/${{ env.DOCKERHUB_REPOSITORY }}:nginx-${{ github.sha }}
+          PROMETHEUS_IMAGE: docker.io/${{ env.DOCKERHUB_USERNAME }}/${{ env.DOCKERHUB_REPOSITORY }}:prometheus-${{ github.sha }}
+          GRAFANA_IMAGE: docker.io/${{ env.DOCKERHUB_USERNAME }}/${{ env.DOCKERHUB_REPOSITORY }}:grafana-${{ github.sha }}
+        run: |
+          cp docker/docker-compose.azure.yml /tmp/docker-compose.azure.yml
+          sed -i \
+            -e "s|__APP_IMAGE__|${APP_IMAGE}|g" \
+            -e "s|__NGINX_IMAGE__|${NGINX_IMAGE}|g" \
+            -e "s|__PROMETHEUS_IMAGE__|${PROMETHEUS_IMAGE}|g" \
+            -e "s|__GRAFANA_IMAGE__|${GRAFANA_IMAGE}|g" \
+            /tmp/docker-compose.azure.yml
+          if grep -nE '(__[A-Z_]+__|replace_with_)' /tmp/docker-compose.azure.yml; then
+            echo "Unresolved Azure image marker"; exit 1
+          fi
+
+      - name: Deploy Azure Compose app
+        id: azure_deploy
+        continue-on-error: true
         run: |
           az webapp config container set \
-            --name "${{ env.AZURE_WEBAPP_NAME }}" \
-            --resource-group "${{ env.AZURE_RESOURCE_GROUP }}" \
-            --container-image-name "docker.io/${{ env.DOCKERHUB_USERNAME }}/${{ env.DOCKERHUB_REPOSITORY }}:${{ github.sha }}" \
-            --container-registry-url "https://index.docker.io" \
-            --container-registry-user "${{ env.DOCKERHUB_USERNAME }}" \
-            --container-registry-password "${{ secrets.DOCKERHUB_TOKEN }}"
+            --name "$AZURE_WEBAPP_NAME" \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --multicontainer-config-type COMPOSE \
+            --multicontainer-config-file /tmp/docker-compose.azure.yml
+          az webapp restart --name "$AZURE_WEBAPP_NAME" --resource-group "$AZURE_RESOURCE_GROUP"
+          for attempt in $(seq 1 30); do
+            code=$(curl -ksS -o /dev/null -w '%{http_code}' "${{ steps.azure-host.outputs.app_url }}${APP_HEALTH_PATH}" || true)
+            echo "Attempt $attempt: HTTP $code"
+            if [ "$code" = "200" ]; then exit 0; fi
+            sleep 10
+          done
+          exit 1
 
-      - name: Restart Azure Web App
-        run: |
-          az webapp restart \
-            --name "${{ env.AZURE_WEBAPP_NAME }}" \
-            --resource-group "${{ env.AZURE_RESOURCE_GROUP }}"
+      - name: Diagnose Azure deployment failure
+        if: ${{ steps.azure_deploy.outcome == 'failure' }}
+        continue-on-error: true
+        env:
+          TARGET_CLOUD: azure
+          APP_URL: ${{ steps.azure-host.outputs.app_url }}
+          MONITOR_API_URL: ${{ steps.azure-host.outputs.app_url }}/monitor/status
+          MONITOR_TOKEN: ${{ secrets.MONITOR_TOKEN_AZURE }}
+          AZURE_WEBAPP_NAME: ${{ env.AZURE_WEBAPP_NAME }}
+          AZURE_RESOURCE_GROUP: ${{ env.AZURE_RESOURCE_GROUP }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          AI_MODEL: ${{ vars.AI_MODEL || 'gemini-2.5-flash' }}
+          AI_PROVIDER: ${{ vars.AI_PROVIDER || 'gemini' }}
+        run: python agent/errors.py
 
-      - name: Get App URL
-        id: get-url
-        run: |
-          HOSTNAME=$(az webapp show \
-            --name "${{ env.AZURE_WEBAPP_NAME }}" \
-            --resource-group "${{ env.AZURE_RESOURCE_GROUP }}" \
-            --query defaultHostName -o tsv)
-          echo "app_url=https://$HOSTNAME" >> "$GITHUB_OUTPUT"
-          echo "Resolved app URL: https://$HOSTNAME"
+      - name: Fail Azure job after diagnostics
+        if: ${{ steps.azure_deploy.outcome != 'success' }}
+        run: exit 1
 
-  verify:
-    name: Post-deploy verification
-    needs: deploy
+  verify_azure:
+    name: Verify Azure deployment
+    if: ${{ always() && needs.deploy_azure.result == 'success' }}
+    needs: deploy_azure
     runs-on: ubuntu-latest
-
     env:
-      APP_URL: ${{ needs.deploy.outputs.app_url }}
-
+      APP_URL: ${{ needs.deploy_azure.outputs.app_url }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -151,68 +323,71 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
 
-      - name: Azure login
-        uses: azure/login@v2
-        with:
-          creds: ${{ secrets.AZURE_CREDENTIALS }}
+      - name: Install post-deploy agent dependencies
+        run: python -m pip install -r requirements.txt
 
-      - name: Install verification dependencies
+      - name: Verify public routes
         run: |
-          pip install requests
-
-      - name: Wait for app to become ready
-        shell: bash
-        run: |
-          URL="${APP_URL}${{ env.APP_HEALTH_PATH }}"
-          if [ -z "${{ env.APP_HEALTH_PATH }}" ]; then
-            URL="${APP_URL}/"
-          fi
-
-          echo "Checking: $URL"
-
-          for i in {1..30}; do
-            STATUS=$(curl -k -s -o /dev/null -w "%{http_code}" "$URL" || true)
-            echo "Attempt $i -> HTTP $STATUS"
-            if [ "$STATUS" = "200" ] || [ "$STATUS" = "302" ]; then
-              exit 0
-            fi
-            sleep 10
+          set -e
+          for path in /health / /metrics /prometheus/-/ready /grafana/api/health /node-exporter/metrics; do
+            code=$(curl -ksS -o /tmp/route.out -w '%{http_code}' "${APP_URL}${path}")
+            echo "$path -> $code"
+            case "$path" in
+              /health|/|/metrics) test "$code" = 200 ;;
+              *) test "$code" = 200 || test "$code" = 302 ;;
+            esac
           done
 
-          echo "Application did not become ready in time."
+      - name: Run post-deploy agent
+        env:
+          DEPLOY_URL: ${{ env.APP_URL }}
+          APP_URL: ${{ env.APP_URL }}
+          APP_HEALTH_PATH: /health
+          TARGET_CLOUD: azure
+          MONITOR_API_URL: ${{ env.APP_URL }}/monitor/status
+          MONITOR_TOKEN: ${{ secrets.MONITOR_TOKEN_AZURE }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          AI_MODEL: ${{ vars.AI_MODEL || 'gemini-2.5-flash' }}
+          AI_PROVIDER: ${{ vars.AI_PROVIDER || 'gemini' }}
+          RUN_AI_REVIEW: ${{ inputs.ai_review && '1' || '0' }}
+        run: python agent/final_agent.py
+
+      - name: Verify real AI-agent metrics
+        run: |
+          for attempt in $(seq 1 6); do
+            if curl -ksS "${APP_URL}/metrics" | grep -q '^agent_last_run_timestamp_seconds'; then
+              echo "Real AI-agent metrics are exposed."
+              exit 0
+            fi
+            echo "Agent metrics not visible yet; retry $attempt/6"
+            sleep 10
+          done
+          echo "No real agent report metrics were exposed at /metrics. Check MONITOR_API_URL and MONITOR_TOKEN."
           exit 1
 
-      - name: Run final verification agent
-        env:
-          APP_URL: ${{ env.APP_URL }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-        run: |
-          if [ -f final_agent.py ]; then
-            python final_agent.py
-          else
-            echo "APP_URL=${APP_URL}" > final_review.txt
-            echo "final_agent.py not found, basic verification only." >> final_review.txt
-          fi
-
-      - name: Upload final review
+      - name: Upload Azure post-deploy reports
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: final-review
-          path: final_review.txt
+          name: azure-post-deploy-reports
+          path: |
+            reports/**
+            final_report.txt
+          if-no-files-found: ignore
 
-
-#==========Variables================
-#AZURE_WEBAPP_NAME
-#AZURE_RESOURCE_GROUP
-#DOCKERHUB_USERNAME
-#DOCKERHUB_REPOSITORY
-#PYTHON_VERSION
-#APP_HEALTH_PATH
-#
-# Secrets
-#AZURE_CREDENTIALS
-#DOCKERHUB_TOKEN
-#GEMINI_API_KEY
-#=====================================
+  summary:
+    name: Pipeline summary
+    if: always()
+    needs: [precheck, build, deploy_azure, verify_azure]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Print job results
+        run: |
+          echo "precheck: ${{ needs.precheck.result }}"
+          echo "build: ${{ needs.build.result }}"
+          echo "azure deploy: ${{ needs.deploy_azure.result }}"
+          echo "azure verify: ${{ needs.verify_azure.result }}"
+          if [ "${{ needs.precheck.result }}" != "success" ] || [ "${{ needs.build.result }}" != "success" ]; then exit 1; fi
+          if [ "${{ needs.deploy_azure.result }}" != "success" ]; then exit 1; fi
