@@ -75,7 +75,7 @@
       "links": ["prometheus"],
       "environment": [
         { "name": "GF_SECURITY_ADMIN_USER", "value": "admin" },
-        { "name": "GF_SECURITY_ADMIN_PASSWORD", "value": "admin123" },
+        { "name": "GF_SECURITY_ADMIN_PASSWORD", "value": "replace_with_grafana_password" },
         { "name": "GF_USERS_ALLOW_SIGN_UP", "value": "false" },
         { "name": "GF_SERVER_DOMAIN", "value": "replace_with_gf_server_domain" },
         { "name": "GF_SERVER_ROOT_URL", "value": "replace_with_gf_server_root_url" },
@@ -126,7 +126,7 @@
   "volumes": [
     {
       "name": "nginx-conf",
-      "host": { "sourcePath": "/var/app/current/docker/nginx" }
+      "host": { "sourcePath": "/var/app/current/docker/nginx-ecs" }
     },
     {
       "name": "app-logs",
