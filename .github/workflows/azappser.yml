@@ -254,4 +254,220 @@ jobs:
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
           GITHUB_SHA: ${{ github.sha }}
           GRAFANA_ADMIN_PASSWORD: ${{ secrets.GRAFANA_ADMIN_PASSWORD }}
-          MONITOR_TOKEN_AZURE: ${{ 
+          MONITOR_TOKEN_AZURE: ${{ secrets.MONITOR_TOKEN_AZURE }}
+          MONITOR_TOKEN: ${{ secrets.MONITOR_TOKEN_AZURE }}
+          APP_HEALTH_PATH: ${{ env.APP_HEALTH_PATH }}
+        run: bash deployment/deploy-azure.sh
+
+      - name: Resolve Azure host for outputs
+        id: azure-host
+        if: always()
+        run: |
+          HOSTNAME=$(az webapp show \
+            --name "$AZURE_WEBAPP_NAME" \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --query defaultHostName -o tsv 2>/dev/null || echo "")
+          if [ -n "$HOSTNAME" ]; then
+            echo "hostname=$HOSTNAME" >> "$GITHUB_OUTPUT"
+            echo "app_url=https://${HOSTNAME}" >> "$GITHUB_OUTPUT"
+          else
+            echo "WARNING: Could not resolve Azure hostname for outputs"
+            echo "hostname=" >> "$GITHUB_OUTPUT"
+            echo "app_url=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Diagnose Azure deployment failure
+        if: ${{ steps.azure_deploy.outcome == 'failure' }}
+        continue-on-error: true
+        env:
+          TARGET_CLOUD: azure
+          APP_URL: ${{ steps.azure-host.outputs.app_url }}
+          MONITOR_API_URL: ${{ steps.azure-host.outputs.app_url }}/monitor/status
+          MONITOR_TOKEN: ${{ secrets.MONITOR_TOKEN_AZURE }}
+          AZURE_WEBAPP_NAME: ${{ env.AZURE_WEBAPP_NAME }}
+          AZURE_RESOURCE_GROUP: ${{ env.AZURE_RESOURCE_GROUP }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          AI_MODEL: ${{ vars.AI_MODEL || 'gemini-2.5-flash' }}
+          AI_PROVIDER: ${{ vars.AI_PROVIDER || 'gemini' }}
+        run: python agent/errors.py
+
+      - name: Collect Azure deployment logs
+        if: always()
+        continue-on-error: true
+        run: |
+          mkdir -p reports
+          az webapp log download \
+            --name "$AZURE_WEBAPP_NAME" \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --log-file reports/azure-webapp-logs.zip 2>/dev/null || true
+          az webapp show \
+            --name "$AZURE_WEBAPP_NAME" \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            -o json > reports/azure-webapp-info.json 2>/dev/null || true
+          az webapp config appsettings list \
+            --name "$AZURE_WEBAPP_NAME" \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --output table > reports/azure-app-settings.txt 2>/dev/null || true
+          echo "===== Azure App Service Info ====="
+          cat reports/azure-webapp-info.json 2>/dev/null || true
+          echo ""
+          echo "===== Azure App Settings ====="
+          cat reports/azure-app-settings.txt 2>/dev/null || true
+
+      - name: Upload Azure deployment diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: azure-deployment-diagnostics
+          path: |
+            reports/**
+            errors_report.txt
+          if-no-files-found: ignore
+
+      - name: Fail Azure job after diagnostics
+        if: ${{ steps.azure_deploy.outcome != 'success' }}
+        run: |
+          echo "Azure deployment failed. Review the deploy-azure.sh log and azure-deployment-diagnostics artifact."
+          exit 1
+
+  # ═══════════════════════════════════════════════════════════════
+  # 4. VERIFY AZURE DEPLOYMENT
+  # ═══════════════════════════════════════════════════════════════
+  verify_azure:
+    name: Verify Azure deployment
+    if: ${{ always() && needs.deploy_azure.result == 'success' }}
+    needs: deploy_azure
+    runs-on: ubuntu-latest
+    env:
+      APP_URL: ${{ needs.deploy_azure.outputs.app_url }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install post-deploy agent dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Wait for Azure containers to stabilize
+        run: |
+          echo "Waiting 60 seconds for all Azure containers to fully start..."
+          sleep 60
+
+      - name: Verify public routes
+        run: |
+          set -e
+          PASS=0
+          FAIL=0
+          for path in /health / /metrics /monitor/status /prometheus/-/ready /grafana/api/health /node-exporter/metrics; do
+            code=$(curl -ksS -o /tmp/route.out -w '%{http_code}' --max-time 30 "${APP_URL}${path}" || true)
+            echo "$path -> $code"
+            case "$path" in
+              /health|/|/metrics|/monitor/status)
+                if [ "$code" = "200" ]; then
+                  PASS=$((PASS+1))
+                else
+                  echo "  WARNING: $path returned $code (expected 200)"
+                  FAIL=$((FAIL+1))
+                fi
+                ;;
+              *)
+                if [ "$code" = "200" ] || [ "$code" = "302" ]; then
+                  PASS=$((PASS+1))
+                else
+                  echo "  WARNING: $path returned $code (expected 200 or 302)"
+                  FAIL=$((FAIL+1))
+                fi
+                ;;
+            esac
+          done
+          echo ""
+          echo "Routes passed: $PASS | Routes failed: $FAIL"
+          if [ "$FAIL" -gt 3 ]; then
+            echo "Too many route failures. Failing verification."
+            exit 1
+          fi
+
+      - name: Run post-deploy agent
+        env:
+          DEPLOY_URL: ${{ env.APP_URL }}
+          APP_URL: ${{ env.APP_URL }}
+          APP_HEALTH_PATH: /health
+          TARGET_CLOUD: azure
+          MONITOR_API_URL: ${{ env.APP_URL }}/monitor/status
+          MONITOR_TOKEN: ${{ secrets.MONITOR_TOKEN_AZURE }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          AI_MODEL: ${{ vars.AI_MODEL || 'gemini-2.5-flash' }}
+          AI_PROVIDER: ${{ vars.AI_PROVIDER || 'gemini' }}
+          RUN_AI_REVIEW: ${{ inputs.ai_review && '1' || '0' }}
+        run: python agent/final_agent.py
+
+      - name: Verify real AI-agent metrics
+        continue-on-error: true
+        run: |
+          for attempt in $(seq 1 6); do
+            if curl -ksS --max-time 15 "${APP_URL}/metrics" | grep -q '^agent_last_run_timestamp_seconds'; then
+              echo "Real AI-agent metrics are exposed."
+              exit 0
+            fi
+            echo "Agent metrics not visible yet; retry $attempt/6"
+            sleep 10
+          done
+          echo "No real agent report metrics were exposed at /metrics. Check MONITOR_API_URL and MONITOR_TOKEN."
+          exit 1
+
+      - name: Upload Azure post-deploy reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: azure-post-deploy-reports
+          path: |
+            reports/**
+            final_report.txt
+          if-no-files-found: ignore
+
+  # ═══════════════════════════════════════════════════════════════
+  # 5. PIPELINE SUMMARY
+  # ═══════════════════════════════════════════════════════════════
+  summary:
+    name: Pipeline summary
+    if: always()
+    needs: [precheck, build, deploy_azure, verify_azure]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Print job results
+        run: |
+          echo "====================================================="
+          echo " SentinelOps-Lite Azure Pipeline Summary"
+          echo "====================================================="
+          echo "precheck     : ${{ needs.precheck.result }}"
+          echo "build        : ${{ needs.build.result }}"
+          echo "azure deploy : ${{ needs.deploy_azure.result }}"
+          echo "azure verify : ${{ needs.verify_azure.result }}"
+          echo "====================================================="
+
+          if [ "${{ needs.precheck.result }}" != "success" ]; then
+            echo "❌ Pre-deployment checks failed."
+            exit 1
+          fi
+
+          if [ "${{ needs.build.result }}" != "success" ]; then
+            echo "❌ Build failed."
+            exit 1
+          fi
+
+          if [ "${{ needs.deploy_azure.result }}" != "success" ]; then
+            echo "❌ Azure deployment failed."
+            exit 1
+          fi
+
+          if [ "${{ needs.verify_azure.result }}" != "success" ]; then
+            echo "⚠️ Azure verification had issues. Check verify_azure logs."
+            exit 1
+          fi
+
+          echo "✅ All Azure pipeline jobs passed successfully."
