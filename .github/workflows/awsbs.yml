@@ -357,6 +357,8 @@ jobs:
               set_env(app, name, value)
 
           grafana = get_container("grafana")
+          # AWS ECS uses the official Grafana image and mounts the dashboard
+          # and provisioning files from the application bundle.
           for name, value in {
               "GF_SECURITY_ADMIN_USER": "admin",
               "GF_SECURITY_ADMIN_PASSWORD": os.environ["GRAFANA_ADMIN_PASSWORD"],
@@ -405,6 +407,7 @@ jobs:
           compose_path = Path("docker-compose.yml")
           text = compose_path.read_text(encoding="utf-8")
 
+          # Support both the new markers and the original repository placeholders.
           direct = {
               "__APP_IMAGE__": os.environ["APP_IMAGE"],
               "replace_with_dockerhub_image_uri": os.environ["APP_IMAGE"],
@@ -418,8 +421,11 @@ jobs:
           for old, new in direct.items():
               text = text.replace(old, new)
 
+          # Do not keep the development Grafana password in the AWS bundle.
           text = text.replace("GF_SECURITY_ADMIN_PASSWORD=admin123", "GF_SECURITY_ADMIN_PASSWORD=${GF_SECURITY_ADMIN_PASSWORD}")
 
+          # Avoid loading nginx-aws.conf, nginx-azure.conf, and other duplicate
+          # server blocks when the original compose file mounts the whole folder.
           text = text.replace(
               "./docker/nginx:/etc/nginx/conf.d:ro",
               "./docker/nginx/default.conf:/etc/nginx/conf.d/default.conf:ro",
@@ -553,16 +559,13 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
-
       - name: Install post-deploy agent dependencies
         run: python -m pip install -r requirements.txt
-
       - name: Verify public routes
         run: |
           set -e
@@ -574,7 +577,6 @@ jobs:
               *) test "$code" = 200 || test "$code" = 302 ;;
             esac
           done
-
       - name: Run post-deploy agent
         env:
           DEPLOY_URL: ${{ env.APP_URL }}
@@ -588,7 +590,6 @@ jobs:
           AI_PROVIDER: ${{ vars.AI_PROVIDER || 'gemini' }}
           RUN_AI_REVIEW: ${{ inputs.ai_review && '1' || '0' }}
         run: python agent/final_agent.py
-
       - name: Verify real AI-agent metrics
         run: |
           for attempt in $(seq 1 6); do
@@ -601,7 +602,6 @@ jobs:
           done
           echo "No real agent report metrics were exposed at /metrics. Check MONITOR_API_URL and MONITOR_TOKEN."
           exit 1
-
       - name: Upload AWS post-deploy reports
         if: always()
         uses: actions/upload-artifact@v4
@@ -620,12 +620,9 @@ jobs:
     steps:
       - name: Print job results
         run: |
-          echo "precheck:   ${{ needs.precheck.result }}"
-          echo "build:      ${{ needs.build.result }}"
+          echo "precheck: ${{ needs.precheck.result }}"
+          echo "build: ${{ needs.build.result }}"
           echo "aws deploy: ${{ needs.deploy_aws.result }}"
           echo "aws verify: ${{ needs.verify_aws.result }}"
-          if [ "${{ needs.precheck.result }}" != "success" ] || \
-             [ "${{ needs.build.result }}" != "success" ] || \
-             [ "${{ needs.deploy_aws.result }}" != "success" ]; then
-            exit 1
-          fi
+          if [ "${{ needs.precheck.result }}" != "success" ] || [ "${{ needs.build.result }}" != "success" ]; then exit 1; fi
+          if [ "${{ needs.deploy_aws.result }}" != "success" ]; then exit 1; fi
