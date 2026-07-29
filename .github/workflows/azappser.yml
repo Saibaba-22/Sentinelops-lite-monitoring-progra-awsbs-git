@@ -24,7 +24,7 @@ env:
 jobs:
 
   # ═══════════════════════════════════════════════════════════════
-  # 1. PRE-DEPLOYMENT CHECKS
+  # 1. PRE-DEPLOYMENT CHECKS (agent/test_agent.py)
   # ═══════════════════════════════════════════════════════════════
   precheck:
     name: Pre-deployment checks
@@ -192,7 +192,7 @@ jobs:
           exit-code: '0'
 
   # ═══════════════════════════════════════════════════════════════
-  # 3. DEPLOY TO AZURE APP SERVICE
+  # 3. DEPLOY TO AZURE APP SERVICE (agent/errors.py on failure)
   # ═══════════════════════════════════════════════════════════════
   deploy_azure:
     name: Deploy to Azure App Service
@@ -233,6 +233,13 @@ jobs:
           test -f docker/docker-compose.azure.yml || { echo "Missing docker/docker-compose.azure.yml"; exit 1; }
           test -f docker/nginx/nginx-azure.conf || { echo "Missing docker/nginx/nginx-azure.conf"; exit 1; }
           test -f deployment/deploy-azure.sh || { echo "Missing deployment/deploy-azure.sh"; exit 1; }
+          test -f agent/errors.py || { echo "Missing agent/errors.py"; exit 1; }
+
+      - name: Verify deploy script is valid bash
+        run: |
+          head -1 deployment/deploy-azure.sh | grep -q "^#!/" || { echo "ERROR: deploy-azure.sh does not start with shebang line"; exit 1; }
+          bash -n deployment/deploy-azure.sh || { echo "ERROR: deploy-azure.sh has syntax errors"; exit 1; }
+          echo "✅ deploy-azure.sh is valid bash script"
 
       - name: Azure login
         uses: azure/login@v2
@@ -276,7 +283,21 @@ jobs:
             echo "app_url=" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Diagnose Azure deployment failure
+      - name: Collect Azure logs before diagnosis
+        if: ${{ steps.azure_deploy.outcome == 'failure' }}
+        continue-on-error: true
+        run: |
+          mkdir -p reports
+          az webapp log download \
+            --name "$AZURE_WEBAPP_NAME" \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --log-file reports/azure-webapp-logs.zip 2>/dev/null || true
+          az webapp show \
+            --name "$AZURE_WEBAPP_NAME" \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            -o json > reports/azure-webapp-info.json 2>/dev/null || true
+
+      - name: Diagnose Azure deployment failure (agent/errors.py)
         if: ${{ steps.azure_deploy.outcome == 'failure' }}
         continue-on-error: true
         env:
@@ -291,7 +312,7 @@ jobs:
           AI_PROVIDER: ${{ vars.AI_PROVIDER || 'gemini' }}
         run: python agent/errors.py
 
-      - name: Collect Azure deployment logs
+      - name: Collect Azure deployment diagnostics
         if: always()
         continue-on-error: true
         run: |
@@ -308,11 +329,18 @@ jobs:
             --name "$AZURE_WEBAPP_NAME" \
             --resource-group "$AZURE_RESOURCE_GROUP" \
             --output table > reports/azure-app-settings.txt 2>/dev/null || true
+          az webapp config container show \
+            --name "$AZURE_WEBAPP_NAME" \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            -o json > reports/azure-container-config.json 2>/dev/null || true
           echo "===== Azure App Service Info ====="
           cat reports/azure-webapp-info.json 2>/dev/null || true
           echo ""
           echo "===== Azure App Settings ====="
           cat reports/azure-app-settings.txt 2>/dev/null || true
+          echo ""
+          echo "===== Azure Container Config ====="
+          cat reports/azure-container-config.json 2>/dev/null || true
 
       - name: Upload Azure deployment diagnostics
         if: always()
@@ -331,7 +359,7 @@ jobs:
           exit 1
 
   # ═══════════════════════════════════════════════════════════════
-  # 4. VERIFY AZURE DEPLOYMENT
+  # 4. VERIFY AZURE DEPLOYMENT (agent/final_agent.py)
   # ═══════════════════════════════════════════════════════════════
   verify_azure:
     name: Verify Azure deployment
@@ -361,17 +389,20 @@ jobs:
       - name: Verify public routes
         run: |
           set -e
+          echo "====================================================="
+          echo " Route Verification: ${APP_URL}"
+          echo "====================================================="
           PASS=0
           FAIL=0
           for path in /health / /metrics /monitor/status /prometheus/-/ready /grafana/api/health /node-exporter/metrics; do
             code=$(curl -ksS -o /tmp/route.out -w '%{http_code}' --max-time 30 "${APP_URL}${path}" || true)
-            echo "$path -> $code"
+            echo "$path -> HTTP $code"
             case "$path" in
               /health|/|/metrics|/monitor/status)
                 if [ "$code" = "200" ]; then
                   PASS=$((PASS+1))
                 else
-                  echo "  WARNING: $path returned $code (expected 200)"
+                  echo "  ⚠️ WARNING: $path returned $code (expected 200)"
                   FAIL=$((FAIL+1))
                 fi
                 ;;
@@ -379,7 +410,7 @@ jobs:
                 if [ "$code" = "200" ] || [ "$code" = "302" ]; then
                   PASS=$((PASS+1))
                 else
-                  echo "  WARNING: $path returned $code (expected 200 or 302)"
+                  echo "  ⚠️ WARNING: $path returned $code (expected 200 or 302)"
                   FAIL=$((FAIL+1))
                 fi
                 ;;
@@ -388,11 +419,12 @@ jobs:
           echo ""
           echo "Routes passed: $PASS | Routes failed: $FAIL"
           if [ "$FAIL" -gt 3 ]; then
-            echo "Too many route failures. Failing verification."
+            echo "❌ Too many route failures. Failing verification."
             exit 1
           fi
+          echo "✅ Route verification passed."
 
-      - name: Run post-deploy agent
+      - name: Run post-deploy agent (agent/final_agent.py)
         env:
           DEPLOY_URL: ${{ env.APP_URL }}
           APP_URL: ${{ env.APP_URL }}
@@ -411,13 +443,14 @@ jobs:
         run: |
           for attempt in $(seq 1 6); do
             if curl -ksS --max-time 15 "${APP_URL}/metrics" | grep -q '^agent_last_run_timestamp_seconds'; then
-              echo "Real AI-agent metrics are exposed."
+              echo "✅ Real AI-agent metrics are exposed."
               exit 0
             fi
             echo "Agent metrics not visible yet; retry $attempt/6"
             sleep 10
           done
-          echo "No real agent report metrics were exposed at /metrics. Check MONITOR_API_URL and MONITOR_TOKEN."
+          echo "⚠️ No real agent report metrics were exposed at /metrics."
+          echo "Check MONITOR_API_URL and MONITOR_TOKEN."
           exit 1
 
       - name: Upload Azure post-deploy reports
