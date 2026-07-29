@@ -1,7 +1,7 @@
-# docker/docker-compose.azure.yml
 version: "3.8"
 
 services:
+
   app:
     image: __APP_IMAGE__
     restart: unless-stopped
@@ -16,7 +16,7 @@ services:
     expose:
       - "5000"
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      test: ["CMD-SHELL", "curl -f http://localhost:5000/health || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 5
@@ -31,8 +31,8 @@ services:
       - "80:80"
     depends_on:
       - app
-      - grafana
       - prometheus
+      - grafana
       - node-exporter
     networks:
       - app-network
@@ -42,21 +42,24 @@ services:
     restart: unless-stopped
     expose:
       - "9090"
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--web.external-url=/prometheus/"
+      - "--web.route-prefix=/prometheus/"
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:9090/prometheus/-/ready"]
+      test: ["CMD-SHELL", "wget -qO- http://localhost:9090/prometheus/-/ready || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 30s
-    depends_on:
-      - app
-      - node-exporter
     networks:
       - app-network
 
   grafana:
     image: __GRAFANA_IMAGE__
     restart: unless-stopped
+    expose:
+      - "3000"
     environment:
       - GF_SECURITY_ADMIN_USER=admin
       - GF_SECURITY_ADMIN_PASSWORD=__GRAFANA_ADMIN_PASSWORD__
@@ -66,10 +69,8 @@ services:
       - GF_SERVER_SUB_PATH=/grafana/
       - GF_SERVER_SERVE_FROM_SUB_PATH=true
       - PROMETHEUS_URL=__PROMETHEUS_URL__
-    expose:
-      - "3000"
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:3000/grafana/api/health"]
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3000/grafana/api/health || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -85,12 +86,9 @@ services:
     expose:
       - "9100"
     command:
-      - "--path.procfs=/host/proc"
-      - "--path.sysfs=/host/sys"
+      - "--path.procfs=/proc"
+      - "--path.sysfs=/sys"
       - "--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc|rootfs)($$|/)"
-    volumes:
-      - /proc:/host/proc:ro
-      - /sys:/host/sys:ro
     networks:
       - app-network
 
