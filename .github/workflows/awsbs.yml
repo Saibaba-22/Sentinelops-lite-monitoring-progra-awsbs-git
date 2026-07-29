@@ -1,4 +1,4 @@
-name: SentinelOps-Lite multi-cloud pipeline
+name: SentinelOps-Lite AWS Cloud Pipeline
 
 on:
   workflow_dispatch:
@@ -54,8 +54,8 @@ jobs:
           RUN_AI_REVIEW: ${{ inputs.ai_review && '1' || '0' }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           TARGET_CLOUD: ${{ inputs.cloud }}
-          MONITOR_API_URL: ${{ secrets.MONITOR_API_URL_AWS }}
-          MONITOR_TOKEN: ${{ secrets.MONITOR_TOKEN_AWS }}
+          MONITOR_API_URL: ${{ inputs.cloud == 'azure' && secrets.MONITOR_API_URL_AZURE || secrets.MONITOR_API_URL_AWS }}
+          MONITOR_TOKEN: ${{ inputs.cloud == 'azure' && secrets.MONITOR_TOKEN_AZURE || secrets.MONITOR_TOKEN_AWS }}
         run: python agent/test_agent.py
 
       - name: Upload pre-check reports
@@ -627,7 +627,7 @@ jobs:
   summary:
     name: Pipeline summary
     if: always()
-    needs: [precheck, build, deploy_aws, verify_aws]
+    needs: [precheck, build, deploy_aws, deploy_azure, verify_aws, verify_azure]
     runs-on: ubuntu-latest
     steps:
       - name: Print job results
@@ -635,6 +635,10 @@ jobs:
           echo "precheck: ${{ needs.precheck.result }}"
           echo "build: ${{ needs.build.result }}"
           echo "aws deploy: ${{ needs.deploy_aws.result }}"
+          echo "azure deploy: ${{ needs.deploy_azure.result }}"
           echo "aws verify: ${{ needs.verify_aws.result }}"
+          echo "azure verify: ${{ needs.verify_azure.result }}"
           if [ "${{ needs.precheck.result }}" != "success" ] || [ "${{ needs.build.result }}" != "success" ]; then exit 1; fi
           if [ "${{ inputs.cloud }}" = "aws" ] && [ "${{ needs.deploy_aws.result }}" != "success" ]; then exit 1; fi
+          if [ "${{ inputs.cloud }}" = "azure" ] && [ "${{ needs.deploy_azure.result }}" != "success" ]; then exit 1; fi
+          if [ "${{ inputs.cloud }}" = "both" ] && { [ "${{ needs.deploy_aws.result }}" != "success" ] || [ "${{ needs.deploy_azure.result }}" != "success" ]; }; then exit 1; fi
