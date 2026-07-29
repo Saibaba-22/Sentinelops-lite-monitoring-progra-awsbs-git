@@ -1,8 +1,14 @@
-name: SentinelOps-Lite AWS Cloud pipeline
+name: SentinelOps-Lite multi-cloud pipeline
 
 on:
   workflow_dispatch:
     inputs:
+      cloud:
+        description: Deployment target
+        required: true
+        type: choice
+        options:
+          - aws
       ai_review:
         description: Run optional Gemini summaries (not required for deployment)
         required: true
@@ -47,7 +53,7 @@ jobs:
           AI_PROVIDER: ${{ vars.AI_PROVIDER || 'gemini' }}
           RUN_AI_REVIEW: ${{ inputs.ai_review && '1' || '0' }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          TARGET_CLOUD: aws
+          TARGET_CLOUD: ${{ inputs.cloud }}
           MONITOR_API_URL: ${{ secrets.MONITOR_API_URL_AWS }}
           MONITOR_TOKEN: ${{ secrets.MONITOR_TOKEN_AWS }}
         run: python agent/test_agent.py
@@ -211,6 +217,7 @@ jobs:
 
   deploy_aws:
     name: Deploy to AWS Elastic Beanstalk
+    if: ${{ inputs.cloud == 'aws' || inputs.cloud == 'both' }}
     needs: build
     runs-on: ubuntu-latest
     outputs:
@@ -289,7 +296,8 @@ jobs:
               "MONITOR_TOKEN": os.environ.get("MONITOR_TOKEN_AWS", ""),
               "GF_SECURITY_ADMIN_PASSWORD": os.environ["GRAFANA_ADMIN_PASSWORD"],
               "GF_SERVER_DOMAIN": os.environ["CNAME"],
-              "GF_SERVER_ROOT_URL": os.environ["BASE_URL"].rstrip("/") + "/grafana/"
+              "GF_SERVER_ROOT_URL": os.environ["BASE_URL"].rstrip("/") + "/grafana/",
+              "PROMETHEUS_URL": os.environ["BASE_URL"].rstrip("/") + "/prometheus",
           }
           options = [{
               "Namespace": "aws:elasticbeanstalk:application:environment",
@@ -555,7 +563,7 @@ jobs:
 
   verify_aws:
     name: Verify AWS deployment
-    if: ${{ always() && needs.deploy_aws.result == 'success' }}
+    if: ${{ always() && (inputs.cloud == 'aws' || inputs.cloud == 'both') && needs.deploy_aws.result == 'success' }}
     needs: deploy_aws
     runs-on: ubuntu-latest
     env:
@@ -629,4 +637,4 @@ jobs:
           echo "aws deploy: ${{ needs.deploy_aws.result }}"
           echo "aws verify: ${{ needs.verify_aws.result }}"
           if [ "${{ needs.precheck.result }}" != "success" ] || [ "${{ needs.build.result }}" != "success" ]; then exit 1; fi
-          if [ "${{ needs.deploy_aws.result }}" != "success" ]; then exit 1; fi
+          if [ "${{ inputs.cloud }}" = "aws" ] && [ "${{ needs.deploy_aws.result }}" != "success" ]; then exit 1; fi
