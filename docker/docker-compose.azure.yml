@@ -1,6 +1,3 @@
-# docker/docker-compose.azure.yml
-# Azure App Service multi-container
-# All containers share localhost network namespace
 version: "3.8"
 
 services:
