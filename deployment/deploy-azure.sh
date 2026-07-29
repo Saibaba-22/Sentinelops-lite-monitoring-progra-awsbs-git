@@ -151,6 +151,7 @@ az webapp config appsettings set \
   --resource-group "${AZURE_RESOURCE_GROUP}" \
   --settings \
     "WEBSITES_PORT=80" \
+    "WEBSITES_WEB_CONTAINER_NAME=nginx" \
     "WEBSITES_CONTAINER_START_TIME_LIMIT=1800" \
     "DOCKER_REGISTRY_SERVER_URL=https://index.docker.io" \
     "DOCKER_REGISTRY_SERVER_USERNAME=${DOCKERHUB_USERNAME}" \

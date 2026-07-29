@@ -15,8 +15,12 @@ services:
       - PYTHONPATH=/app
     expose:
       - "5000"
-    depends_on:
-      - prometheus
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
     networks:
       - app-network
 
@@ -38,6 +42,12 @@ services:
     restart: unless-stopped
     expose:
       - "9090"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9090/prometheus/-/ready"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
     depends_on:
       - app
       - node-exporter
@@ -58,6 +68,12 @@ services:
       - PROMETHEUS_URL=__PROMETHEUS_URL__
     expose:
       - "3000"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/grafana/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
     depends_on:
       - prometheus
     networks:
