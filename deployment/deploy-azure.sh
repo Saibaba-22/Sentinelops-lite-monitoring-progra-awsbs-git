@@ -1,69 +1,63 @@
 #!/usr/bin/env bash
 #
-# SentinelOps-Lite — Azure App Service deployment helper (Docker Hub)
-#
-# What it does:
-#   1. Builds the Python application Docker image.
-#   2. Logs in to Docker Hub and PUSHES the image.
-#   3. Resolves Azure App Service hostname for monitoring URLs.
-#   4. Injects image URI + monitoring URLs into docker-compose.azure.yml.
-#   5. Deploys multi-container (app + prometheus + grafana + nginx)
-#      to Azure App Service via docker-compose.
-#
-# Prerequisites:
-#   - Docker daemon available (e.g. GitHub-hosted ubuntu-latest).
-#   - Azure CLI logged in (az login) with perms for App Service.
-#   - App Service plan (Linux, Docker) already created.
+# SentinelOps-Lite — Azure App Service deployment helper
 #
 # Required env:
-#   AZURE_WEBAPP_NAME, AZURE_RESOURCE_GROUP    (Azure)
-#   DOCKERHUB_USERNAME, DOCKERHUB_TOKEN         (Docker Hub push auth)
-#   GITHUB_SHA                                  (set by GitHub Actions)
-#   REPOSITORY                                  (Docker Hub repo name)
+#   AZURE_WEBAPP_NAME, AZURE_RESOURCE_GROUP
+#   DOCKERHUB_USERNAME, DOCKERHUB_TOKEN
+#   GITHUB_SHA
+#   DOCKERHUB_REPOSITORY or REPOSITORY
+#   GRAFANA_ADMIN_PASSWORD
+#   MONITOR_TOKEN_AZURE or MONITOR_TOKEN
 
 set -euo pipefail
 
-# ─── Required Variables ───
+# ─── Required Variables with validation ───
 AZURE_WEBAPP_NAME="${AZURE_WEBAPP_NAME:?Set AZURE_WEBAPP_NAME}"
 AZURE_RESOURCE_GROUP="${AZURE_RESOURCE_GROUP:?Set AZURE_RESOURCE_GROUP}"
-IMAGE_NAME="${DOCKERHUB_REPOSITORY:-${REPOSITORY:?Set REPOSITORY}}"
-IMAGE_TAG="${GITHUB_SHA}"
+IMAGE_NAME="${DOCKERHUB_REPOSITORY:-${REPOSITORY:?Set DOCKERHUB_REPOSITORY or REPOSITORY}}"
+IMAGE_TAG="${GITHUB_SHA:?Set GITHUB_SHA}"
 DOCKERHUB_USERNAME="${DOCKERHUB_USERNAME:?Set DOCKERHUB_USERNAME}"
 DOCKERHUB_TOKEN="${DOCKERHUB_TOKEN:?Set DOCKERHUB_TOKEN}"
 GRAFANA_ADMIN_PASSWORD="${GRAFANA_ADMIN_PASSWORD:?Set GRAFANA_ADMIN_PASSWORD}"
-MONITOR_TOKEN="${MONITOR_TOKEN_AZURE:-${MONITOR_TOKEN:?Set MONITOR_TOKEN}}"
+MONITOR_TOKEN="${MONITOR_TOKEN_AZURE:-${MONITOR_TOKEN:-}}"
+
+if [ -z "${MONITOR_TOKEN}" ]; then
+  echo "ERROR: Set MONITOR_TOKEN_AZURE or MONITOR_TOKEN"
+  exit 1
+fi
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 COMPOSE_SRC="${ROOT_DIR}/docker/docker-compose.azure.yml"
 COMPOSE_TMP="/tmp/docker-compose.azure.yml"
-NGINX_SRC="${ROOT_DIR}/docker/nginx/nginx-azure.conf"
-NGINX_DST="${ROOT_DIR}/docker/nginx/default.conf"
 
+# ─── Image URIs ───
 APP_IMAGE="docker.io/${DOCKERHUB_USERNAME}/${IMAGE_NAME}:${IMAGE_TAG}"
 NGINX_IMAGE="docker.io/${DOCKERHUB_USERNAME}/${IMAGE_NAME}:nginx-${IMAGE_TAG}"
 PROMETHEUS_IMAGE="docker.io/${DOCKERHUB_USERNAME}/${IMAGE_NAME}:prometheus-${IMAGE_TAG}"
 GRAFANA_IMAGE="docker.io/${DOCKERHUB_USERNAME}/${IMAGE_NAME}:grafana-${IMAGE_TAG}"
 
-echo "===================================="
-echo "DOCKERHUB_USERNAME  = ${DOCKERHUB_USERNAME}"
-echo "IMAGE_NAME          = ${IMAGE_NAME}"
-echo "IMAGE_TAG           = ${IMAGE_TAG}"
-echo "APP_IMAGE           = ${APP_IMAGE}"
-echo "AZURE_WEBAPP_NAME   = ${AZURE_WEBAPP_NAME}"
-echo "AZURE_RESOURCE_GROUP= ${AZURE_RESOURCE_GROUP}"
-echo "===================================="
+echo "====================================================="
+echo " SentinelOps-Lite — Azure Deployment"
+echo "====================================================="
+echo "DOCKERHUB_USERNAME   = ${DOCKERHUB_USERNAME}"
+echo "IMAGE_NAME           = ${IMAGE_NAME}"
+echo "IMAGE_TAG            = ${IMAGE_TAG}"
+echo "APP_IMAGE            = ${APP_IMAGE}"
+echo "NGINX_IMAGE          = ${NGINX_IMAGE}"
+echo "PROMETHEUS_IMAGE     = ${PROMETHEUS_IMAGE}"
+echo "GRAFANA_IMAGE        = ${GRAFANA_IMAGE}"
+echo "AZURE_WEBAPP_NAME    = ${AZURE_WEBAPP_NAME}"
+echo "AZURE_RESOURCE_GROUP = ${AZURE_RESOURCE_GROUP}"
+echo "====================================================="
 
-# ─── Select nginx config for Azure ───
-echo "==> Selecting Azure nginx config"
-if [ -f "${NGINX_SRC}" ]; then
-  cp "${NGINX_SRC}" "${NGINX_DST}"
-  echo "   Using nginx-azure.conf"
-else
-  echo "   nginx-azure.conf not found, using nginx.conf"
-  cp "${ROOT_DIR}/docker/nginx/nginx.conf" "${NGINX_DST}"
+# ─── Validate compose source exists ───
+if [ ! -f "${COMPOSE_SRC}" ]; then
+  echo "ERROR: Missing ${COMPOSE_SRC}"
+  exit 1
 fi
 
-# ─── Resolve Azure hostname for monitoring URLs ───
+# ─── Resolve Azure hostname ───
 echo "==> Resolving Azure App Service hostname"
 AZURE_HOSTNAME=$(az webapp show \
   --name "${AZURE_WEBAPP_NAME}" \
@@ -72,40 +66,50 @@ AZURE_HOSTNAME=$(az webapp show \
   -o tsv 2>/dev/null || echo "")
 
 if [ -z "${AZURE_HOSTNAME}" ]; then
-  echo "ERROR: Could not resolve Azure hostname. Exiting."
+  echo "ERROR: Could not resolve Azure hostname."
   exit 1
 fi
 
-echo "   Azure Hostname      : ${AZURE_HOSTNAME}"
+APP_URL="https://${AZURE_HOSTNAME}"
 PROM_URL="https://${AZURE_HOSTNAME}/prometheus/"
 GF_DOMAIN="${AZURE_HOSTNAME}"
 GF_ROOT_URL="https://${AZURE_HOSTNAME}/grafana/"
-APP_URL="https://${AZURE_HOSTNAME}"
 
-echo "   PROMETHEUS_URL      : ${PROM_URL}"
-echo "   GF_SERVER_DOMAIN    : ${GF_DOMAIN}"
-echo "   GF_SERVER_ROOT_URL  : ${GF_ROOT_URL}"
+echo "   Hostname           : ${AZURE_HOSTNAME}"
+echo "   App URL            : ${APP_URL}"
+echo "   PROMETHEUS_URL     : ${PROM_URL}"
+echo "   GF_SERVER_DOMAIN   : ${GF_DOMAIN}"
+echo "   GF_SERVER_ROOT_URL : ${GF_ROOT_URL}"
 
-# ─── Copy compose file to tmp and replace all placeholders ───
-echo "==> Copying compose file to /tmp and replacing placeholders"
+# ─── Copy and replace ALL placeholders including secrets ───
+echo "==> Preparing docker-compose.azure.yml"
 cp "${COMPOSE_SRC}" "${COMPOSE_TMP}"
 
+# Replace image placeholders
 sed -i \
   -e "s|__APP_IMAGE__|${APP_IMAGE}|g" \
   -e "s|__NGINX_IMAGE__|${NGINX_IMAGE}|g" \
   -e "s|__PROMETHEUS_IMAGE__|${PROMETHEUS_IMAGE}|g" \
   -e "s|__GRAFANA_IMAGE__|${GRAFANA_IMAGE}|g" \
-  -e "s|__BUILD_NUMBER__|${GITHUB_SHA}|g" \
+  -e "s|__BUILD_NUMBER__|${IMAGE_TAG}|g" \
   -e "s|__ENVIRONMENT__|production|g" \
   -e "s|__GF_SERVER_DOMAIN__|${GF_DOMAIN}|g" \
   -e "s|__GF_SERVER_ROOT_URL__|${GF_ROOT_URL}|g" \
   -e "s|__PROMETHEUS_URL__|${PROM_URL}|g" \
+  -e "s|__MONITOR_TOKEN__|${MONITOR_TOKEN}|g" \
+  -e "s|__GRAFANA_ADMIN_PASSWORD__|${GRAFANA_ADMIN_PASSWORD}|g" \
+  "${COMPOSE_TMP}"
+
+# Also replace shell-style variable references if still present
+sed -i \
+  -e "s|\${MONITOR_TOKEN}|${MONITOR_TOKEN}|g" \
+  -e "s|\${GF_SECURITY_ADMIN_PASSWORD}|${GRAFANA_ADMIN_PASSWORD}|g" \
   "${COMPOSE_TMP}"
 
 # ─── Verify no placeholders remain ───
-echo "==> Verifying all placeholders replaced"
-UNRESOLVED=0
-for placeholder in \
+echo "==> Verifying all placeholders resolved"
+FAILED=0
+for marker in \
   "__APP_IMAGE__" \
   "__NGINX_IMAGE__" \
   "__PROMETHEUS_IMAGE__" \
@@ -115,80 +119,118 @@ for placeholder in \
   "__GF_SERVER_DOMAIN__" \
   "__GF_SERVER_ROOT_URL__" \
   "__PROMETHEUS_URL__" \
+  "__MONITOR_TOKEN__" \
+  "__GRAFANA_ADMIN_PASSWORD__" \
   "replace_with_"; do
-  if grep -q "${placeholder}" "${COMPOSE_TMP}" 2>/dev/null; then
-    echo "ERROR: Placeholder '${placeholder}' still exists in compose file!"
-    UNRESOLVED=1
+  if grep -q "${marker}" "${COMPOSE_TMP}" 2>/dev/null; then
+    echo "ERROR: Unresolved placeholder '${marker}'"
+    FAILED=1
   fi
 done
 
-if [ "${UNRESOLVED}" = "1" ]; then
-  echo "Unresolved placeholders found. Aborting."
+if [ "${FAILED}" = "1" ]; then
+  echo "Aborting due to unresolved placeholders."
+  cat "${COMPOSE_TMP}"
   exit 1
 fi
 echo "✅ All placeholders replaced successfully."
 
-# ─── Show final compose for debug ───
+echo ""
 echo "========== Images =========="
 grep "image:" "${COMPOSE_TMP}"
-
-echo "========== Monitoring URLs =========="
-grep -E "PROMETHEUS_URL|GRAFANA|GF_SERVER" "${COMPOSE_TMP}" || true
-
-echo "========== FINAL COMPOSE =========="
+echo ""
+echo "========== Final Compose =========="
 cat "${COMPOSE_TMP}"
+echo ""
 
 # ─── Configure Azure App Settings ───
-echo "==> Setting Azure App Service application settings"
+# NOTE: Values are passed explicitly — not relying on env vars
+echo "==> Setting Azure App Service app settings"
 az webapp config appsettings set \
   --name "${AZURE_WEBAPP_NAME}" \
   --resource-group "${AZURE_RESOURCE_GROUP}" \
   --settings \
-    WEBSITES_PORT=80 \
-    WEBSITES_CONTAINER_START_TIME_LIMIT=1800 \
-    DOCKER_REGISTRY_SERVER_URL=https://index.docker.io \
-    DOCKER_REGISTRY_SERVER_USERNAME="${DOCKERHUB_USERNAME}" \
-    DOCKER_REGISTRY_SERVER_PASSWORD="${DOCKERHUB_TOKEN}" \
-    BUILD_NUMBER="${GITHUB_SHA}" \
-    ENVIRONMENT=production \
-    MONITOR_TOKEN="${MONITOR_TOKEN}" \
-    GF_SECURITY_ADMIN_PASSWORD="${GRAFANA_ADMIN_PASSWORD}" \
-    GF_SERVER_DOMAIN="${GF_DOMAIN}" \
-    GF_SERVER_ROOT_URL="${GF_ROOT_URL}"
+    "WEBSITES_PORT=80" \
+    "WEBSITES_CONTAINER_START_TIME_LIMIT=1800" \
+    "DOCKER_REGISTRY_SERVER_URL=https://index.docker.io" \
+    "DOCKER_REGISTRY_SERVER_USERNAME=${DOCKERHUB_USERNAME}" \
+    "DOCKER_REGISTRY_SERVER_PASSWORD=${DOCKERHUB_TOKEN}" \
+    "BUILD_NUMBER=${IMAGE_TAG}" \
+    "ENVIRONMENT=production" \
+    "MONITOR_TOKEN=${MONITOR_TOKEN}" \
+    "GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD}" \
+    "GF_SERVER_DOMAIN=${GF_DOMAIN}" \
+    "GF_SERVER_ROOT_URL=${GF_ROOT_URL}" \
+  --output none
+
+echo "✅ App settings configured."
+
+# ─── Verify settings were applied ───
+echo "==> Verifying app settings applied"
+WEBSITES_PORT_CHECK=$(az webapp config appsettings list \
+  --name "${AZURE_WEBAPP_NAME}" \
+  --resource-group "${AZURE_RESOURCE_GROUP}" \
+  --query "[?name=='WEBSITES_PORT'].value" \
+  -o tsv 2>/dev/null || echo "")
+
+if [ -z "${WEBSITES_PORT_CHECK}" ]; then
+  echo "WARNING: WEBSITES_PORT setting not confirmed. Continuing anyway."
+else
+  echo "✅ WEBSITES_PORT confirmed = ${WEBSITES_PORT_CHECK}"
+fi
 
 # ─── Deploy to Azure App Service ───
-echo "==> Deploying to Azure App Service (${AZURE_WEBAPP_NAME})"
+echo "==> Deploying multi-container app to Azure App Service"
 az webapp config container set \
   --name "${AZURE_WEBAPP_NAME}" \
   --resource-group "${AZURE_RESOURCE_GROUP}" \
   --multicontainer-config-type COMPOSE \
-  --multicontainer-config-file "${COMPOSE_TMP}"
+  --multicontainer-config-file "${COMPOSE_TMP}" \
+  --output none
 
+echo "✅ Container config applied."
+
+# ─── Restart App Service ───
 echo "==> Restarting Azure App Service"
 az webapp restart \
   --name "${AZURE_WEBAPP_NAME}" \
   --resource-group "${AZURE_RESOURCE_GROUP}"
 
+echo "==> Waiting 30 seconds for containers to initialize..."
+sleep 30
+
 # ─── Health Check ───
-echo "==> Waiting for app to be healthy..."
+HEALTH_PATH="${APP_HEALTH_PATH:-/health}"
+echo "==> Waiting for app to become healthy at ${APP_URL}${HEALTH_PATH}"
 for attempt in $(seq 1 30); do
-  code=$(curl -ksS -o /dev/null -w '%{http_code}' "${APP_URL}/health" || true)
-  echo "Attempt ${attempt}/30: HTTP ${code}"
+  code=$(curl -ksS -o /dev/null -w '%{http_code}' \
+    --max-time 15 \
+    "${APP_URL}${HEALTH_PATH}" || true)
+  echo "  Attempt ${attempt}/30: HTTP ${code}"
   if [ "${code}" = "200" ]; then
     echo "✅ App is healthy!"
     break
   fi
   if [ "${attempt}" = "30" ]; then
-    echo "ERROR: App did not become healthy after 30 attempts."
+    echo "❌ App did not become healthy after 30 attempts."
+    echo ""
+    echo "==> Fetching Azure container logs for diagnosis..."
+    az webapp log tail \
+      --name "${AZURE_WEBAPP_NAME}" \
+      --resource-group "${AZURE_RESOURCE_GROUP}" \
+      --timeout 20 2>/dev/null || true
     exit 1
   fi
   sleep 10
 done
 
-echo "==> Done. ✅"
 echo ""
-echo "========== ACCESS URLs =========="
+echo "====================================================="
+echo " ✅ Azure Deployment Complete"
+echo "====================================================="
 echo "App:        ${APP_URL}"
+echo "Health:     ${APP_URL}${HEALTH_PATH}"
 echo "Prometheus: ${PROM_URL}"
 echo "Grafana:    ${GF_ROOT_URL}"
-echo "  Login:    admin / [your GRAFANA_ADMIN_PASSWORD]"
+echo "  Login:    admin / [GRAFANA_ADMIN_PASSWORD]"
+echo "====================================================="

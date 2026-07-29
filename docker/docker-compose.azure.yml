@@ -11,7 +11,7 @@ services:
       - BUILD_NUMBER=__BUILD_NUMBER__
       - ENVIRONMENT=__ENVIRONMENT__
       - METRICS_INTERVAL=5
-      - MONITOR_TOKEN=${MONITOR_TOKEN}
+      - MONITOR_TOKEN=__MONITOR_TOKEN__
       - PYTHONPATH=/app
     expose:
       - "5000"
@@ -29,6 +29,7 @@ services:
       - app
       - grafana
       - prometheus
+      - node-exporter
     networks:
       - app-network
 
@@ -37,6 +38,9 @@ services:
     restart: unless-stopped
     expose:
       - "9090"
+    depends_on:
+      - app
+      - node-exporter
     networks:
       - app-network
 
@@ -45,14 +49,32 @@ services:
     restart: unless-stopped
     environment:
       - GF_SECURITY_ADMIN_USER=admin
-      - GF_SECURITY_ADMIN_PASSWORD=${GF_SECURITY_ADMIN_PASSWORD}
+      - GF_SECURITY_ADMIN_PASSWORD=__GRAFANA_ADMIN_PASSWORD__
       - GF_USERS_ALLOW_SIGN_UP=false
       - GF_SERVER_DOMAIN=__GF_SERVER_DOMAIN__
       - GF_SERVER_ROOT_URL=__GF_SERVER_ROOT_URL__
+      - GF_SERVER_SUB_PATH=/grafana/
       - GF_SERVER_SERVE_FROM_SUB_PATH=true
       - PROMETHEUS_URL=__PROMETHEUS_URL__
     expose:
       - "3000"
+    depends_on:
+      - prometheus
+    networks:
+      - app-network
+
+  node-exporter:
+    image: prom/node-exporter:v1.8.0
+    restart: unless-stopped
+    expose:
+      - "9100"
+    command:
+      - "--path.procfs=/host/proc"
+      - "--path.sysfs=/host/sys"
+      - "--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc|rootfs)($$|/)"
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
     networks:
       - app-network
 
