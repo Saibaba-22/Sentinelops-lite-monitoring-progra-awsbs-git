@@ -15,6 +15,34 @@ if [ -z "${MONITOR_TOKEN}" ]; then
   exit 1
 fi
 
+# ─── Validate all critical secrets are non-empty ───
+echo "==> Validating secrets are present"
+SECRETS_FAILED=0
+
+if [ -z "${DOCKERHUB_TOKEN}" ]; then
+  echo "ERROR: DOCKERHUB_TOKEN is empty"
+  SECRETS_FAILED=1
+fi
+if [ -z "${GRAFANA_ADMIN_PASSWORD}" ]; then
+  echo "ERROR: GRAFANA_ADMIN_PASSWORD is empty"
+  SECRETS_FAILED=1
+fi
+if [ -z "${MONITOR_TOKEN}" ]; then
+  echo "ERROR: MONITOR_TOKEN is empty"
+  SECRETS_FAILED=1
+fi
+
+# Show lengths only (not values) for security
+echo "   DOCKERHUB_TOKEN length     : ${#DOCKERHUB_TOKEN}"
+echo "   GRAFANA_ADMIN_PASSWORD length : ${#GRAFANA_ADMIN_PASSWORD}"
+echo "   MONITOR_TOKEN length       : ${#MONITOR_TOKEN}"
+
+if [ "${SECRETS_FAILED}" = "1" ]; then
+  echo "ERROR: One or more required secrets are empty. Aborting."
+  exit 1
+fi
+echo "✅ All secrets are present."
+
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 COMPOSE_SRC="${ROOT_DIR}/docker/docker-compose.azure.yml"
 COMPOSE_TMP="/tmp/docker-compose.azure.yml"
@@ -40,6 +68,7 @@ if [ ! -f "${COMPOSE_SRC}" ]; then
   exit 1
 fi
 
+# ─── Resolve Azure hostname ───
 echo "==> Resolving Azure App Service hostname"
 AZURE_HOSTNAME=$(az webapp show \
   --name "${AZURE_WEBAPP_NAME}" \
@@ -61,6 +90,7 @@ echo "   App URL            : ${APP_URL}"
 echo "   GF_SERVER_DOMAIN   : ${GF_DOMAIN}"
 echo "   GF_SERVER_ROOT_URL : ${GF_ROOT_URL}"
 
+# ─── Replace placeholders ───
 echo "==> Preparing docker-compose.azure.yml"
 cp "${COMPOSE_SRC}" "${COMPOSE_TMP}"
 
@@ -82,6 +112,7 @@ sed -i \
   -e "s|\${GF_SECURITY_ADMIN_PASSWORD}|${GRAFANA_ADMIN_PASSWORD}|g" \
   "${COMPOSE_TMP}"
 
+# ─── Verify no placeholders remain ───
 echo "==> Verifying all placeholders resolved"
 FAILED=0
 for marker in "__APP_IMAGE__" "__NGINX_IMAGE__" "__PROMETHEUS_IMAGE__" "__GRAFANA_IMAGE__" \
@@ -92,18 +123,17 @@ for marker in "__APP_IMAGE__" "__NGINX_IMAGE__" "__PROMETHEUS_IMAGE__" "__GRAFAN
     FAILED=1
   fi
 done
-
 if [ "${FAILED}" = "1" ]; then
   cat "${COMPOSE_TMP}"
   exit 1
 fi
-
 echo "✅ All placeholders replaced."
 
 echo "========== Final Compose =========="
 cat "${COMPOSE_TMP}"
 echo ""
 
+# ─── Configure Azure App Settings ───
 echo "==> Setting Azure App Service app settings"
 az webapp config appsettings set \
   --name "${AZURE_WEBAPP_NAME}" \
@@ -125,6 +155,30 @@ az webapp config appsettings set \
 
 echo "✅ App settings configured."
 
+# ─── Verify DOCKER_REGISTRY_SERVER_PASSWORD was saved ───
+echo "==> Verifying Docker registry password was saved"
+SAVED_PWD=$(az webapp config appsettings list \
+  --name "${AZURE_WEBAPP_NAME}" \
+  --resource-group "${AZURE_RESOURCE_GROUP}" \
+  --query "[?name=='DOCKER_REGISTRY_SERVER_PASSWORD'].value | [0]" \
+  -o tsv 2>/dev/null || echo "")
+
+if [ -z "${SAVED_PWD}" ]; then
+  echo "WARNING: DOCKER_REGISTRY_SERVER_PASSWORD appears empty in Azure."
+  echo "         Trying alternate method to set registry credentials..."
+  az webapp config container set \
+    --name "${AZURE_WEBAPP_NAME}" \
+    --resource-group "${AZURE_RESOURCE_GROUP}" \
+    --docker-registry-server-url "https://index.docker.io" \
+    --docker-registry-server-user "${DOCKERHUB_USERNAME}" \
+    --docker-registry-server-password "${DOCKERHUB_TOKEN}" \
+    --output none
+  echo "✅ Registry credentials set via container config."
+else
+  echo "✅ DOCKER_REGISTRY_SERVER_PASSWORD is saved in Azure."
+fi
+
+# ─── Deploy Compose ───
 echo "==> Deploying to Azure App Service"
 az webapp config container set \
   --name "${AZURE_WEBAPP_NAME}" \
@@ -138,13 +192,15 @@ az webapp restart \
   --name "${AZURE_WEBAPP_NAME}" \
   --resource-group "${AZURE_RESOURCE_GROUP}"
 
-echo "==> Waiting 60 seconds for containers to start..."
-sleep 60
+echo "==> Waiting 90 seconds for containers to start and pull images..."
+sleep 90
 
+# ─── Health Check ───
 HEALTH_PATH="${APP_HEALTH_PATH:-/health}"
 echo "==> Health check: ${APP_URL}${HEALTH_PATH}"
 for attempt in $(seq 1 30); do
-  code=$(curl -ksS -o /dev/null -w '%{http_code}' --max-time 15 "${APP_URL}${HEALTH_PATH}" || true)
+  code=$(curl -ksS -o /dev/null -w '%{http_code}' \
+    --max-time 20 "${APP_URL}${HEALTH_PATH}" || true)
   echo "  Attempt ${attempt}/30: HTTP ${code}"
   if [ "${code}" = "200" ]; then
     echo "✅ App is healthy!"
@@ -152,6 +208,12 @@ for attempt in $(seq 1 30); do
   fi
   if [ "${attempt}" = "30" ]; then
     echo "❌ App not healthy after 30 attempts."
+    echo ""
+    echo "==> Fetching recent Azure logs for diagnosis:"
+    az webapp log tail \
+      --name "${AZURE_WEBAPP_NAME}" \
+      --resource-group "${AZURE_RESOURCE_GROUP}" \
+      --timeout 30 2>/dev/null || true
     exit 1
   fi
   sleep 10
@@ -166,4 +228,5 @@ echo "Health:     ${APP_URL}/health"
 echo "Metrics:    ${APP_URL}/metrics"
 echo "Prometheus: ${APP_URL}/prometheus/"
 echo "Grafana:    ${APP_URL}/grafana/"
+echo "  Login:    admin / [GRAFANA_ADMIN_PASSWORD]"
 echo "====================================================="

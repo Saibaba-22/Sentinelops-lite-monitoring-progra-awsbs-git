@@ -41,7 +41,7 @@ services:
       - GF_SERVER_ROOT_URL=__GF_SERVER_ROOT_URL__
       - GF_SERVER_SUB_PATH=/grafana/
       - GF_SERVER_SERVE_FROM_SUB_PATH=true
-      - PROMETHEUS_URL=http://localhost:9090/prometheus/
+      - PROMETHEUS_URL=http://prometheus:9090/prometheus/
 
   node-exporter:
     image: prom/node-exporter:v1.8.0
