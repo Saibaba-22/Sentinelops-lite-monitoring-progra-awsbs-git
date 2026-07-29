@@ -620,9 +620,12 @@ jobs:
     steps:
       - name: Print job results
         run: |
-          echo "precheck: ${{ needs.precheck.result }}"
-          echo "build: ${{ needs.build.result }}"
+          echo "precheck:   ${{ needs.precheck.result }}"
+          echo "build:      ${{ needs.build.result }}"
           echo "aws deploy: ${{ needs.deploy_aws.result }}"
           echo "aws verify: ${{ needs.verify_aws.result }}"
-          if [ "${{ needs.precheck.result }}" != "success" ] || [ "${{ needs.build.result }}" != "success" ]; then exit 1; fi
-          if [ "${{ needs.deploy_aws.result }}" != "success" ]; then exit 1; fi
+          if [ "${{ needs.precheck.result }}" != "success" ] || \
+             [ "${{ needs.build.result }}" != "success" ] || \
+             [ "${{ needs.deploy_aws.result }}" != "success" ]; then
+            exit 1
+          fi

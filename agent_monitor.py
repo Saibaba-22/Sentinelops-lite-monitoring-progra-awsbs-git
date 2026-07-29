@@ -1,958 +1,1232 @@
-"""SentinelOps-Lite Flask application and modern AI-agent monitor."""
+#!/usr/bin/env python3
+"""
+AI Agent Scanner & Dashboard - REAL DATA VERSION
+Scans folders, detects agents, reads ACTUAL usage from log files & env.
+NO hardcoded or simulated values.
+"""
 
-from __future__ import annotations
-
-import html
-import json
 import os
+import re
+import json
+import ast
 import time
-from collections import defaultdict
-from datetime import datetime, timezone
-from typing import Any
+import hashlib
+import configparser
+from datetime import datetime
+from pathlib import Path
+from http.server import HTTPServer, SimpleHTTPRequestHandler
+from urllib.parse import urlparse, parse_qs
+import threading
+import webbrowser
 
-import requests
-from flask import Flask, Response, jsonify, redirect, request, url_for
-from werkzeug.exceptions import HTTPException
+# ============================================================
+# CONFIGURATION
+# ============================================================
+SCAN_ROOT = os.environ.get("SCAN_ROOT", ".")
+SERVER_PORT = 8787
 
-from monitoring import agent_state as agent_state_store
-from monitoring import collectors
-from monitoring.metrics import (
-    AGENT_DECISIONS,
-    AGENT_STATES,
-    APP_STATS,
-    CONTENT_TYPE_LATEST,
-    agent_api_calls_total,
-    agent_api_key_count,
-    agent_api_response_time_seconds,
-    agent_completion_tokens_total,
-    agent_execution_duration_seconds,
-    agent_execution_time_seconds,
-    agent_last_decision,
-    agent_last_run_timestamp_seconds,
-    agent_model_info,
-    agent_prompt_tokens_total,
-    agent_state,
-    agent_tasks_total,
-    agent_token_usage_total,
-    app_active_sessions,
-    app_active_users,
-    app_errors_total,
-    app_exceptions_total,
-    app_request_duration_seconds,
-    app_requests_total,
-    generate_latest,
-    http_status_codes_total,
-    start_metrics_updater,
-    update_metrics,
-)
-
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-application = Flask(
-    __name__,
-    template_folder=os.path.join(BASE_DIR, "templates"),
-)
-application.config.update(ACTIVE_SESSIONS=0, ACTIVE_USERS=0, JSON_SORT_KEYS=False)
-
-KNOWN_AGENTS = ("test_agent", "errors_agent", "final_agent")
-STAGE_AGENT_MAP = {
-    "pre_deploy": "test_agent",
-    "pre-deploy": "test_agent",
-    "deploy": "errors_agent",
-    "during_deploy": "errors_agent",
-    "during-deploy": "errors_agent",
-    "post_deploy": "final_agent",
-    "post-deploy": "final_agent",
+# ============================================================
+# AI PROVIDER PATTERNS
+# ============================================================
+AI_PATTERNS = {
+    "providers": {
+        "OpenAI": {
+            "imports": [
+                r"import\s+openai", r"from\s+openai",
+                r"OpenAI\s*\(", r"openai\.ChatCompletion",
+                r"openai\.api_key", r"OPENAI_API_KEY",
+                r"AsyncOpenAI\s*\(",
+            ],
+            "env_keys": ["OPENAI_API_KEY"],
+            "models": [
+                "gpt-4o", "gpt-4o-mini", "gpt-4-turbo",
+                "gpt-4", "gpt-3.5-turbo", "o1-preview",
+                "o1-mini", "dall-e-3", "dall-e-2",
+                "whisper-1", "tts-1",
+            ],
+        },
+        "Anthropic": {
+            "imports": [
+                r"import\s+anthropic", r"from\s+anthropic",
+                r"Anthropic\s*\(", r"ANTHROPIC_API_KEY",
+                r"AsyncAnthropic\s*\(",
+            ],
+            "env_keys": ["ANTHROPIC_API_KEY"],
+            "models": [
+                "claude-3-5-sonnet", "claude-3-5-haiku",
+                "claude-3-opus", "claude-3-sonnet", "claude-3-haiku",
+                "claude-2.1", "claude-2",
+            ],
+        },
+        "Google AI": {
+            "imports": [
+                r"import\s+google\.generativeai",
+                r"from\s+google\.generativeai",
+                r"genai\.GenerativeModel", r"GOOGLE_API_KEY",
+                r"import\s+vertexai", r"from\s+vertexai",
+            ],
+            "env_keys": ["GOOGLE_API_KEY", "GOOGLE_APPLICATION_CREDENTIALS"],
+            "models": [
+                "gemini-2.0-flash", "gemini-1.5-pro",
+                "gemini-1.5-flash", "gemini-pro", "gemini-ultra",
+            ],
+        },
+        "Hugging Face": {
+            "imports": [
+                r"from\s+transformers", r"import\s+transformers",
+                r"pipeline\s*\(", r"AutoModel",
+                r"from\s+huggingface_hub", r"HfApi",
+            ],
+            "env_keys": ["HUGGINGFACE_TOKEN", "HF_TOKEN"],
+            "models": [
+                "bert", "roberta", "distilbert", "t5",
+                "falcon", "mistral", "mixtral", "phi",
+                "stable-diffusion", "starcoder",
+            ],
+        },
+        "Cohere": {
+            "imports": [
+                r"import\s+cohere", r"from\s+cohere",
+                r"cohere\.Client", r"COHERE_API_KEY",
+            ],
+            "env_keys": ["COHERE_API_KEY"],
+            "models": [
+                "command-r-plus", "command-r", "command",
+                "command-light", "embed-english",
+            ],
+        },
+        "Mistral AI": {
+            "imports": [
+                r"from\s+mistralai", r"import\s+mistralai",
+                r"MistralClient", r"MISTRAL_API_KEY",
+                r"Mistral\s*\(",
+            ],
+            "env_keys": ["MISTRAL_API_KEY"],
+            "models": [
+                "mistral-large", "mistral-medium",
+                "mistral-small", "mistral-tiny",
+                "open-mistral-7b",
+            ],
+        },
+        "Groq": {
+            "imports": [
+                r"import\s+groq", r"from\s+groq",
+                r"Groq\s*\(", r"GROQ_API_KEY",
+            ],
+            "env_keys": ["GROQ_API_KEY"],
+            "models": ["llama", "mixtral", "gemma", "whisper"],
+        },
+        "Ollama": {
+            "imports": [
+                r"import\s+ollama", r"from\s+ollama",
+                r"ollama\.chat", r"ollama\.generate",
+                r"localhost:11434",
+            ],
+            "env_keys": [],
+            "models": [
+                "llama2", "llama3", "mistral",
+                "codellama", "phi", "gemma", "qwen",
+            ],
+        },
+        "LangChain": {
+            "imports": [
+                r"from\s+langchain", r"import\s+langchain",
+                r"LLMChain", r"AgentExecutor",
+                r"create_react_agent", r"ChatOpenAI",
+            ],
+            "env_keys": [],
+            "models": [],
+        },
+        "CrewAI": {
+            "imports": [
+                r"from\s+crewai", r"import\s+crewai",
+                r"Agent\s*\(.*role\s*=", r"Crew\s*\(",
+            ],
+            "env_keys": [],
+            "models": [],
+        },
+        "AutoGen": {
+            "imports": [
+                r"from\s+autogen", r"import\s+autogen",
+                r"AssistantAgent", r"UserProxyAgent",
+            ],
+            "env_keys": [],
+            "models": [],
+        },
+        "AWS Bedrock": {
+            "imports": [
+                r"bedrock-runtime", r"invoke_model",
+                r"BedrockRuntime",
+            ],
+            "env_keys": ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"],
+            "models": [
+                "amazon.titan", "anthropic.claude",
+                "ai21.j2", "cohere.command",
+            ],
+        },
+        "Azure OpenAI": {
+            "imports": [
+                r"AzureOpenAI\s*\(", r"azure_endpoint",
+                r"AZURE_OPENAI",
+            ],
+            "env_keys": ["AZURE_OPENAI_API_KEY", "AZURE_OPENAI_ENDPOINT"],
+            "models": ["gpt-4", "gpt-35-turbo"],
+        },
+    },
+    "agent_frameworks": {
+        "LangChain Agent": [
+            r"AgentExecutor", r"create_react_agent",
+            r"initialize_agent", r"AgentType",
+        ],
+        "CrewAI Agent": [
+            r"from\s+crewai\s+import\s+Agent",
+            r"Agent\s*\(.*role\s*=",
+        ],
+        "AutoGen Agent": [
+            r"AssistantAgent\s*\(", r"UserProxyAgent\s*\(",
+        ],
+        "Custom Agent": [
+            r"class\s+\w*[Aa]gent\w*\s*[\(:]",
+            r"def\s+agent_", r"async\s+def\s+agent_",
+        ],
+    },
+    "agent_areas": {
+        "Chatbot / Conversational": [
+            r"\bchat\b", r"\bconversation\b", r"\bchatbot\b",
+            r"\bassistant\b", r"\bdialogue\b",
+        ],
+        "Code Generation": [
+            r"\bcode[-_]?gen\b", r"\bcoding\b",
+            r"\bcode[-_]?review\b", r"\brefactor\b",
+        ],
+        "Data Analysis": [
+            r"\bpandas\b", r"\bdataframe\b",
+            r"\bcsv\b", r"\banalyz\b", r"\breport\b",
+        ],
+        "Web Scraping": [
+            r"\bscrape\b", r"\bcrawl\b",
+            r"\bbeautifulsoup\b", r"\bselenium\b",
+        ],
+        "Image Generation": [
+            r"\bdall[-_]?e\b", r"\bstable[-_]?diffusion\b",
+            r"\bimage[-_]?gen\b",
+        ],
+        "Text Processing / NLP": [
+            r"\bsummariz\b", r"\btranslat\b",
+            r"\bsentiment\b", r"\bnlp\b", r"\bembed\b",
+        ],
+        "Email / Communication": [
+            r"\bemail\b", r"\bsmtp\b",
+            r"\bsendgrid\b", r"\bslack\b",
+        ],
+        "Database / Knowledge": [
+            r"\bvector[-_]?store\b", r"\bchromadb\b",
+            r"\bpinecone\b", r"\bfaiss\b", r"\brag\b",
+        ],
+        "DevOps / Automation": [
+            r"\bdeploy\b", r"\bdocker\b",
+            r"\bkubernetes\b", r"\bci[-_]?cd\b",
+        ],
+        "Research / Search": [
+            r"\bsearch\b", r"\bresearch\b",
+            r"\bwikipedia\b", r"\bserp\b",
+        ],
+        "Finance / Trading": [
+            r"\btrading\b", r"\bstock\b",
+            r"\bcrypto\b", r"\bfinance\b",
+        ],
+    },
 }
 
-AI_RPM_LIMIT = int(os.getenv("AI_RPM_LIMIT", "15"))
-AI_TPM_LIMIT = int(os.getenv("AI_TPM_LIMIT", "250000"))
-AI_RPD_LIMIT = int(os.getenv("AI_RPD_LIMIT", "500"))
+# ============================================================
+# LOG FILE PATTERNS - Real log file detection
+# ============================================================
+LOG_PATTERNS = {
+    "openai_usage": [
+        # OpenAI API response log format
+        r'"usage":\s*\{[^}]*"prompt_tokens":\s*(\d+)[^}]*"completion_tokens":\s*(\d+)[^}]*"total_tokens":\s*(\d+)',
+        r'"total_tokens":\s*(\d+)',
+        r'prompt_tokens["\s:=]+(\d+)',
+        r'completion_tokens["\s:=]+(\d+)',
+    ],
+    "request_success": [
+        r'HTTP/\d\.\d"\s+200',
+        r'"status":\s*200',
+        r'"status":\s*"success"',
+        r'status_code=200',
+        r'✓|✅|SUCCESS|success',
+    ],
+    "request_failure": [
+        r'HTTP/\d\.\d"\s+[45]\d\d',
+        r'"status":\s*[45]\d\d',
+        r'Error|ERROR|error|Exception|FAILED|failed',
+        r'RateLimitError|APIError|AuthenticationError',
+        r'status_code=[45]\d\d',
+    ],
+    "rate_limit": [
+        r'rate.?limit|RateLimit|429',
+        r'Too Many Requests',
+        r'quota.?exceeded',
+    ],
+    "response_time": [
+        r'response.?time[:\s=]+(\d+\.?\d*)\s*(ms|s)',
+        r'elapsed[:\s=]+(\d+\.?\d*)',
+        r'duration[:\s=]+(\d+\.?\d*)',
+    ],
+}
 
-# ---------------------------------------------------------------------------
-# In-memory rate tracking for accurate RPM / TPM / RPD calculation.
-#
-# Prometheus increase() needs 2+ scrapes inside the window and breaks on
-# counter resets (app restarts).  By recording every POST locally we can
-# compute exact rates regardless of scrape cadence or restarts.
-# ---------------------------------------------------------------------------
-# Each entry: (epoch_seconds, requests_count, tokens_count)
-_rate_history: dict[str, list[tuple[float, int, int]]] = defaultdict(list)
-_RATE_HISTORY_MAX_AGE = 86400  # keep 24 h of data per agent
+# ============================================================
+# LOG FILE READER
+# ============================================================
+class LogFileReader:
+    """Reads and parses REAL log files to extract usage data."""
 
+    LOG_EXTENSIONS = {
+        ".log", ".txt", ".json", ".jsonl",
+        ".csv", ".out", ".err"
+    }
+    LOG_NAME_PATTERNS = [
+        "*.log", "*.logs", "log_*", "*_log*",
+        "usage*", "*usage*", "requests*",
+        "*request*", "*api*", "agent*.log",
+    ]
 
-def _record_rate(agent_name: str, req_count: int, token_count: int) -> None:
-    """Record a POST for in-memory rate calculation."""
-    now = time.time()
-    bucket = _rate_history[agent_name]
-    bucket.append((now, max(0, req_count), max(0, token_count)))
-    # prune old entries
-    cutoff = now - _RATE_HISTORY_MAX_AGE
-    _rate_history[agent_name] = [e for e in bucket if e[0] > cutoff]
+    def __init__(self, agent_script_path: str):
+        self.agent_path = agent_script_path
+        self.agent_dir = os.path.dirname(agent_script_path)
+        self.agent_name = os.path.splitext(
+            os.path.basename(agent_script_path)
+        )[0]
 
+    def find_log_files(self) -> list:
+        """Find log files associated with this agent."""
+        log_files = []
+        search_dirs = [
+            self.agent_dir,
+            os.path.join(self.agent_dir, "logs"),
+            os.path.join(self.agent_dir, "log"),
+            os.path.join(self.agent_dir, ".."),
+            os.path.join(self.agent_dir, "..", "logs"),
+        ]
 
-def _calc_rates(agent_name: str) -> dict[str, float]:
-    """Return {rpm, tpm, rph, rpd, tok_day} from in-memory history.
-    
-    Calculates average rates over sliding windows:
-    - RPM: average requests per minute over last 5 minutes
-    - TPM: average tokens per minute over last 5 minutes
-    - RPH: requests in last hour
-    - RPD: requests in last 24 hours
-    - tok_day: tokens in last 24 hours
-    """
-    now = time.time()
-    entries = _rate_history.get(agent_name, [])
-    
-    # RPM/TPM: average over last 5 minutes (300 seconds)
-    recent_5min = [(t, r, tok) for t, r, tok in entries if t > now - 300]
-    if recent_5min:
-        rpm = sum(r for _, r, _ in recent_5min) / 5.0  # average per minute
-        tpm = sum(tok for _, _, tok in recent_5min) / 5.0
-    else:
-        rpm = 0.0
-        tpm = 0.0
-    
-    # RPH: requests in last hour
-    rph = sum(r for t, r, _ in entries if t > now - 3600)
-    
-    # RPD: requests in last 24 hours
-    rpd = sum(r for t, r, _ in entries if t > now - 86400)
-    
-    # Tokens per day
-    tok_day = sum(tok for t, _, tok in entries if t > now - 86400)
-    
-    return {"rpm": rpm, "tpm": tpm, "rph": rph, "rpd": rpd, "tok_day": tok_day}
-
-
-def _prometheus_base_url() -> str:
-    return os.getenv(
-        "PROMETHEUS_URL", "http://prometheus:9090/prometheus"
-    ).rstrip("/")
-
-
-def _prom_query(query: str) -> list[dict[str, Any]]:
-    try:
-        response = requests.get(
-            f"{_prometheus_base_url()}/api/v1/query",
-            params={"query": query},
-            timeout=5,
-        )
-        response.raise_for_status()
-        body = response.json()
-        if body.get("status") != "success":
-            return []
-        return body.get("data", {}).get("result", []) or []
-    except (requests.RequestException, ValueError, TypeError):
-        return []
-
-
-def _prom_range(query: str) -> dict[str, list[float]]:
-    """Return six-hour agent series for the small SVG sparklines."""
-    end = time.time()
-    start = end - 6 * 60 * 60
-    try:
-        response = requests.get(
-            f"{_prometheus_base_url()}/api/v1/query_range",
-            params={
-                "query": query,
-                "start": start,
-                "end": end,
-                "step": 300,
-            },
-            timeout=6,
-        )
-        response.raise_for_status()
-        body = response.json()
-        results = body.get("data", {}).get("result", []) or []
-        output: dict[str, list[float]] = {}
-        for item in results:
-            name = item.get("metric", {}).get("agent_name")
-            if not name:
+        for search_dir in search_dirs:
+            if not os.path.isdir(search_dir):
                 continue
-            values = []
-            for pair in item.get("values", []):
-                try:
-                    values.append(float(pair[1]))
-                except (IndexError, TypeError, ValueError):
-                    values.append(0.0)
-            output[name] = values
-        return output
-    except (requests.RequestException, ValueError, TypeError):
-        return {}
-
-
-def _vector_by_agent(query: str) -> dict[str, float]:
-    values: dict[str, float] = {}
-    for item in _prom_query(query):
-        labels = item.get("metric", {})
-        name = labels.get("agent_name")
-        if not name:
-            continue
-        try:
-            values[name] = float(item.get("value", [0, 0])[1])
-        except (IndexError, TypeError, ValueError):
-            values[name] = 0.0
-    return values
-
-
-def _states_by_agent() -> dict[str, dict[str, str]]:
-    values: dict[str, dict[str, str]] = {}
-    for item in _prom_query("agent_state == 1"):
-        labels = item.get("metric", {})
-        name = labels.get("agent_name")
-        if name:
-            values[name] = {
-                "state": labels.get("state", "unknown"),
-                "stage": labels.get("stage", "—"),
-                "cloud": labels.get("cloud", "—"),
-            }
-    return values
-
-
-def _models_by_agent() -> dict[str, dict[str, str]]:
-    values: dict[str, dict[str, str]] = {}
-    for item in _prom_query("agent_model_info"):
-        labels = item.get("metric", {})
-        name = labels.get("agent_name")
-        if name:
-            values[name] = {
-                "provider": labels.get("provider", "—"),
-                "model": labels.get("model", "—"),
-                "stage": labels.get("stage", "—"),
-                "cloud": labels.get("cloud", "—"),
-            }
-    return values
-
-
-def _load_state() -> dict[str, Any]:
-    try:
-        path = os.getenv(
-            "AGENT_STATE_FILE", os.path.join(BASE_DIR, "logs", "agent_stats.json")
-        )
-        with open(path, encoding="utf-8") as handle:
-            value = json.load(handle)
-        return value if isinstance(value, dict) else {}
-    except (OSError, ValueError, TypeError):
-        return {}
-
-
-def _safe_number(value: Any, converter=float, default=0):
-    try:
-        return max(default, converter(value))
-    except (TypeError, ValueError):
-        return default
-
-
-def _agent_snapshot() -> tuple[list[dict[str, Any]], bool]:
-    persisted = _load_state().get("agents", {})
-    if not isinstance(persisted, dict):
-        persisted = {}
-
-    total_tokens = _vector_by_agent(
-        "sum by (agent_name) (agent_token_usage_total)"
-    )
-    prompt_tokens = _vector_by_agent(
-        "sum by (agent_name) (agent_prompt_tokens_total)"
-    )
-    completion_tokens = _vector_by_agent(
-        "sum by (agent_name) (agent_completion_tokens_total)"
-    )
-    total_requests = _vector_by_agent(
-        "sum by (agent_name) (agent_api_calls_total)"
-    )
-    # Prometheus-based rates (may be 0 after restarts or with sparse scrapes)
-    prom_requests_minute = _vector_by_agent(
-        "sum by (agent_name) (increase(agent_api_calls_total[1m]))"
-    )
-    prom_tokens_minute = _vector_by_agent(
-        "sum by (agent_name) (increase(agent_token_usage_total[1m]))"
-    )
-    prom_requests_hour = _vector_by_agent(
-        "sum by (agent_name) (increase(agent_api_calls_total[1h]))"
-    )
-    prom_requests_day = _vector_by_agent(
-        "sum by (agent_name) (increase(agent_api_calls_total[24h]))"
-    )
-    prom_tokens_day = _vector_by_agent(
-        "sum by (agent_name) (increase(agent_token_usage_total[24h]))"
-    )
-    last_runs = _vector_by_agent(
-        "max by (agent_name) (agent_last_run_timestamp_seconds)"
-    )
-    states = _states_by_agent()
-    models = _models_by_agent()
-    history = _prom_range(
-        "sum by (agent_name) (rate(agent_api_calls_total[5m])) * 60"
-    )
-
-    discovered = set(KNOWN_AGENTS)
-    discovered.update(persisted.keys())
-    discovered.update(total_tokens.keys())
-    discovered.update(total_requests.keys())
-    discovered.update(states.keys())
-
-    agents = []
-    for name in sorted(discovered):
-        saved = persisted.get(name, {})
-        if not isinstance(saved, dict):
-            saved = {}
-        model = models.get(name, {})
-        state_info = states.get(name, {})
-        has_prometheus_data = bool(
-            name in states or name in total_tokens or name in total_requests
-        )
-        last_run: Any = last_runs.get(name, 0)
-        if not last_run:
-            last_run = saved.get("last_run")
-
-        total_request_value = round(
-            total_requests.get(name, saved.get("requests", 0))
-        )
-        total_token_value = round(
-            total_tokens.get(name, saved.get("total_tokens", 0))
-        )
-
-        # ------------------------------------------------------------------
-        # Rate calculation: prefer in-memory rates (accurate, restart-safe),
-        # fall back to Prometheus increase(), then to persisted estimates.
-        # ------------------------------------------------------------------
-        mem_rates = _calc_rates(name)
-
-        # Compute last_run epoch for fallback estimation
-        last_epoch = _safe_number(saved.get("last_run_epoch", 0), float)
-        if not last_epoch:
-            # Try Prometheus timestamp
-            prom_epoch = last_runs.get(name, 0)
-            if prom_epoch:
-                last_epoch = float(prom_epoch)
-        if not last_epoch and isinstance(last_run, str) and last_run:
             try:
-                last_epoch = datetime.strptime(
-                    last_run, "%Y-%m-%dT%H:%M:%SZ"
-                ).replace(tzinfo=timezone.utc).timestamp()
-            except ValueError:
-                last_epoch = 0
-        age = max(0, time.time() - last_epoch) if last_epoch else 0
+                for fname in os.listdir(search_dir):
+                    fpath = os.path.join(search_dir, fname)
+                    if not os.path.isfile(fpath):
+                        continue
+                    ext = os.path.splitext(fname)[1].lower()
+                    if ext not in self.LOG_EXTENSIONS:
+                        continue
+                    # Check if log file relates to this agent
+                    name_lower = fname.lower()
+                    agent_lower = self.agent_name.lower()
+                    if (
+                        agent_lower in name_lower or
+                        "log" in name_lower or
+                        "usage" in name_lower or
+                        "request" in name_lower or
+                        "api" in name_lower
+                    ):
+                        log_files.append(fpath)
+            except PermissionError:
+                continue
 
-        # --- RPM (requests per minute) ---
-        # Priority: persisted observed rate > in-memory > prometheus > estimate
-        if saved.get("observed_rpm", 0) > 0 and 0 < age <= 86400:
-            # Use last observed rate (persisted across restarts, stable display)
-            minute_value = int(saved["observed_rpm"])
-        elif mem_rates["rpm"] >= 0.5:
-            minute_value = round(mem_rates["rpm"])
-        elif round(prom_requests_minute.get(name, 0)) > 0:
-            minute_value = round(prom_requests_minute.get(name, 0))
-        elif total_request_value > 0 and 0 < age <= 300:
-            # Agent ran very recently: use its request count as the RPM
-            minute_value = max(1, total_request_value)
+        return list(set(log_files))
+
+    def parse_logs(self) -> dict:
+        """Parse all found log files and extract real usage data."""
+        log_files = self.find_log_files()
+
+        result = {
+            "log_files_found": log_files,
+            "total_requests": 0,
+            "successful_requests": 0,
+            "failed_requests": 0,
+            "tokens_used": 0,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "failure_reasons": {},
+            "response_times_ms": [],
+            "avg_response_time_ms": None,
+            "last_request_time": None,
+            "data_source": "none",
+        }
+
+        if not log_files:
+            result["data_source"] = "no_logs_found"
+            return result
+
+        result["data_source"] = "log_files"
+
+        for log_file in log_files:
+            self._parse_single_log(log_file, result)
+
+        # Calculate averages
+        if result["response_times_ms"]:
+            result["avg_response_time_ms"] = round(
+                sum(result["response_times_ms"]) / len(result["response_times_ms"]), 2
+            )
+
+        # Ensure consistency
+        if result["total_requests"] == 0:
+            total = result["successful_requests"] + result["failed_requests"]
+            result["total_requests"] = total
+        elif result["successful_requests"] == 0 and result["failed_requests"] == 0:
+            result["failed_requests"] = 0
+            result["successful_requests"] = result["total_requests"]
+
+        return result
+
+    def _parse_single_log(self, log_path: str, result: dict):
+        """Parse a single log file."""
+        try:
+            file_size = os.path.getsize(log_path)
+            if file_size > 50 * 1024 * 1024:  # Skip files > 50MB
+                return
+            if file_size == 0:
+                return
+
+            with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read()
+
+            # Try JSON/JSONL first
+            if log_path.endswith(".jsonl"):
+                self._parse_jsonl(content, result)
+            elif log_path.endswith(".json"):
+                self._parse_json_log(content, result)
+            else:
+                self._parse_text_log(content, result)
+
+            # Extract last timestamp
+            ts_patterns = [
+                r'(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2})',
+                r'(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2})',
+            ]
+            for pat in ts_patterns:
+                matches = re.findall(pat, content)
+                if matches:
+                    result["last_request_time"] = matches[-1]
+                    break
+
+        except Exception:
+            pass
+
+    def _parse_jsonl(self, content: str, result: dict):
+        """Parse JSONL format logs (one JSON per line)."""
+        for line in content.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+                self._extract_from_json_entry(entry, result)
+            except json.JSONDecodeError:
+                pass
+
+    def _parse_json_log(self, content: str, result: dict):
+        """Parse JSON format logs."""
+        try:
+            data = json.loads(content)
+            if isinstance(data, list):
+                for entry in data:
+                    if isinstance(entry, dict):
+                        self._extract_from_json_entry(entry, result)
+            elif isinstance(data, dict):
+                self._extract_from_json_entry(data, result)
+                # Check for nested arrays like {"requests": [...]}
+                for key in ["requests", "events", "logs", "entries"]:
+                    if key in data and isinstance(data[key], list):
+                        for entry in data[key]:
+                            self._extract_from_json_entry(entry, result)
+        except json.JSONDecodeError:
+            # Try parsing as text if JSON fails
+            self._parse_text_log(content, result)
+
+    def _extract_from_json_entry(self, entry: dict, result: dict):
+        """Extract usage data from a JSON entry."""
+        # Token counts
+        usage = entry.get("usage", {})
+        if isinstance(usage, dict):
+            pt = usage.get("prompt_tokens", 0) or 0
+            ct = usage.get("completion_tokens", 0) or 0
+            tt = usage.get("total_tokens", 0) or 0
+            result["prompt_tokens"] += pt
+            result["completion_tokens"] += ct
+            result["tokens_used"] += tt or (pt + ct)
+
+        # Direct token fields
+        for key in ["total_tokens", "tokens"]:
+            val = entry.get(key)
+            if isinstance(val, (int, float)) and val > 0:
+                result["tokens_used"] += int(val)
+
+        # Status
+        status = entry.get("status") or entry.get("status_code")
+        if status is not None:
+            if str(status) in ("200", "success", "ok", "OK", "Success"):
+                result["successful_requests"] += 1
+                result["total_requests"] += 1
+            elif str(status) in ("error", "failed", "fail") or (
+                isinstance(status, int) and status >= 400
+            ):
+                result["failed_requests"] += 1
+                result["total_requests"] += 1
+                error_msg = (
+                    entry.get("error") or
+                    entry.get("message") or
+                    entry.get("error_message") or
+                    f"HTTP {status}"
+                )
+                if error_msg:
+                    result["failure_reasons"][str(error_msg)] = (
+                        result["failure_reasons"].get(str(error_msg), 0) + 1
+                    )
+
+        # Response time
+        for rt_key in ["response_time", "duration", "elapsed", "latency"]:
+            val = entry.get(rt_key)
+            if isinstance(val, (int, float)) and val > 0:
+                # Convert seconds to ms if needed
+                rt = val * 1000 if val < 1000 else val
+                result["response_times_ms"].append(round(rt, 2))
+                break
+
+        # Error messages
+        error = entry.get("error") or entry.get("exception") or entry.get("err")
+        if error and isinstance(error, str):
+            result["failure_reasons"][error] = (
+                result["failure_reasons"].get(error, 0) + 1
+            )
+
+    def _parse_text_log(self, content: str, result: dict):
+        """Parse plain text log files."""
+        lines = content.splitlines()
+
+        for line in lines:
+            # Token extraction
+            token_match = re.search(
+                r'"total_tokens":\s*(\d+)', line
+            )
+            if token_match:
+                result["tokens_used"] += int(token_match.group(1))
+                continue
+
+            pt_match = re.search(r'prompt_tokens["\s:=]+(\d+)', line)
+            ct_match = re.search(r'completion_tokens["\s:=]+(\d+)', line)
+            if pt_match:
+                result["prompt_tokens"] += int(pt_match.group(1))
+            if ct_match:
+                result["completion_tokens"] += int(ct_match.group(1))
+            if pt_match or ct_match:
+                pt = int(pt_match.group(1)) if pt_match else 0
+                ct = int(ct_match.group(1)) if ct_match else 0
+                result["tokens_used"] += pt + ct
+
+            # Success patterns
+            success = False
+            for pat in LOG_PATTERNS["request_success"]:
+                if re.search(pat, line, re.IGNORECASE):
+                    success = True
+                    break
+            if success:
+                result["successful_requests"] += 1
+                result["total_requests"] += 1
+                continue
+
+            # Failure patterns
+            for pat in LOG_PATTERNS["request_failure"]:
+                if re.search(pat, line, re.IGNORECASE):
+                    result["failed_requests"] += 1
+                    result["total_requests"] += 1
+                    # Extract reason
+                    reason_match = re.search(
+                        r'(Error|Exception|FAILED)[:\s]+([^\n]{5,80})',
+                        line, re.IGNORECASE
+                    )
+                    if reason_match:
+                        reason = reason_match.group(2).strip()
+                        result["failure_reasons"][reason] = (
+                            result["failure_reasons"].get(reason, 0) + 1
+                        )
+                    # Check for rate limit
+                    for rl_pat in LOG_PATTERNS["rate_limit"]:
+                        if re.search(rl_pat, line, re.IGNORECASE):
+                            result["failure_reasons"]["Rate Limit (429)"] = (
+                                result["failure_reasons"].get("Rate Limit (429)", 0) + 1
+                            )
+                    break
+
+            # Response time
+            rt_match = re.search(
+                r'(?:response.time|elapsed|duration|latency)[:\s=]+(\d+\.?\d*)\s*(ms|s)?',
+                line, re.IGNORECASE
+            )
+            if rt_match:
+                val = float(rt_match.group(1))
+                unit = rt_match.group(2) or "ms"
+                rt_ms = val * 1000 if unit.lower() == "s" else val
+                result["response_times_ms"].append(round(rt_ms, 2))
+
+
+# ============================================================
+# ENV & CONFIG READER
+# ============================================================
+class EnvConfigReader:
+    """Reads real environment and config files for API settings."""
+
+    def __init__(self, script_path: str, providers: list):
+        self.script_path = script_path
+        self.script_dir = os.path.dirname(script_path)
+        self.providers = providers
+
+    def read_api_keys_present(self) -> dict:
+        """Check which API keys are actually set (not their values)."""
+        found_keys = {}
+        env_files = self._find_env_files()
+        env_vars = self._load_all_env_vars(env_files)
+
+        for provider in self.providers:
+            info = AI_PATTERNS["providers"].get(provider, {})
+            env_key_names = info.get("env_keys", [])
+            for key_name in env_key_names:
+                val = env_vars.get(key_name, "")
+                if val and val not in ("your_key_here", "YOUR_KEY", "sk-xxx", ""):
+                    found_keys[key_name] = True  # Only store presence, NOT value
+                else:
+                    found_keys[key_name] = False
+        return found_keys
+
+    def _find_env_files(self) -> list:
+        """Find .env files near the script."""
+        candidates = []
+        search_dirs = [
+            self.script_dir,
+            os.path.join(self.script_dir, ".."),
+            os.path.join(self.script_dir, "..", ".."),
+            SCAN_ROOT,
+        ]
+        env_filenames = [".env", ".env.local", ".env.production", "config.env"]
+        for d in search_dirs:
+            for fname in env_filenames:
+                p = os.path.join(d, fname)
+                if os.path.isfile(p):
+                    candidates.append(p)
+        return list(set(candidates))
+
+    def _load_all_env_vars(self, env_files: list) -> dict:
+        """Load env vars from files + actual environment."""
+        env_vars = dict(os.environ)  # Start with real environment
+        for env_file in env_files:
+            try:
+                with open(env_file, "r", errors="ignore") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line and not line.startswith("#") and "=" in line:
+                            key, _, val = line.partition("=")
+                            env_vars[key.strip()] = val.strip().strip('"').strip("'")
+            except Exception:
+                pass
+        return env_vars
+
+    def read_config_files(self) -> dict:
+        """Read config.json, config.yaml, settings.py for agent settings."""
+        config = {}
+        config_filenames = [
+            "config.json", "settings.json", "config.yaml",
+            "config.yml", "settings.yaml", "agent_config.json",
+        ]
+        for d in [self.script_dir, os.path.join(self.script_dir, "..")]:
+            for fname in config_filenames:
+                fpath = os.path.join(d, fname)
+                if os.path.isfile(fpath):
+                    try:
+                        with open(fpath, "r") as f:
+                            data = json.load(f)
+                        config.update(data)
+                    except Exception:
+                        pass
+        return config
+
+
+# ============================================================
+# SOURCE CODE ANALYZER
+# ============================================================
+class SourceCodeAnalyzer:
+    """Analyzes Python/JS source files to extract real info."""
+
+    def __init__(self, filepath: str, content: str):
+        self.filepath = filepath
+        self.content = content
+        self.ext = os.path.splitext(filepath)[1].lower()
+
+    def extract_description(self) -> str:
+        """Extract real docstring or file comments."""
+        # Module-level docstring (Python)
+        docstring_match = re.search(
+            r'^"""(.*?)"""', self.content, re.DOTALL
+        )
+        if docstring_match:
+            desc = docstring_match.group(1).strip()
+            # Take first 3 non-empty lines
+            lines = [l.strip() for l in desc.split("\n") if l.strip()]
+            return " ".join(lines[:3])[:250]
+
+        docstring_match = re.search(
+            r"^'''(.*?)'''", self.content, re.DOTALL
+        )
+        if docstring_match:
+            desc = docstring_match.group(1).strip()
+            lines = [l.strip() for l in desc.split("\n") if l.strip()]
+            return " ".join(lines[:3])[:250]
+
+        # File-level comments
+        lines = self.content.split("\n")[:15]
+        comments = []
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith(("//", "#")) and not stripped.startswith("#!"):
+                comment = re.sub(r'^[/#\s]+', '', stripped).strip()
+                if len(comment) > 8:
+                    comments.append(comment)
+        if comments:
+            return " | ".join(comments[:2])[:250]
+
+        # Fallback: filename-based
+        name = os.path.splitext(os.path.basename(self.filepath))[0]
+        return name.replace("_", " ").replace("-", " ").title()
+
+    def detect_providers(self) -> list:
+        """Detect AI providers from imports and usage."""
+        found = []
+        for provider, info in AI_PATTERNS["providers"].items():
+            for pattern in info["imports"]:
+                if re.search(pattern, self.content, re.IGNORECASE):
+                    found.append(provider)
+                    break
+        return found
+
+    def detect_models(self) -> list:
+        """Detect AI model names from source code."""
+        found = []
+        for provider, info in AI_PATTERNS["providers"].items():
+            for model in info.get("models", []):
+                pattern = re.escape(model)
+                if re.search(pattern, self.content, re.IGNORECASE):
+                    if model not in found:
+                        found.append(model)
+
+        # Also search for quoted model strings
+        model_quotes = re.findall(
+            r'''(?:model\s*=\s*|"model"\s*:\s*)['"]([\w.:\-/]+)['"]''',
+            self.content
+        )
+        for m in model_quotes:
+            if len(m) > 3 and m not in found:
+                found.append(m)
+
+        return found
+
+    def detect_frameworks(self) -> list:
+        """Detect AI frameworks."""
+        found = []
+        for fw, patterns in AI_PATTERNS["agent_frameworks"].items():
+            for pat in patterns:
+                if re.search(pat, self.content, re.IGNORECASE):
+                    found.append(fw)
+                    break
+        return found
+
+    def detect_areas(self) -> list:
+        """Detect working areas from code content."""
+        found = []
+        for area, patterns in AI_PATTERNS["agent_areas"].items():
+            matches = sum(
+                1 for p in patterns
+                if re.search(p, self.content, re.IGNORECASE)
+            )
+            if matches >= 2:
+                found.append(area)
+        return found
+
+    def extract_inline_usage(self) -> dict:
+        """
+        Extract usage data written directly in source code,
+        e.g., comments or logging statements like:
+        # tokens_used = 1500
+        # requests_made = 200
+        """
+        usage = {}
+        patterns_inline = {
+            "tokens_used": r'#\s*tokens_used\s*[=:]\s*(\d+)',
+            "total_requests": r'#\s*(?:total_)?requests\s*[=:]\s*(\d+)',
+            "failed_requests": r'#\s*failed\s*[=:]\s*(\d+)',
+            "rpm": r'#\s*rpm\s*[=:]\s*(\d+)',
+            "tpm": r'#\s*tpm\s*[=:]\s*(\d+)',
+        }
+        for key, pat in patterns_inline.items():
+            m = re.search(pat, self.content, re.IGNORECASE)
+            if m:
+                usage[key] = int(m.group(1))
+        return usage
+
+    def count_api_calls(self) -> int:
+        """Count approximate number of API call sites in source."""
+        api_call_patterns = [
+            r'\.create\s*\(',
+            r'\.generate\s*\(',
+            r'\.chat\s*\(',
+            r'\.complete\s*\(',
+            r'\.messages\.create\s*\(',
+            r'ollama\.generate\s*\(',
+            r'ollama\.chat\s*\(',
+            r'client\.chat\.completions\.create\s*\(',
+        ]
+        count = 0
+        for pat in api_call_patterns:
+            count += len(re.findall(pat, self.content))
+        return count
+
+
+# ============================================================
+# MAIN SCANNER
+# ============================================================
+class AIAgentScanner:
+    """
+    Scans directories recursively to detect AI agents.
+    Uses ONLY real data from source code, log files, and env vars.
+    """
+
+    SUPPORTED_EXTENSIONS = {".py", ".js", ".ts", ".jsx", ".tsx", ".mjs"}
+    SKIP_DIRS = {
+        "__pycache__", "node_modules", ".git", "venv",
+        "env", ".venv", "dist", "build", ".next", ".nuxt",
+    }
+
+    def __init__(self, root_path: str):
+        self.root_path = os.path.abspath(root_path)
+        self.agents = []
+        self.folder_tree = {}
+        self.scan_stats = {
+            "total_files_scanned": 0,
+            "total_folders_scanned": 0,
+            "total_agents_found": 0,
+            "scan_start": None,
+            "scan_end": None,
+            "scan_duration_ms": 0,
+            "root_path": self.root_path,
+        }
+
+    def scan(self) -> dict:
+        """Run the full scan."""
+        self.scan_stats["scan_start"] = datetime.now().isoformat()
+        t0 = time.time()
+
+        self.folder_tree = self._build_tree(self.root_path)
+        self._scan_dir(self.root_path)
+
+        elapsed = (time.time() - t0) * 1000
+        self.scan_stats["scan_end"] = datetime.now().isoformat()
+        self.scan_stats["scan_duration_ms"] = round(elapsed, 2)
+        self.scan_stats["total_agents_found"] = len(self.agents)
+
+        projects = self._group_into_projects()
+
+        return {
+            "scan_root": self.root_path,
+            "scan_stats": self.scan_stats,
+            "folder_tree": self.folder_tree,
+            "agents": self.agents,
+            "projects": projects,
+            "summary": self._build_summary(projects),
+        }
+
+    # ----------------------------------------------------------
+    # Folder tree
+    # ----------------------------------------------------------
+    def _build_tree(self, path: str, depth: int = 0) -> dict:
+        node = {
+            "name": os.path.basename(path) or path,
+            "path": path,
+            "type": "folder",
+            "depth": depth,
+            "children": [],
+            "agent_count": 0,
+        }
+        self.scan_stats["total_folders_scanned"] += 1
+        try:
+            entries = sorted(os.listdir(path))
+        except PermissionError:
+            return node
+
+        for entry in entries:
+            full = os.path.join(path, entry)
+            if os.path.isdir(full):
+                if entry.startswith(".") or entry in self.SKIP_DIRS:
+                    continue
+                node["children"].append(self._build_tree(full, depth + 1))
+            elif os.path.isfile(full):
+                ext = os.path.splitext(entry)[1].lower()
+                if ext in self.SUPPORTED_EXTENSIONS:
+                    node["children"].append({
+                        "name": entry, "path": full,
+                        "type": "file", "depth": depth + 1,
+                    })
+        return node
+
+    def _mark_agent_in_tree(self, tree: dict, filepath: str):
+        """Mark files that are agents in the tree."""
+        if tree["type"] == "file" and tree["path"] == filepath:
+            tree["is_agent"] = True
+        elif tree["type"] == "folder":
+            if filepath.startswith(tree["path"]):
+                tree["agent_count"] += 1
+                for child in tree.get("children", []):
+                    self._mark_agent_in_tree(child, filepath)
+
+    # ----------------------------------------------------------
+    # Directory scan
+    # ----------------------------------------------------------
+    def _scan_dir(self, path: str):
+        try:
+            entries = os.listdir(path)
+        except PermissionError:
+            return
+        for entry in entries:
+            full = os.path.join(path, entry)
+            if os.path.isdir(full):
+                if entry.startswith(".") or entry in self.SKIP_DIRS:
+                    continue
+                self._scan_dir(full)
+            elif os.path.isfile(full):
+                ext = os.path.splitext(entry)[1].lower()
+                if ext in self.SUPPORTED_EXTENSIONS:
+                    self.scan_stats["total_files_scanned"] += 1
+                    self._analyze_file(full)
+
+    def _analyze_file(self, filepath: str):
+        """Analyze one file - extract REAL data only."""
+        try:
+            with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read()
+        except Exception:
+            return
+
+        if len(content.strip()) < 20:
+            return
+
+        analyzer = SourceCodeAnalyzer(filepath, content)
+        providers = analyzer.detect_providers()
+        frameworks = analyzer.detect_frameworks()
+
+        # Only process if AI-related
+        if not providers and not frameworks:
+            return
+
+        models = analyzer.detect_models()
+        areas = analyzer.detect_areas()
+        description = analyzer.extract_description()
+        api_call_count = analyzer.count_api_calls()
+        inline_usage = analyzer.extract_inline_usage()
+
+        # Read real log data
+        log_reader = LogFileReader(filepath)
+        log_data = log_reader.parse_logs()
+
+        # Read env/config
+        env_reader = EnvConfigReader(filepath, providers)
+        api_keys_present = env_reader.read_api_keys_present()
+        config_data = env_reader.read_config_files()
+
+        # Merge inline usage annotations if log has no data
+        if log_data["total_requests"] == 0 and inline_usage:
+            log_data.update(inline_usage)
+            log_data["data_source"] = "inline_annotations"
+
+        # Build usage stats - NO random values
+        usage = self._build_usage(log_data, providers, config_data)
+
+        agent_info = {
+            "id": hashlib.md5(filepath.encode()).hexdigest()[:12],
+            "script_name": os.path.basename(filepath),
+            "script_path": filepath,
+            "relative_path": os.path.relpath(filepath, self.root_path),
+            "folder": os.path.dirname(
+                os.path.relpath(filepath, self.root_path)
+            ),
+            "providers": providers if providers else [],
+            "models": models if models else ["Not specified in code"],
+            "frameworks": frameworks if frameworks else ["Direct API"],
+            "areas": areas if areas else ["General Purpose"],
+            "description": description,
+            "file_size_bytes": os.path.getsize(filepath),
+            "lines_of_code": content.count("\n") + 1,
+            "api_call_sites": api_call_count,
+            "last_modified": datetime.fromtimestamp(
+                os.path.getmtime(filepath)
+            ).isoformat(),
+            "api_keys_present": api_keys_present,
+            "config": config_data,
+            "usage": usage,
+        }
+
+        self.agents.append(agent_info)
+        self._mark_agent_in_tree(self.folder_tree, filepath)
+
+    def _build_usage(
+        self,
+        log_data: dict,
+        providers: list,
+        config_data: dict,
+    ) -> dict:
+        """
+        Build usage dict from REAL log data only.
+        Shows null/unknown for anything we couldn't find.
+        """
+        total = log_data.get("total_requests", 0)
+        success = log_data.get("successful_requests", 0)
+        failed = log_data.get("failed_requests", 0)
+        tokens = log_data.get("tokens_used", 0)
+
+        # Success rate
+        if total > 0:
+            success_rate = round((success / total) * 100, 1)
         else:
-            minute_value = 0
+            success_rate = None  # Unknown, not assumed
 
-        # --- TPM (tokens per minute) ---
-        if saved.get("observed_tpm", 0) > 0 and 0 < age <= 86400:
-            # Use last observed rate (persisted across restarts, stable display)
-            token_minute_value = int(saved["observed_tpm"])
-        elif mem_rates["tpm"] >= 0.5:
-            token_minute_value = round(mem_rates["tpm"])
-        elif round(prom_tokens_minute.get(name, 0)) > 0:
-            token_minute_value = round(prom_tokens_minute.get(name, 0))
-        elif total_token_value > 0 and 0 < age <= 300:
-            token_minute_value = max(1, total_token_value)
-        else:
-            token_minute_value = 0
-
-        # --- Requests per hour ---
-        if mem_rates["rph"] > 0:
-            hour_value = round(mem_rates["rph"])
-        elif round(prom_requests_hour.get(name, 0)) > 0:
-            hour_value = round(prom_requests_hour.get(name, 0))
-        elif total_request_value > 0 and 0 < age <= 3600:
-            hour_value = total_request_value
-        else:
-            hour_value = 0
-
-        # --- Requests per day ---
-        if mem_rates["rpd"] > 0:
-            day_value = round(mem_rates["rpd"])
-        elif round(prom_requests_day.get(name, 0)) > 0:
-            day_value = round(prom_requests_day.get(name, 0))
-        elif total_request_value > 0 and 0 < age <= 86400:
-            day_value = total_request_value
-        else:
-            day_value = 0
-
-        # --- Tokens per day ---
-        if mem_rates["tok_day"] > 0:
-            tokens_day_value = round(mem_rates["tok_day"])
-        elif round(prom_tokens_day.get(name, 0)) > 0:
-            tokens_day_value = round(prom_tokens_day.get(name, 0))
-        elif total_token_value > 0 and 0 < age <= 86400:
-            tokens_day_value = total_token_value
-        else:
-            tokens_day_value = 0
-
-        # Render the raw epoch (from Prometheus) as a human-readable timestamp.
-        if isinstance(last_run, (int, float)) and last_run:
-            last_run_display = datetime.fromtimestamp(
-                float(last_run), tz=timezone.utc
-            ).strftime("%Y-%m-%d %H:%M:%S UTC")
-        else:
-            last_run_display = last_run or None
-
-        reported = has_prometheus_data or bool(saved.get("last_run"))
-        agents.append(
-            {
-                "agent_name": name,
-                "status": state_info.get("state", saved.get("status", "not reported"))
-                if reported else "not reported",
-                "decision": saved.get("decision", "none"),
-                "stage": state_info.get("stage", model.get("stage", saved.get("stage", "—")))
-                if reported else "—",
-                "cloud": state_info.get("cloud", model.get("cloud", saved.get("cloud", "—")))
-                if reported else "—",
-                "provider": model.get("provider", saved.get("provider", "—"))
-                if reported else "—",
-                "model": model.get("model", saved.get("model", "—"))
-                if reported else "—",
-                "prompt_tokens": round(prompt_tokens.get(name, saved.get("prompt_tokens", 0))),
-                "completion_tokens": round(completion_tokens.get(name, saved.get("completion_tokens", 0))),
-                "total_tokens": total_token_value,
-                "requests_total": total_request_value,
-                "requests_minute": minute_value,
-                "tokens_minute": token_minute_value,
-                "requests_hour": hour_value,
-                "requests_day": day_value,
-                "tokens_day": tokens_day_value,
-                "rpm_limit": AI_RPM_LIMIT,
-                "tpm_limit": AI_TPM_LIMIT,
-                "rpd_limit": AI_RPD_LIMIT,
-                "last_run": last_run_display,
-                "has_prometheus_data": has_prometheus_data,
-                "demo": bool(saved.get("demo")),
-                "request_history": history.get(name, []),
-            }
+        # Rate limits: only from config or env
+        rpm = config_data.get("rpm") or config_data.get("rate_limit_rpm")
+        tpm = config_data.get("tpm") or config_data.get("rate_limit_tpm")
+        rpd = config_data.get("rpd") or config_data.get("rate_limit_rpd")
+        token_limit = (
+            config_data.get("token_limit") or
+            config_data.get("max_tokens_total")
         )
 
-    return agents, bool(_prom_query("up"))
+        tokens_pct = None
+        if tokens and token_limit:
+            tokens_pct = round((tokens / token_limit) * 100, 1)
+
+        return {
+            "data_source": log_data.get("data_source", "none"),
+            "log_files_found": log_data.get("log_files_found", []),
+            "total_requests": total if total > 0 else None,
+            "successful_requests": success if success > 0 else None,
+            "failed_requests": failed,
+            "success_rate": success_rate,
+            "tokens_used": tokens if tokens > 0 else None,
+            "prompt_tokens": log_data.get("prompt_tokens") or None,
+            "completion_tokens": log_data.get("completion_tokens") or None,
+            "tokens_available": token_limit,
+            "tokens_percentage": tokens_pct,
+            "rpm": rpm,
+            "tpm": tpm,
+            "rpd": rpd,
+            "rpm_used": None,  # Can't know without live monitoring
+            "tpm_used": None,
+            "rpd_used": None,
+            "failure_reasons": log_data.get("failure_reasons", {}),
+            "avg_response_time_ms": log_data.get("avg_response_time_ms"),
+            "last_request_time": log_data.get("last_request_time"),
+        }
+
+    # ----------------------------------------------------------
+    # Project grouping
+    # ----------------------------------------------------------
+    def _group_into_projects(self) -> list:
+        projects = {}
+        for agent in self.agents:
+            parts = agent["folder"].replace("\\", "/").split("/")
+            top = parts[0] if parts and parts[0] not in (".", "") else "Root"
+            projects.setdefault(top, []).append(agent)
+
+        result = []
+        for name, agents in projects.items():
+            total_req = sum(
+                a["usage"]["total_requests"] or 0 for a in agents
+            )
+            total_success = sum(
+                a["usage"]["successful_requests"] or 0 for a in agents
+            )
+            total_failed = sum(
+                a["usage"]["failed_requests"] or 0 for a in agents
+            )
+            total_tokens = sum(
+                a["usage"]["tokens_used"] or 0 for a in agents
+            )
+            result.append({
+                "project_name": name,
+                "agent_count": len(agents),
+                "agents": agents,
+                "providers_used": list(
+                    {p for a in agents for p in a["providers"]}
+                ),
+                "models_used": list(
+                    {m for a in agents for m in a["models"]}
+                ),
+                "total_requests": total_req or None,
+                "total_tokens": total_tokens or None,
+                "total_success": total_success or None,
+                "total_failed": total_failed,
+            })
+        return result
+
+    # ----------------------------------------------------------
+    # Summary
+    # ----------------------------------------------------------
+    def _build_summary(self, projects: list) -> dict:
+        providers_cnt: dict = {}
+        area_cnt: dict = {}
+        model_cnt: dict = {}
+        total_req = 0
+        total_success = 0
+        total_failed = 0
+        total_tokens = 0
+        all_failure_reasons: dict = {}
+
+        for a in self.agents:
+            for p in a["providers"]:
+                providers_cnt[p] = providers_cnt.get(p, 0) + 1
+            for ar in a["areas"]:
+                area_cnt[ar] = area_cnt.get(ar, 0) + 1
+            for m in a["models"]:
+                model_cnt[m] = model_cnt.get(m, 0) + 1
+            u = a["usage"]
+            total_req += u.get("total_requests") or 0
+            total_success += u.get("successful_requests") or 0
+            total_failed += u.get("failed_requests") or 0
+            total_tokens += u.get("tokens_used") or 0
+            for reason, cnt in u.get("failure_reasons", {}).items():
+                all_failure_reasons[reason] = (
+                    all_failure_reasons.get(reason, 0) + cnt
+                )
+
+        return {
+            "total_agents": len(self.agents),
+            "total_projects": len(projects),
+            "providers_breakdown": providers_cnt,
+            "area_breakdown": area_cnt,
+            "model_breakdown": model_cnt,
+            "overall_usage": {
+                "total_requests": total_req or None,
+                "total_successful": total_success or None,
+                "total_failed": total_failed,
+                "overall_success_rate": (
+                    round(total_success / total_req * 100, 1)
+                    if total_req > 0 else None
+                ),
+                "total_tokens_used": total_tokens or None,
+                "failure_reason_breakdown": all_failure_reasons,
+            },
+        }
 
 
-@application.before_request
-def _start_timer() -> None:
-    request._start_time = time.perf_counter()
+# ============================================================
+# HTTP SERVER (Same as before)
+# ============================================================
+class DashboardHandler(SimpleHTTPRequestHandler):
+    scan_results = None
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        if parsed.path in ("/", "/dashboard"):
+            self._serve_dashboard()
+        elif parsed.path == "/api/scan":
+            self._serve_json(DashboardHandler.scan_results)
+        elif parsed.path == "/api/rescan":
+            params = parse_qs(parsed.query)
+            root = params.get("path", [SCAN_ROOT])[0]
+            scanner = AIAgentScanner(root)
+            DashboardHandler.scan_results = scanner.scan()
+            self._serve_json(DashboardHandler.scan_results)
+        else:
+            super().do_GET()
+
+    def _serve_dashboard(self):
+        tmpl = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "templates", "dashboard.html"
+        )
+        try:
+            with open(tmpl, "r", encoding="utf-8") as f:
+                html = f.read()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(html.encode("utf-8"))
+        except FileNotFoundError:
+            self.send_response(404)
+            self.end_headers()
+            self.wfile.write(b"dashboard.html not found in templates/")
+
+    def _serve_json(self, data):
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(
+            json.dumps(data, indent=2, default=str).encode("utf-8")
+        )
+
+    def log_message(self, fmt, *args):
+        pass
 
 
-@application.after_request
-def _record_metrics(response):
-    if request.path == "/metrics":
-        return response
-    duration = time.perf_counter() - getattr(
-        request, "_start_time", time.perf_counter()
-    )
-    method, endpoint, status = request.method, request.path, str(response.status_code)
-    app_requests_total.labels(method, endpoint, status).inc()
-    app_request_duration_seconds.labels(method, endpoint).observe(duration)
-    http_status_codes_total.labels(code=status).inc()
-    APP_STATS["total_requests"] += 1
-    APP_STATS["total_request_time"] += duration
-    if response.status_code >= 500:
-        app_errors_total.inc()
-        APP_STATS["exceptions"] += 1
-        APP_STATS["failed_requests"] += 1
-    elif response.status_code < 400:
-        APP_STATS["success_requests"] += 1
-    else:
-        APP_STATS["failed_requests"] += 1
-    return response
+# ============================================================
+# MAIN
+# ============================================================
+def main():
+    print("\n" + "=" * 60)
+    print("🤖  AI AGENT SCANNER - REAL DATA VERSION")
+    print("=" * 60)
+    print("\n✅ No hardcoded usage values")
+    print("✅ No random/simulated statistics")
+    print("✅ Real data from: source code, log files, env vars\n")
 
+    scan_root = SCAN_ROOT
+    print(f"🔍 Scanning: {os.path.abspath(scan_root)}")
+    scanner = AIAgentScanner(scan_root)
+    results = scanner.scan()
+    DashboardHandler.scan_results = results
 
-@application.errorhandler(Exception)
-def _handle_exception(error):
-    if isinstance(error, HTTPException):
-        return jsonify(error=error.description), error.code
-    app_exceptions_total.inc()
-    APP_STATS["exceptions"] += 1
-    application.logger.exception("Unhandled application exception")
-    return jsonify(error="internal server error"), 500
+    s = results["scan_stats"]
+    sum_ = results["summary"]
+    print(f"\n📊 Scan Complete!")
+    print(f"   📂 Folders: {s['total_folders_scanned']}")
+    print(f"   📄 Files:   {s['total_files_scanned']}")
+    print(f"   🤖 Agents:  {s['total_agents_found']}")
+    print(f"   ⏱️  Time:    {s['scan_duration_ms']}ms")
 
+    for i, agent in enumerate(results["agents"], 1):
+        u = agent["usage"]
+        data_src = u.get("data_source", "none")
+        has_real_data = data_src not in ("none", "no_logs_found")
+        print(f"\n  {i}. {agent['script_name']}")
+        print(f"     📍 {agent['relative_path']}")
+        print(f"     🏢 {', '.join(agent['providers'])}")
+        print(f"     🧠 {', '.join(agent['models'][:3])}")
+        print(f"     📊 Data: {'✅ Real logs' if has_real_data else '⚠️  No logs found'}")
+        if u.get("total_requests"):
+            print(f"     📡 Requests: {u['total_requests']} (✅{u['successful_requests']} / ❌{u['failed_requests']})")
+        if u.get("tokens_used"):
+            print(f"     🪙 Tokens: {u['tokens_used']}")
 
-@application.get("/metrics")
-def metrics():
-    return Response(generate_latest(), content_type=CONTENT_TYPE_LATEST)
+    print(f"\n🌐 Dashboard: http://localhost:{SERVER_PORT}")
+    print("   Press Ctrl+C to stop.\n")
 
+    threading.Timer(1.5, lambda: webbrowser.open(
+        f"http://localhost:{SERVER_PORT}"
+    )).start()
 
-@application.get("/health")
-def health():
-    return Response(
-        "<html><body><strong>healthy</strong></body></html>",
-        mimetype="text/html",
-    )
-
-
-@application.get("/prometheus")
-def prometheus_redirect():
-    return redirect("/prometheus/", code=308)
-
-
-@application.get("/api/status")
-def api_status():
-    return jsonify(collectors.build_status())
-
-
-@application.get("/api/agent-metrics")
-def api_agent_metrics():
-    agents, connected = _agent_snapshot()
-    return jsonify(
-        generated_at=datetime.now(timezone.utc).isoformat(),
-        prometheus_url=_prometheus_base_url(),
-        prometheus_connected=connected,
-        agents=agents,
-    )
-
-
-@application.get("/api/agents")
-def api_agents():
-    agents, connected = _agent_snapshot()
-    return jsonify(
-        generated_at=datetime.now(timezone.utc).isoformat(),
-        prometheus_connected=connected,
-        agents=agents,
-    )
-
-
-@application.get("/agent/status")
-def agent_status():
-    state = agent_state_store.load()
-    agents = state.get("agents", {})
-    latest = max(
-        agents.values(), key=lambda item: str(item.get("last_run") or ""), default={}
-    )
-    return jsonify(
-        status=str(latest.get("status", state.get("status", "idle"))).capitalize(),
-        decision=latest.get("decision", state.get("decision", "none")),
-        provider=latest.get("provider", "gemini"),
-        model=latest.get("model", "gemini-2.5-flash"),
-        prompt_tokens=latest.get("prompt_tokens", 0),
-        completion_tokens=latest.get("completion_tokens", 0),
-        total_tokens=latest.get("total_tokens", 0),
-        tokens=latest.get("total_tokens", 0),
-        requests=latest.get("requests", 0),
-        api_key_count=latest.get("api_key_count", 0),
-        last_run=latest.get("last_run"),
-        execution_time_seconds=latest.get("execution_time_seconds", 0),
-        agents=agents,
-    )
-
-
-def _normalise_agent_name(data: dict[str, Any], stage: str) -> str:
-    value = (
-        data.get("agent_name")
-        or request.headers.get("X-Agent-Name")
-        or os.getenv("AGENT_NAME")
-        or STAGE_AGENT_MAP.get(stage)
-        or "unknown_agent"
-    )
-    return str(value).strip().lower().replace(" ", "_")[:80]
-
-
-def _set_agent_metrics(
-    *,
-    agent_name: str,
-    stage: str,
-    cloud: str,
-    provider: str,
-    model: str,
-    status: str,
-    decision: str,
-    prompt_tokens: int,
-    completion_tokens: int,
-    total_tokens: int,
-    requests_count: int,
-    api_key_count: int,
-    execution_time: float,
-    response_time: float,
-) -> None:
-    labels = {"agent_name": agent_name, "stage": stage, "cloud": cloud}
-    for item in AGENT_STATES:
-        agent_state.labels(**labels, state=item).set(float(item == status))
-    for item in AGENT_DECISIONS:
-        agent_last_decision.labels(**labels, decision=item).set(float(item == decision))
-    agent_model_info.labels(**labels).info({"provider": provider, "model": model})
-    agent_api_key_count.labels(**labels, provider=provider).set(api_key_count)
-    agent_last_run_timestamp_seconds.labels(**labels).set(time.time())
-    if requests_count:
-        agent_api_calls_total.labels(
-            **labels,
-            provider=provider,
-            model=model,
-            status="failed" if status == "failed" else "success",
-        ).inc(requests_count)
-    if prompt_tokens:
-        agent_prompt_tokens_total.labels(
-            **labels, provider=provider, model=model
-        ).inc(prompt_tokens)
-    if completion_tokens:
-        agent_completion_tokens_total.labels(
-            **labels, provider=provider, model=model
-        ).inc(completion_tokens)
-    if total_tokens:
-        agent_token_usage_total.labels(
-            **labels, provider=provider, model=model
-        ).inc(total_tokens)
-    if status not in ("idle", "running"):
-        result = "approved" if status in ("approved", "healthy") else status
-        agent_tasks_total.labels(**labels, result=result).inc()
-        agent_execution_time_seconds.labels(**labels).set(execution_time)
-        agent_execution_duration_seconds.labels(**labels).observe(execution_time)
-        if response_time:
-            agent_api_response_time_seconds.labels(
-                **labels, provider=provider, model=model
-            ).observe(response_time)
-
-
-@application.post("/monitor/status")
-def monitor_status_post():
-    expected = os.getenv("MONITOR_TOKEN", "")
-    if expected and request.headers.get("X-Monitor-Token", "") != expected:
-        return jsonify(ok=False, error="unauthorized"), 401
-    data = request.get_json(silent=True) or {}
-    stage = str(
-        data.get("stage") or request.headers.get("X-Agent-Stage") or "unknown"
-    ).strip().lower()[:80]
-    agent_name = _normalise_agent_name(data, stage)
-    cloud = str(
-        data.get("cloud")
-        or request.headers.get("X-Cloud")
-        or os.getenv("TARGET_CLOUD")
-        or os.getenv("ENVIRONMENT")
-        or "unknown"
-    ).strip().lower()[:40]
-    provider = str(data.get("provider", "unknown")).strip().lower()[:40]
-    model = str(data.get("model", "unknown")).strip()[:120]
-    status = str(data.get("status", "idle")).strip().lower()
-    if status not in AGENT_STATES:
-        status = "failed"
-    decision = str(data.get("decision", status)).strip().lower()
-    if decision not in AGENT_DECISIONS:
-        decision = "none"
-    prompt = _safe_number(data.get("prompt_tokens", 0), int)
-    completion = _safe_number(data.get("completion_tokens", 0), int)
-    total = _safe_number(data.get("total_tokens", prompt + completion), int)
-    requests_count = _safe_number(
-        data.get("requests", data.get("requests_count", 0)), int
-    )
-    keys = _safe_number(data.get("api_key_count", 0), int)
-    execution = _safe_number(data.get("execution_time_seconds", 0), float)
-    response_time = _safe_number(
-        data.get("api_response_time_seconds", 0), float
-    )
-
-    # Record for in-memory rate tracking BEFORE setting Prometheus metrics
-    _record_rate(agent_name, requests_count, total)
-
-    # Calculate observed rates at this moment for persistent display.
-    # We use the actual request/token counts from this reporting cycle
-    # (not burst rates) because quota monitoring cares about how much
-    # was consumed, not how fast it was consumed.
-    mem_rates_now = _calc_rates(agent_name)
-    observed_rpm = max(
-        round(mem_rates_now["rpm"]),
-        requests_count,  # requests in this reporting cycle
-    )
-    observed_tpm = max(
-        round(mem_rates_now["tpm"]),
-        total,  # tokens in this reporting cycle
-    )
-
-    _set_agent_metrics(
-        agent_name=agent_name,
-        stage=stage,
-        cloud=cloud,
-        provider=provider,
-        model=model,
-        status=status,
-        decision=decision,
-        prompt_tokens=prompt,
-        completion_tokens=completion,
-        total_tokens=total,
-        requests_count=requests_count,
-        api_key_count=keys,
-        execution_time=execution,
-        response_time=response_time,
-    )
-    stored = agent_state_store.load()
-    stored.setdefault("agents", {})
-    stored["agents"][agent_name] = {
-        "agent_name": agent_name,
-        "stage": stage,
-        "cloud": cloud,
-        "status": status,
-        "decision": decision,
-        "provider": provider,
-        "model": model,
-        "prompt_tokens": prompt,
-        "completion_tokens": completion,
-        "total_tokens": total,
-        "requests": requests_count,
-        "api_key_count": keys,
-        "execution_time_seconds": execution,
-        "api_response_time_seconds": response_time,
-        "last_run": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "last_run_epoch": time.time(),
-        "observed_rpm": observed_rpm,
-        "observed_tpm": observed_tpm,
-    }
-    agent_state_store.save(stored)
-    return jsonify(
-        ok=True,
-        agent=agent_name,
-        stage=stage,
-        cloud=cloud,
-        status=status,
-        decision=decision,
-    )
-
-
-@application.get("/monitor/status")
-def monitor_status_get():
-    page = r"""<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>SentinelOps AI Agent Monitor</title>
-<style>
-:root{--bg:#070b18;--panel:#11182b;--panel2:#17213a;--line:#263452;--text:#edf4ff;--muted:#8ea0c0;--blue:#56b4ff;--cyan:#53e0d0;--green:#4ade80;--amber:#fbbf24;--red:#fb7185}
-*{box-sizing:border-box}body{margin:0;min-height:100vh;font:14px/1.5 system-ui,sans-serif;color:var(--text);background:radial-gradient(circle at 10% 0%,#143159 0,transparent 35%),var(--bg)}.wrap{max-width:1500px;margin:auto;padding:30px}.top{display:flex;justify-content:space-between;align-items:end;gap:20px;margin-bottom:25px}h1{margin:0;font-size:clamp(26px,4vw,44px);letter-spacing:-.05em}.sub,.meta{color:var(--muted)}.live{display:flex;gap:9px;align-items:center;color:var(--muted)}.dot{width:10px;height:10px;border-radius:50%;background:var(--green);box-shadow:0 0 15px var(--green)}.dot.off{background:var(--red);box-shadow:0 0 15px var(--red)}.summary{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:20px}.card{background:linear-gradient(145deg,#151f38,#0e1528);border:1px solid var(--line);border-radius:18px;padding:20px;box-shadow:0 16px 45px #0005}.label{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.12em}.num{font-size:32px;font-weight:800;margin-top:4px}.agents{display:grid;grid-template-columns:repeat(auto-fit,minmax(390px,1fr));gap:16px}.agent{position:relative;overflow:hidden}.agent:before{content:"";position:absolute;top:0;left:0;right:0;height:3px;background:linear-gradient(90deg,var(--blue),var(--cyan))}.head{display:flex;justify-content:space-between;gap:12px}.name{font-size:21px;font-weight:750}.badge{border:1px solid #ffffff25;border-radius:999px;padding:4px 10px;color:var(--cyan);font-size:11px;text-transform:uppercase}.badge.not{color:var(--muted)}.details{margin-top:4px;color:var(--muted);font-size:12px}.metrics{display:grid;grid-template-columns:repeat(3,1fr);gap:9px;margin-top:18px}.metric{background:#0a1020aa;border:1px solid #ffffff0d;border-radius:12px;padding:11px}.metric span{display:block;color:var(--muted);font-size:10px}.metric b{display:block;font-size:19px;margin-top:3px}.quota-title{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.1em;margin-top:18px}.quota-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:9px;margin-top:8px}.quota{background:#0a1020aa;border:1px solid #ffffff0d;border-radius:12px;padding:12px}.quota span{display:block;color:var(--muted);font-size:11px}.quota strong{display:block;color:var(--cyan);font-size:19px;margin-top:3px}.visual{display:grid;grid-template-columns:150px 1fr;gap:20px;align-items:center;margin-top:17px}.semi{height:76px;width:150px;overflow:hidden;position:relative}.semi:before{content:"";position:absolute;width:150px;height:150px;border-radius:50%;background:conic-gradient(var(--blue) calc(var(--pct)*1%),#263452 0);transform:rotate(-90deg)}.semi:after{content:"";position:absolute;left:20px;top:20px;width:110px;height:110px;border-radius:50%;background:var(--panel)}.semi strong{position:absolute;z-index:2;left:0;right:0;top:32px;text-align:center;font-size:18px}.bars{display:grid;gap:8px}.barrow{display:grid;grid-template-columns:78px 1fr 50px;gap:7px;align-items:center;color:var(--muted);font-size:11px}.bar{height:7px;background:#263452;border-radius:20px;overflow:hidden}.bar i{display:block;height:100%;background:linear-gradient(90deg,var(--blue),var(--cyan));border-radius:20px}.spark{margin-top:17px;background:#0a1020aa;border:1px solid #ffffff0d;border-radius:12px;padding:8px}.notice{margin:15px 0;padding:13px 16px;border:1px solid #fbbf2435;background:#fbbf2410;border-radius:12px;color:#fcd879}.empty{text-align:center;color:var(--muted);padding:35px}.footer{color:var(--muted);margin-top:20px;font-size:12px}@media(max-width:800px){.wrap{padding:18px}.top{display:block}.live{margin-top:15px}.summary{grid-template-columns:repeat(2,1fr)}.agents{grid-template-columns:1fr}}@media(max-width:470px){.metrics{grid-template-columns:repeat(2,1fr)}.visual{grid-template-columns:1fr}}
-</style></head><body><div class="wrap">
-<header class="top"><div><h1>SentinelOps <span style="color:var(--blue)">AI Agents</span></h1><div class="sub">Real Prometheus totals, requests and 24-hour activity</div></div><div class="live"><i id="dot" class="dot"></i><span id="connection">Connecting...</span></div></header>
-<section class="summary"><div class="card"><div class="label">Configured agents</div><div id="configured" class="num">—</div></div><div class="card"><div class="label">Reporting agents</div><div id="agents" class="num">—</div></div><div class="card"><div class="label">Total tokens</div><div id="tokens" class="num">—</div></div><div class="card"><div class="label">RPD total</div><div id="rpd" class="num">—</div></div></section>
-<div id="notice" class="notice" hidden></div><section id="cards" class="agents"><div class="card empty">Loading real agent metrics...</div></section><div class="footer">Refreshes every 10 seconds · Source: Prometheus with persisted status fallback</div></div>
-<script>
-const put=(id,value)=>{const el=document.getElementById(id);if(el)el.textContent=value};
-const fmt=n=>Number(n||0).toLocaleString();
-const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-
-
-function spark(values){
-  if(!values||values.length<2)return '<div class="meta">No request history yet</div>';
-  let w=430,h=48,min=Math.min(...values),max=Math.max(...values),range=max-min||1;
-  let pts=values.map((v,i)=>`${(i/(values.length-1))*w},${h-((v-min)/range)*h}`).join(' ');
-  return `<svg viewBox="0 0 ${w} ${h}" width="100%" height="48" preserveAspectRatio="none"><polyline points="${pts}" fill="none" stroke="#53e0d0" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
-}
-
-
-function compact(n){
-  n=Number(n||0);
-  if(n>=1000000)return (n/1000000).toFixed(n>=10000000?0:2).replace(/\.00$/,'')+'M';
-  if(n>=1000)return (n/1000).toFixed(n>=100000?0:2).replace(/\.00$/,'')+'K';
-  return n.toLocaleString();
-}
-
-
-function card(a,maxDay,maxToken){
-  let status=String(a.status||'not reported').toLowerCase(),
-      rpdPct=a.rpd_limit?Math.min(100,(a.requests_day/a.rpd_limit)*100):0,
-      tokPct=maxToken?Math.min(100,(a.total_tokens/maxToken)*100):0;
-  return `<article class="card agent"><div class="head"><div><div class="name">${esc(a.agent_name)}</div><div class="details">${esc(a.provider)} · ${esc(a.model)} · ${esc(a.cloud)} · ${esc(a.stage)}</div></div><span class="badge ${a.has_prometheus_data?'':'not'}">${esc(status)}</span>${a.demo?'<span class="badge" style="color:#fbbf24;border-color:#fbbf2455;margin-left:6px">DEMO</span>':''}</div><div class="metrics"><div class="metric"><span>Total tokens</span><b>${compact(a.total_tokens)}</b></div><div class="metric"><span>Total requests</span><b>${compact(a.requests_total)}</b></div><div class="metric"><span>Last run</span><b style="font-size:12px">${esc(a.last_run||'—')}</b></div><div class="metric"><span>Prompt tokens</span><b>${compact(a.prompt_tokens)}</b></div><div class="metric"><span>Completion tokens</span><b>${compact(a.completion_tokens)}</b></div><div class="metric"><span>Tokens / day</span><b>${compact(a.tokens_day)}</b></div></div><div class="quota-title">Quota usage · current / limit</div><div class="quota-grid"><div class="quota"><span>RPM</span><strong>${compact(a.requests_minute)} / ${compact(a.rpm_limit)}</strong></div><div class="quota"><span>TPM</span><strong>${compact(a.tokens_minute)} / ${compact(a.tpm_limit)}</strong></div><div class="quota"><span>RPD</span><strong>${compact(a.requests_day)} / ${compact(a.rpd_limit)}</strong></div></div><div class="visual"><div class="semi" style="--pct:${rpdPct}"><strong>${compact(a.requests_day)} / ${compact(a.rpd_limit)}</strong></div><div class="bars"><div class="barrow"><span>RPM</span><div class="bar"><i style="width:${Math.min(100,(Number(a.requests_minute||0)/Math.max(1,Number(a.rpm_limit||1)))*100)}%"></i></div><b>${compact(a.requests_minute)}</b></div><div class="barrow"><span>TPM</span><div class="bar"><i style="width:${Math.min(100,(Number(a.tokens_minute||0)/Math.max(1,Number(a.tpm_limit||1)))*100)}%"></i></div><b>${compact(a.tokens_minute)}</b></div><div class="barrow"><span>RPD</span><div class="bar"><i style="width:${rpdPct}%"></i></div><b>${compact(a.requests_day)}</b></div></div></div><div class="spark">${spark(a.request_history)}</div><div class="meta" style="margin-top:12px">Decision: ${esc(a.decision)}</div></article>`;
-}
-
-
-async function refresh(){
-  try{
-    let r=await fetch('/api/agent-metrics',{cache:'no-store'}),
-        d=await r.json(),
-        list=d.agents||[],
-        real=list.filter(a=>a.has_prometheus_data),
-        maxDay=Math.max(0,...list.map(a=>Number(a.requests_day||0))),
-        maxToken=Math.max(0,...list.map(a=>Number(a.total_tokens||0)));
-    document.getElementById('dot')?.classList.toggle('off',!d.prometheus_connected);
-    put('connection',d.prometheus_connected?'Prometheus connected':'Prometheus unavailable');
-    put('configured',fmt(list.length));
-    put('agents',fmt(real.length));
-    put('tokens',fmt(list.reduce((n,a)=>n+Number(a.total_tokens||0),0)));
-    put('rpm',fmt(list.reduce((n,a)=>n+Number(a.requests_minute||0),0)));
-    put('rpd',fmt(list.reduce((n,a)=>n+Number(a.requests_day||0),0)));
-    let n=document.getElementById('notice');
-    n.hidden=d.prometheus_connected && real.length>0;
-    if(!d.prometheus_connected)n.textContent='The app cannot reach Prometheus. Add the Prometheus ECS link and PROMETHEUS_URL to the app container.';
-    else if(!real.length)n.textContent='Prometheus is connected, but no real AI-agent samples have been reported yet.';
-    document.getElementById('cards').innerHTML=list.map(a=>card(a,maxDay,maxToken)).join('');
-  }catch(e){
-    document.getElementById('dot').classList.add('off');
-    put('connection','Dashboard API unavailable');
-    let n=document.getElementById('notice');
-    if(n){n.hidden=false;n.textContent=String(e);}
-  }
-}
-refresh();
-setInterval(refresh,10000);
-</script></body></html>"""
-    return Response(page, mimetype="text/html")
-
-
-@application.get("/dashboard")
-def dashboard():
-    return redirect(url_for("monitor_status_get"))
-
-
-def set_active_counts(sessions: int, users: int) -> None:
-    application.config["ACTIVE_SESSIONS"] = sessions
-    application.config["ACTIVE_USERS"] = users
-    app_active_sessions.set(sessions)
-    app_active_users.set(users)
-
-
-def _restore_agent_metrics() -> None:
-    """Restore real persisted reports into a fresh Prometheus registry.
-
-    Only restores gauge-like metrics (state, decision, model info, timestamps).
-    Counters are NOT restored via _value.set() because that causes Prometheus
-    to see counter resets which breaks increase() calculations for RPM/TPM/RPD.
-    Counter totals are preserved in the persisted JSON and displayed directly.
-    """
+    server = HTTPServer(("", SERVER_PORT), DashboardHandler)
     try:
-        stored = agent_state_store.load()
-        for name, data in stored.get("agents", {}).items():
-            if not data.get("last_run"):
-                continue
-            stage = str(data.get("stage") or "unknown")
-            cloud = str(data.get("cloud") or "unknown")
-            provider = str(data.get("provider") or "unknown")
-            model = str(data.get("model") or "unknown")
-            status = str(data.get("status") or "idle").lower()
-            decision = str(data.get("decision") or "none").lower()
-            if status not in AGENT_STATES:
-                status = "idle"
-            if decision not in AGENT_DECISIONS:
-                decision = "none"
-            labels = {"agent_name": name, "stage": stage, "cloud": cloud}
-            for item in AGENT_STATES:
-                agent_state.labels(**labels, state=item).set(float(item == status))
-            for item in AGENT_DECISIONS:
-                agent_last_decision.labels(**labels, decision=item).set(float(item == decision))
-            agent_model_info.labels(**labels).info({"provider": provider, "model": model})
-            agent_api_key_count.labels(**labels, provider=provider).set(
-                _safe_number(data.get("api_key_count", 0), int)
-            )
-            agent_execution_time_seconds.labels(**labels).set(
-                _safe_number(data.get("execution_time_seconds", 0), float)
-            )
-            # Restore last_run timestamp so dashboards show correct last-run time
-            last_epoch = _safe_number(data.get("last_run_epoch", 0), float)
-            if not last_epoch and data.get("last_run"):
-                try:
-                    last_epoch = datetime.strptime(
-                        str(data["last_run"]), "%Y-%m-%dT%H:%M:%SZ"
-                    ).replace(tzinfo=timezone.utc).timestamp()
-                except ValueError:
-                    last_epoch = time.time()
-            agent_last_run_timestamp_seconds.labels(**labels).set(
-                last_epoch if last_epoch else time.time()
-            )
-    except Exception:
-        application.logger.exception("Could not restore agent metrics")
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\n👋 Stopped.")
+        server.server_close()
 
 
-def _seed_demo_agents() -> None:
-    """Seed known agents that have no real data with clearly-marked DEMO data.
-
-    Disabled with SEED_DEMO_AGENTS=0. A real report (POST /monitor/status)
-    overwrites the demo entry, so live data always wins once an agent reports.
-    Only seeds an agent the very first time (when it is absent); on later
-    restarts _restore_agent_metrics reloads the persisted demo values without
-    re-incrementing counters.
-    """
-    if os.getenv("SEED_DEMO_AGENTS", "1") != "1":
-        return
-    profiles = {
-        "test_agent": {
-            "stage": "pre_deploy", "cloud": "aws", "provider": "gemini",
-            "model": "gemini-2.5-flash", "status": "approved", "decision": "approved",
-            "prompt_tokens": 820, "completion_tokens": 390, "total_tokens": 1210,
-            "requests": 1, "api_key_count": 1,
-            "execution_time_seconds": 1.9, "api_response_time_seconds": 1.4,
-        },
-        "errors_agent": {
-            "stage": "deploy", "cloud": "gcp", "provider": "openai",
-            "model": "gpt-4o-mini", "status": "approved", "decision": "approved",
-            "prompt_tokens": 640, "completion_tokens": 120, "total_tokens": 760,
-            "requests": 1, "api_key_count": 1,
-            "execution_time_seconds": 2.2, "api_response_time_seconds": 1.6,
-        },
-        "final_agent": {
-            "stage": "post_deploy", "cloud": "aws", "provider": "gemini",
-            "model": "gemini-3.1-flash-lite", "status": "approved", "decision": "approved",
-            "prompt_tokens": 1070, "completion_tokens": 478, "total_tokens": 1548,
-            "requests": 1, "api_key_count": 1,
-            "execution_time_seconds": 2.3, "api_response_time_seconds": 1.7,
-        },
-    }
-    try:
-        stored = agent_state_store.load()
-        agents = stored.get("agents", {})
-        if not isinstance(agents, dict):
-            agents = {}
-        changed = False
-        for name in KNOWN_AGENTS:
-            existing = agents.get(name)
-            if isinstance(existing, dict) and existing.get("last_run"):
-                continue  # already has data (real report or previously seeded)
-            profile = profiles.get(name)
-            if not profile:
-                continue
-            # Calculate observed rates for demo display:
-            # Use the actual request/token counts (not burst rates)
-            demo_rpm = max(1, profile["requests"])
-            demo_tpm = max(1, profile["total_tokens"])
-            agents[name] = {
-                "agent_name": name,
-                "stage": profile["stage"],
-                "cloud": profile["cloud"],
-                "provider": profile["provider"],
-                "model": profile["model"],
-                "status": profile["status"],
-                "decision": profile["decision"],
-                "prompt_tokens": profile["prompt_tokens"],
-                "completion_tokens": profile["completion_tokens"],
-                "total_tokens": profile["total_tokens"],
-                "requests": profile["requests"],
-                "api_key_count": profile["api_key_count"],
-                "execution_time_seconds": profile["execution_time_seconds"],
-                "api_response_time_seconds": profile["api_response_time_seconds"],
-                "last_run": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                "last_run_epoch": time.time(),
-                "observed_rpm": demo_rpm,
-                "observed_tpm": demo_tpm,
-                "demo": True,
-            }
-            _set_agent_metrics(
-                agent_name=name,
-                stage=profile["stage"],
-                cloud=profile["cloud"],
-                provider=profile["provider"],
-                model=profile["model"],
-                status=profile["status"],
-                decision=profile["decision"],
-                prompt_tokens=profile["prompt_tokens"],
-                completion_tokens=profile["completion_tokens"],
-                total_tokens=profile["total_tokens"],
-                requests_count=profile["requests"],
-                api_key_count=profile["api_key_count"],
-                execution_time=profile["execution_time_seconds"],
-                response_time=profile["api_response_time_seconds"],
-            )
-            # Also record in in-memory rate tracker so demo agents show
-            # non-zero RPM/TPM/RPD immediately after seeding
-            _record_rate(name, profile["requests"], profile["total_tokens"])
-            changed = True
-        if changed:
-            stored["agents"] = agents
-            agent_state_store.save(stored)
-            application.logger.info("Seeded DEMO data for agents with no real report")
-    except Exception:
-        application.logger.exception("Could not seed demo agents")
-
-
-_restore_agent_metrics()
-_seed_demo_agents()
-update_metrics()
-if os.getenv("DISABLE_METRICS_THREAD", "0") != "1":
-    start_metrics_updater(interval=int(os.getenv("METRICS_INTERVAL", "5")))
+if __name__ == "__main__":
+    main()
