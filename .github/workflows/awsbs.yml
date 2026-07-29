@@ -1,4 +1,4 @@
-name: SentinelOps-Lite AWS pipeline
+name: SentinelOps-Lite multi-cloud pipeline
 
 on:
   workflow_dispatch:
@@ -97,6 +97,7 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: Validate Prometheus and AWS manifests
+        if: ${{ inputs.cloud == 'aws' || inputs.cloud == 'both' }}
         run: |
           test -f monitoring/prometheus/prometheus.yml || { echo "Missing monitoring/prometheus/prometheus.yml"; exit 1; }
           test -f monitoring/prometheus/alert.rules.yml || { echo "Missing monitoring/prometheus/alert.rules.yml"; exit 1; }
@@ -129,6 +130,7 @@ jobs:
           cache-to: type=gha,mode=max,scope=app
 
       - name: Prepare monitoring sidecar Dockerfiles
+        if: ${{ inputs.cloud == 'aws' || inputs.cloud == 'both' }}
         run: |
           test -f docker/nginx/nginx.conf || { echo "Missing docker/nginx/nginx.conf"; exit 1; }
           test -f monitoring/prometheus/prometheus.yml || { echo "Missing monitoring/prometheus/prometheus.yml"; exit 1; }
@@ -159,6 +161,7 @@ jobs:
           EOF
 
       - name: Build and push nginx monitoring image
+        if: ${{ inputs.cloud == 'aws' || inputs.cloud == 'both' }}
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -171,6 +174,7 @@ jobs:
           cache-to: type=gha,mode=max,scope=nginx
 
       - name: Build and push Prometheus monitoring image
+        if: ${{ inputs.cloud == 'aws' || inputs.cloud == 'both' }}
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -183,6 +187,7 @@ jobs:
           cache-to: type=gha,mode=max,scope=prometheus
 
       - name: Build and push Grafana monitoring image
+        if: ${{ inputs.cloud == 'aws' || inputs.cloud == 'both' }}
         uses: docker/build-push-action@v6
         with:
           context: .
