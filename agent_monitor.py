@@ -27,7 +27,7 @@ from collections import Counter
 
 # ── Safe Flask import ────────────────────────────────────────
 try:
-    from flask import Blueprint, jsonify
+    from flask import Blueprint, jsonify, request
     _flask_ok = True
 except ImportError:
     Blueprint = None
@@ -104,34 +104,49 @@ PROVIDER_RATE_LIMITS = {
     "default": {"rpm": 200, "tpm": 50000, "rpd": 4000},
 }
 
-FILE_PATTERNS = {
+# Agent detection scoring system.
+# Each pattern scores points. A file must reach MIN_SCORE to be an agent.
+# This prevents false positives from files that merely mention an AI term.
+AGENT_PATTERNS_SCORED = {
     ".py": [
-        r"(?:class|def)\s+\w*(?:Agent|agent|Tool|tool|Task|task)",
-        r"from\s+(?:langchain|crewai|autogen|openai|llama_index|haystack|pydantic_ai|smolagents)",
-        r"import\s+(?:langchain|crewai|autogen|openai|llama_index|haystack)",
-        r"(?:@tool|@agent|@task)",
-        r"(?:AgentExecutor|ConversableAgent|AssistantAgent|UserProxyAgent|ToolAgent)",
-        r"(?:Crew|Agent|Task|Process|Workflow)\s*[\(:]",
-        r"(?:ChatOpenAI|ChatAnthropic|ChatGoogle|ChatMistral)\s*\(",
-        r"llm\s*[=:]\s*\{", r"model\s*[=:]\s*[\"']",
-        r"(?:create_agent|initialize_agent|load_agent)",
+        # Strong signals (high score)
+        (r"(?:class|def)\s+\w*(?:Agent|agent|Tool|tool|Task|task)\b", 50),
+        (r"(?:@tool|@agent|@task)", 50),
+        (r"(?:AgentExecutor|ConversableAgent|AssistantAgent|UserProxyAgent|ToolAgent)", 50),
+        (r"(?:ChatOpenAI|ChatAnthropic|ChatGoogle|ChatMistral)\s*\(", 50),
+        (r"from\s+(?:langchain|crewai|autogen|llama_index|haystack|pydantic_ai|smolagents)", 40),
+        (r"(?:Crew|Process|Workflow)\s*[\(:]", 30),
+        # Medium signals
+        (r"llm\s*[=:]\s*\{", 30),
+        (r"(?:create_agent|initialize_agent|load_agent)", 30),
+        (r"role\s*[=:]\s*[\"']", 25),
+        (r"goal\s*[=:]\s*[\"']", 25),
+        (r"backstory\s*[=:]\s*[\"']", 25),
+        # Weak signals (must combine with others)
+        (r"model\s*[=:]\s*[\"'](?:gpt|claude|gemini|llama|mistral)", 20),
+        (r"from\s+openai\s+import", 15),
+        (r"import\s+(?:langchain|crewai|autogen|llama_index|haystack)", 15),
+        (r"llm_config\s*[=:]", 20),
     ],
     ".json": [
-        r"\"(?:agent|model|provider|llm|tools)\"\s*:",
-        r"\"(?:name|type|role|goal|backstory)\"\s*:",
+        (r"\"(?:agent|model|provider|llm|tools)\"\s*:", 20),
+        (r"\"(?:name|type|role|goal|backstory)\"\s*:", 15),
     ],
     ".yaml": [
-        r"(?:agent|model|provider|llm|tools)\s*:",
-        r"(?:name|type|role|goal|backstory)\s*:",
+        (r"(?:agent|model|provider|llm|tools)\s*:", 20),
+        (r"(?:name|type|role|goal|backstory)\s*:", 15),
     ],
     ".yml": [
-        r"(?:agent|model|provider|llm|tools)\s*:",
-        r"(?:name|type|role|goal|backstory)\s*:",
+        (r"(?:agent|model|provider|llm|tools)\s*:", 20),
+        (r"(?:name|type|role|goal|backstory)\s*:", 15),
     ],
-    ".toml": [r"\[(?:agent|tool|llm|model|provider)\]"],
-    ".cfg": [r"(?:agent|model|provider|llm)"],
-    ".env": [r"(?:OPENAI|ANTHROPIC|GEMINI|MISTRAL|COHERE)_API_KEY"],
+    ".toml": [(r"\[(?:agent|tool|llm|model|provider)\]", 20)],
+    ".cfg": [(r"(?:agent|model|provider|llm)", 10)],
+    ".env": [(r"(?:OPENAI|ANTHROPIC|GEMINI|MISTRAL|COHERE)_API_KEY", 30)],
 }
+
+# Minimum score for a file to be considered an agent
+AGENT_MIN_SCORE = 40
 
 PROVIDER_MAP = {
     "openai": "OpenAI", "gpt": "OpenAI", "chatopenai": "OpenAI",
@@ -264,10 +279,15 @@ def extract_description(text, filepath):
     return f"AI agent in {Path(filepath).name}"
 
 def is_agent_file(text, ext):
-    for pat in FILE_PATTERNS.get(ext, []):
-        if re.search(pat, text, re.IGNORECASE):
-            return True
-    return False
+    """Score a file for agent content. Returns True if score >= AGENT_MIN_SCORE."""
+    patterns = AGENT_PATTERNS_SCORED.get(ext, [])
+    total_score = sum(score for pat, score in patterns if re.search(pat, text, re.IGNORECASE))
+    return total_score >= AGENT_MIN_SCORE
+
+def get_agent_score(text, ext):
+    """Return agent detection score for logging."""
+    patterns = AGENT_PATTERNS_SCORED.get(ext, [])
+    return sum(score for pat, score in patterns if re.search(pat, text, re.IGNORECASE))
 
 
 def scan_folder(root_path):
@@ -284,7 +304,7 @@ def scan_folder(root_path):
         for fn in filenames:
             fp = Path(dirpath) / fn
             ext = fp.suffix.lower()
-            if ext not in FILE_PATTERNS:
+            if ext not in AGENT_PATTERNS_SCORED:
                 continue
             try:
                 if fp.stat().st_size > 500_000:
@@ -836,16 +856,74 @@ if _flask_ok:
 
     @scanner_bp.route("/scan")
     def scanner_trigger_scan():
-        """Trigger a fresh scan."""
+        """Trigger a fresh scan and then redirect to dashboard."""
         run_scan()
-        return _cached_html or "<html><body><h1>✅ Scan complete</h1><p><a href='/scanner/'>View</a></p></body></html>"
+        summary = get_cached_summary_dict()
+        n = summary.get('agents_found', 0)
+        t = summary.get('last_scan', 'just now')
+        html = _cached_html or ''
+        return f"""<!DOCTYPE html>
+<html><head><meta http-equiv="refresh" content="2;url=/scanner/">
+<title>Scan Complete</title>
+<style>body{{font-family:sans-serif;background:#0a0a1a;color:#e8e8f0;display:flex;justify-content:center;align-items:center;min-height:100vh;margin:0}}
+.card{{background:#16163a;border:1px solid #2a2a5e;border-radius:16px;padding:40px;text-align:center;max-width:500px}}
+h1{{font-size:2rem;color:#00d4aa}}p{{color:#a0a0c0;margin:10px 0}}.count{{font-size:1.4rem;font-weight:700;color:#a29bfe}}</style></head>
+<body><div class="card">
+<h1>✅ Scan Complete</h1>
+<p class="count">{n} agent(s) found</p>
+<p>Last scan: {t[:19]}</p>
+<p><a href="/scanner/" style="color:#00d4aa">View Dashboard →</a></p>
+<p style="font-size:0.85rem;color:#636e72">Redirecting in 2 seconds...</p>
+</div></body></html>"""
 
     @scanner_bp.route("/api")
     def scanner_api():
-        """JSON summary of detected agents."""
+        """HTML page showing agent summary (with raw JSON also available)."""
         if _cached_html is None:
             run_scan()
-        return jsonify(get_cached_summary_dict())
+        summary = get_cached_summary_dict()
+        if request.args.get('format') == 'json':
+            return jsonify(summary)
+        n = summary.get('agents_found', 0)
+        agents_list = summary.get('agents', [])
+        rows = ''
+        for a in agents_list:
+            q = a.get('quality', 0)
+            color = '#00b894' if q >= 70 else '#fdcb6e' if q >= 40 else '#e17055'
+            rows += f'<tr><td>{a.get("name","?")}</td><td>{a.get("provider","?")}</td><td>{a.get("model","?")}</td><td>{a.get("area","?")}</td><td>{a.get("lines",0)}</td><td style="color:{color};font-weight:600">{q}/100</td><td>{a.get("api_calls",0)}</td></tr>'
+        return f"""<!DOCTYPE html>
+<html><head><title>Agent API — Scanner</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=JetBrains+Mono:wght@400&display=swap" rel="stylesheet">
+<style>
+*{{margin:0;padding:0;box-sizing:border-box}}
+body{{font-family:'Inter',sans-serif;background:#0a0a1a;color:#e8e8f0;padding:30px}}
+h1{{font-size:1.8rem;background:linear-gradient(135deg,#00d4aa,#6c5ce7,#fd79a8);-webkit-background-clip:text;-webkit-text-fill-color:transparent}}
+.summary-cards{{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:14px;margin:20px 0}}
+.card{{background:#16163a;border:1px solid #2a2a5e;border-radius:12px;padding:18px;text-align:center}}
+.card .num{{font-size:1.8rem;font-weight:700;color:#00d4aa;display:block}}
+.card .label{{font-size:0.8rem;color:#a0a0c0}}
+table{{width:100%;border-collapse:collapse;margin-top:16px;font-size:0.9rem}}
+th{{background:#1a1a3e;color:#a0a0c0;padding:10px 12px;text-align:left;font-weight:600;border-bottom:2px solid #2a2a5e}}
+td{{padding:10px 12px;border-bottom:1px solid #2a2a5e}}
+tr:hover{{background:#1a1a3e}}
+.json-link{{display:inline-block;margin-top:16px;padding:8px 20px;background:#00d4aa;color:#000;border-radius:8px;text-decoration:none;font-weight:600}}
+.json-link:hover{{background:#00e6b3}}
+.footer{{margin-top:30px;color:#636e72;font-size:0.8rem}}
+</style></head>
+<body>
+<h1>🤖 Agent Scanner API</h1>
+<div class="summary-cards">
+<div class="card"><span class="num">{n}</span><span class="label">Agents Found</span></div>
+<div class="card"><span class="num">{summary.get('total_tokens',0):,}</span><span class="label">Total Tokens</span></div>
+<div class="card"><span class="num">{summary.get('total_api_calls',0)}</span><span class="label">API Calls</span></div>
+<div class="card"><span class="num">{summary.get('average_quality',0)}</span><span class="label">Avg Quality</span></div>
+</div>
+<h2>📋 Agent List</h2>
+<table><thead><tr><th>Name</th><th>Provider</th><th>Model</th><th>Area</th><th>Lines</th><th>Quality</th><th>API Calls</th></tr></thead><tbody>{rows if rows else '<tr><td colspan="7" style="text-align:center;color:#636e72">No agents found</td></tr>'}</tbody></table>
+<a class="json-link" href="?format=json" target="_blank">📄 View Raw JSON</a>
+<div class="footer">Path: {summary.get('scan_path','?')} | Last scan: {summary.get('last_scan','?')[:19]}</div>
+</body></html>"""
 
     @scanner_bp.record_once
     def _start_scanner(state):
