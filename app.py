@@ -10,7 +10,8 @@ import os
 import sys
 from pathlib import Path
 
-from flask import render_template
+from flask import render_template, Response
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
 # ── path setup ────────────────────────────────────────────────
 BASE_DIR = Path(__file__).resolve().parent
@@ -44,6 +45,13 @@ def monitor_status():
     from agent_monitor import handle_monitor_status
     return handle_monitor_status()
 
+@application.get("/metrics")
+def prometheus_metrics():
+    """Prometheus scrape endpoint."""
+    return Response(
+        generate_latest(),
+        content_type=CONTENT_TYPE_LATEST,
+    )
 
 # ══════════════════════════════════════════════════════════════
 # WSGI entry point
