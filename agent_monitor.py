@@ -37,9 +37,38 @@ except ImportError:
 logger = logging.getLogger("agent_monitor")
 
 # ── Config (override via env vars) ───────────────────────────
-SCAN_PATH      = os.environ.get("SCAN_PATH", "/var/app/current")
-AUTO_CREATE    = os.environ.get("AUTO_CREATE_SAMPLES", "true").lower() == "true"
-REFRESH_SECS   = int(os.environ.get("SCAN_REFRESH_SECS", "300"))
+_SCAN_PATH_ENV = os.environ.get("SCAN_PATH", "")
+
+def _resolve_scan_path():
+    """Find a writable scan path — never try to create /var/app."""
+    # 1. Use env var if set
+    if _SCAN_PATH_ENV:
+        p = Path(_SCAN_PATH_ENV).expanduser().resolve()
+        # Check if parent is writable (needed for sample creation)
+        if p.exists() or _is_writable(p.parent):
+            return str(p)
+    # 2. Try common Beanstalk paths
+    for candidate in ["/var/app/current", "/var/app/current/agent_scanner", os.getcwd()]:
+        p = Path(candidate)
+        if p.exists() or _is_writable(p.parent):
+            return str(p)
+    # 3. Ultimate fallback — use /tmp
+    return "/tmp/ai_agent_scan"
+
+def _is_writable(path):
+    """Check if a directory is writable without actually creating it."""
+    try:
+        p = Path(path)
+        if not p.exists():
+            p = p.parent
+        return os.access(str(p), os.W_OK | os.X_OK)
+    except Exception:
+        return False
+
+SCAN_PATH    = _resolve_scan_path()
+AUTO_CREATE  = os.environ.get("AUTO_CREATE_SAMPLES", "true").lower() == "true"
+REFRESH_SECS = int(os.environ.get("SCAN_REFRESH_SECS", "300"))
+logger.info(f"SCAN_PATH resolved to: {SCAN_PATH}")
 
 # ── Cache ────────────────────────────────────────────────────
 _cached_html    = None
@@ -694,18 +723,29 @@ html{{font-size:15px}}body{{font-family:'Inter',sans-serif;background:var(--bg);
 
 def run_scan():
     """Run a scan and cache results (thread-safe)."""
-    global _cached_html, _cached_json, _cached_summary, _cached_time
+    global _cached_html, _cached_json, _cached_summary, _cached_time, SCAN_PATH
     with _lock:
         scan_path = Path(SCAN_PATH).expanduser().resolve()
+
+        # If path doesn't exist, try to create sample agents in a writable location
         if not scan_path.exists():
             logger.warning(f"Path not found: {scan_path}")
             if AUTO_CREATE:
                 try:
-                    scan_path = create_sample_agents(scan_path)
+                    # Check if parent is writable; if not, use /tmp fallback
+                    if not _is_writable(scan_path.parent):
+                        fallback = Path("/tmp") / "ai_agent_samples"
+                        logger.info(f"Path not writable, using fallback: {fallback}")
+                        scan_path = create_sample_agents(fallback)
+                        SCAN_PATH = str(scan_path)  # update for future scans
+                    else:
+                        scan_path = create_sample_agents(scan_path)
                 except Exception as e:
-                    _cached_html = f"<html><body><h1>❌ Error</h1><p>{e}</p></body></html>"
-                    _cached_json = json.dumps({"error": str(e), "agents_found": 0})
-                    _cached_summary = {"error": str(e), "agents_found": 0}
+                    err_msg = f"Cannot create samples: {e}"
+                    logger.error(err_msg)
+                    _cached_html = f"<html><body><h1>❌ Permission Error</h1><p>{err_msg}</p><p>Set SCAN_PATH env variable to a writable directory.</p></body></html>"
+                    _cached_json = json.dumps({"error": err_msg, "agents_found": 0})
+                    _cached_summary = {"error": err_msg, "agents_found": 0}
                     return
             else:
                 _cached_html = f"<html><body><h1>❌ Path Not Found</h1><p>SCAN_PATH={scan_path}</p></body></html>"
@@ -716,10 +756,19 @@ def run_scan():
         agents = scan_folder(scan_path)
         if not agents and AUTO_CREATE:
             try:
+                # Try creating samples directly in the directory
                 create_sample_agents(scan_path)
                 agents = scan_folder(scan_path) or []
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"Sample creation at {scan_path} failed: {e}")
+                # Last resort: use /tmp
+                try:
+                    fallback = Path("/tmp") / "ai_agent_samples"
+                    create_sample_agents(fallback)
+                    agents = scan_folder(fallback) or []
+                    SCAN_PATH = str(fallback)
+                except Exception as e2:
+                    logger.warning(f"Fallback also failed: {e2}")
 
         _cached_html = generate_dashboard_html(agents or [], str(scan_path))
         _cached_summary = {
@@ -801,7 +850,10 @@ if _flask_ok:
     @scanner_bp.record_once
     def _start_scanner(state):
         """Auto-start background scanner when blueprint is registered."""
-        start_background_scanner()
+        try:
+            start_background_scanner()
+        except Exception as e:
+            logger.warning(f"Background scanner start failed: {e}")
 
     logger.info("✅ scanner_bp blueprint ready at /scanner")
 else:
