@@ -367,65 +367,15 @@ def extract_models_list(text):
 
 
 def extract_model_with_fallback(text):
-    """Extract model with inference. Returns (model_name, is_inferred).
-    If specific model found in code -> return it, not inferred.
-    If not, infer from provider/detected patterns -> return best guess, inferred=True.
+    """Extract model ONLY if explicitly found in code. NO inference.
+    Returns (model_name, is_inferred).
+    is_inferred is always False - we never guess models.
     """
-    # First try exact model matching
     exact = extract_model(text)
     if exact:
         return exact, False
-    
-    # No exact model found - infer from provider and context
-    provider = extract_provider(text)
-    if not provider:
-        return "Unknown", False
-    
-    # Map provider to its most common/likely default model
-    provider_defaults = {
-        "OpenAI": "gpt-4o",
-        "Anthropic": "claude-3.5-sonnet",
-        "Google": "gemini-1.5-pro",
-        "Mistral": "mistral-large",
-        "Meta": "llama-3.1",
-        "DeepSeek": "deepseek-chat",
-        "Cohere": "command-r",
-        "Groq": "mixtral",
-        "Together": "llama-3.1",
-        "Replicate": "llama-3.1",
-    }
-    inferred = provider_defaults.get(provider, "Unknown")
-    
-    # Look at code patterns for more specific clues
-    text_lower = text.lower()
-    
-    # Check for size indicators (small, large, etc.)
-    if "haiku" in text_lower or "flash" in text_lower or "mini" in text_lower or "small" in text_lower:
-        size_hints = {"haiku": "claude-3-haiku", "flash": "gemini-1.5-flash", "mini": "gpt-4o-mini", "small": "mistral-small"}
-        for keyword, model_hint in size_hints.items():
-            if keyword in text_lower:
-                inferred = model_hint
-                break
-    
-    # Check for reasoning/analysis patterns → use larger model
-    if any(w in text_lower for w in ["reason", "analyze", "complex", "research", "review"]):
-        if provider == "OpenAI" and "mini" not in text_lower:
-            inferred = "gpt-4o"
-        elif provider == "Anthropic" and "haiku" not in text_lower:
-            inferred = "claude-3.5-sonnet"
-    
-    # Check for temperature/TTL patterns
-    temps = re.findall(r'temperature\s*[=:]\s*(\d+\.?\d*)', text, re.IGNORECASE)
-    if temps:
-        try:
-            t = float(temps[0])
-            if t > 0.5:
-                # Creative tasks → might use different model
-                pass
-        except:
-            pass
-    
-    return inferred, True
+    # No exact model found in code - return Unknown
+    return "Unknown", False
 
 
 def get_context_window(model_name):
@@ -1029,15 +979,12 @@ def generate_dashboard_html(agents, non_agents, root_path, total_py_files=0):
                 <div class="info-grid">
                     <div class="info-item">
                         <span class="info-label">📦 AI Provider</span>
-                        <span class="info-value"><span class="badge badge-provider">{a.get("provider", "Unknown")}</span></span>
+                        <span class="info-value">{'<span class="badge badge-provider">' + a.get("provider", "") + '</span>' if a.get("provider") and a.get("provider") != "Unknown" else '<span style="color:var(--text2);font-size:0.8rem">Not detected</span>'}</span>
                     </div>
-                    <div class="info-item">
-                        <span class="info-label">🎯 Why Used</span>
-                        <span class="info-value" style="font-size:0.8rem;color:var(--text2)">{'Agent uses ' + a.get("model", "Unknown") + ' model via ' + a.get("provider", "Unknown") + ' for: ' + a.get("description", "")[:80]}</span>
-                    </div>
+
                     <div class="info-item">
                         <span class="info-label">🧠 AI Model</span>
-                        <span class="info-value"><span class="badge badge-model">{a.get("model", "Unknown")}</span>{' <span class="badge badge-inferred" title="Model inferred from provider/patterns">🔮 inferred</span>' if a.get("model_inferred", False) else ''}</span>
+                        <span class="info-value">{'<span class="badge badge-model">' + a.get("model", "") + '</span>' if a.get("model") and a.get("model") != "Unknown" else '<span style="color:var(--text2);font-size:0.8rem">Not specified in code</span>'}</span>
                     </div>
                     <div class="info-item">
                         <span class="info-label">📄 File</span>
