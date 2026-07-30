@@ -1,2612 +1,2440 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
-=====================================================================================
- AI REPOSITORY AUDITOR  --  single standalone script
-=====================================================================================
+agent_monitor.py
+================
+Complete SentinelOps-Lite backend.
 
-Performs a complete, zero-configuration, STATIC audit of any repository and emits:
+Contains:
+  - Flask application object
+  - All Prometheus metrics
+  - All configuration
+  - All business logic
+  - monitor_bp  Blueprint  → /monitor/*
+  - scanner_bp  Blueprint  → /scanner/*
+  - handle_monitor_status() → called by app.py /monitor/status route
 
-    repository_summary.md      Markdown report (tables + summaries)
-    repository_summary.html    Interactive dashboard (charts, search, filters,
-                               sorting, dark mode, export buttons, responsive)
-    repository_summary.json    Full machine-readable dump
-    repository_summary.csv     Flat file inventory
-    repository_summary.xlsx    Multi-sheet workbook (needs openpyxl; skipped if absent)
-
-What it discovers automatically
--------------------------------
-  * Every directory / file (recursive, incl. hidden dirs, minus the ignore list)
-  * Language, category, purpose and a human-readable description per file
-  * AI agents, agent types and purposes
-  * AI providers (OpenAI, Azure, Anthropic, Gemini, Bedrock, Groq, Ollama, ...)
-  * AI models + reference counts
-  * AI SDKs / frameworks (LangChain, LangGraph, CrewAI, AutoGen, SK, LlamaIndex...)
-  * Prompts (system/user/developer/inline/file/markdown/json/yaml/template)
-  * API-key environment variables and where they are loaded from
-  * Token configuration + static token/cost estimates
-  * Request / rate-limit / retry / backoff / timeout configuration
-  * Tools used by agents, and agentic workflow patterns
-  * Import graph, dependency graph, unused / orphan files
-  * Repository statistics (classes, functions, endpoints, tests, IaC, ...)
-
-Guarantees
-----------
-  * STATIC ANALYSIS ONLY. Repository code is never imported or executed.
-  * READ-ONLY. No file in the scanned repository is ever modified.
-  * DETERMINISTIC. All collections are sorted; the same input yields the same output.
-  * Anything that genuinely cannot be derived from source is reported verbatim as
-    "Not Available from Source Code" instead of being guessed.
-
-Usage
------
-    python ai_repo_audit.py                      # audit current directory
-    python ai_repo_audit.py /path/to/repo
-    python ai_repo_audit.py /path/to/repo -o ./audit_out
-    python ai_repo_audit.py . --max-file-mb 5 --quiet
-    python ai_repo_audit.py . --open             # open the dashboard in a browser
-    python ai_repo_audit.py . --serve 8000       # view it at http://127.0.0.1:8000/
-
-Viewing the dashboard
----------------------
-repository_summary.html is a SELF-CONTAINED local file. Open it directly:
-
-    file:///full/path/to/ai_audit_report/repository_summary.html
-
-It is not a route inside your application. Requesting it from your own Flask/FastAPI/
-Django server (e.g. http://localhost:5000/repository_summary.html) returns that
-server's "Not Found" page, because the file lives on disk and not in that app's
-routing table or static folder. Use --open, use --serve, or double-click the file.
-
-Standard library only (openpyxl optional, only for the .xlsx report).
-=====================================================================================
+app.py only owns:
+  GET  /          → render_template("index.html")
+  POST /monitor/status → delegates to handle_monitor_status()
 """
 
 from __future__ import annotations
 
-import argparse
-import csv
-import datetime as _dt
-import hashlib
-import html as _html
+# ── stdlib ────────────────────────────────────────────────────
+import ast
+import datetime
+import hmac
 import json
 import os
 import re
 import sys
+import time
 from collections import Counter, defaultdict
-from dataclasses import dataclass, field, asdict
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from threading import Lock, Thread
+from typing import Any
 
-VERSION = "1.0.0"
-NA = "Not Available from Source Code"
+# ── Flask ─────────────────────────────────────────────────────
+from flask import Blueprint, Flask, Response, jsonify, render_template_string, request
 
-# =====================================================================================
-# SECTION 1 -- CONFIGURATION / KNOWLEDGE BASE
-# =====================================================================================
+# ── Prometheus ────────────────────────────────────────────────
+import psutil
+from prometheus_client import (
+    CONTENT_TYPE_LATEST,
+    Counter as PCounter,
+    Gauge,
+    Histogram,
+    Info,
+    generate_latest,
+)
 
-IGNORE_DIRS: Set[str] = {
-    ".git", ".terraform", "node_modules", "venv", "__pycache__", "dist", "build",
-    "target", "coverage", ".cache", ".idea", ".vscode",
+
+# ══════════════════════════════════════════════════════════════
+# FLASK APPLICATION OBJECT
+# ══════════════════════════════════════════════════════════════
+
+application = Flask(__name__)
+
+
+# ══════════════════════════════════════════════════════════════
+# CENTRALISED CONFIG  —  read once at startup
+# ══════════════════════════════════════════════════════════════
+
+_CFG: dict[str, str] = {
+    "provider":      os.getenv("AI_PROVIDER",    "gemini"),
+    "model":         os.getenv("AI_MODEL",       "gemini-2.5-flash"),
+    "version":       os.getenv("APP_VERSION",    "1.0.0"),
+    "build":         os.getenv("BUILD_NUMBER",   "unknown"),
+    "environment":   os.getenv("ENVIRONMENT",    "production"),
+    "cloud":         os.getenv("TARGET_CLOUD",   "aws"),
+    "region":        os.getenv("AWS_REGION",     "us-east-1"),
+    "monitor_token": os.getenv("MONITOR_TOKEN",  ""),
+    "metrics_token": os.getenv("METRICS_TOKEN",  ""),
+    "port":          os.getenv("PORT",           "8000"),
 }
-# Practical extras that are never source and would only add noise. Kept small and
-# explicit so the "ignore only" contract above is honoured for real directories.
-IGNORE_DIR_EXTRAS: Set[str] = {".venv", ".mypy_cache", ".pytest_cache", ".ruff_cache",
-                               ".next", ".nuxt", ".svelte-kit", ".gradle", ".tox",
-                               "site-packages", ".egg-info"}
 
-BINARY_EXTS: Set[str] = {
-    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".webp", ".svg", ".pdf", ".zip",
-    ".gz", ".tar", ".tgz", ".bz2", ".xz", ".7z", ".rar", ".jar", ".war", ".ear",
-    ".class", ".pyc", ".pyo", ".so", ".dll", ".dylib", ".exe", ".bin", ".o", ".a",
-    ".woff", ".woff2", ".ttf", ".otf", ".eot", ".mp3", ".mp4", ".avi", ".mov", ".mkv",
-    ".wav", ".flac", ".db", ".sqlite", ".sqlite3", ".parquet", ".pkl", ".pickle",
-    ".h5", ".pt", ".pth", ".onnx", ".safetensors", ".bin", ".xlsx", ".xls", ".docx",
-    ".pptx", ".lock",
+# ── startup timestamp ─────────────────────────────────────────
+_START_TIME: float = time.time()
+
+# ── cached psutil process handle ─────────────────────────────
+# One object reused across all calls so cpu_percent() delta is correct.
+# First call always returns 0.0 — prime it once at startup.
+_PROC: psutil.Process = psutil.Process()
+_PROC.cpu_percent(interval=0.1)   # blocks 100 ms once, correct thereafter
+
+# ── blueprint loaded flag ─────────────────────────────────────
+_SCANNER_LOADED: bool = False
+
+
+# ══════════════════════════════════════════════════════════════
+# PROMETHEUS METRICS
+# ══════════════════════════════════════════════════════════════
+
+# ── HTTP ──────────────────────────────────────────────────────
+REQUEST_COUNT = PCounter(
+    "app_requests_total",
+    "Total HTTP requests",
+    ["method", "endpoint", "status"],
+)
+
+REQUEST_LATENCY = Histogram(
+    "app_request_duration_seconds",
+    "HTTP request latency in seconds",
+    ["method", "endpoint"],
+    buckets=[0.005, 0.01, 0.025, 0.05,
+             0.1, 0.25, 0.5, 1.0, 2.5, 5.0],
+)
+
+# ── Agent ─────────────────────────────────────────────────────
+AGENT_STATUS = Gauge(
+    "agent_status",
+    "AI agent running status (1=running, 0=stopped)",
+)
+
+AGENT_INFO = Info(
+    "agent",
+    "AI agent static information — set once at startup",
+)
+
+AGENT_REQUESTS_TOTAL = PCounter(
+    "agent_requests_total",
+    "Total requests made by the AI agent",
+    ["provider", "model", "status"],
+)
+
+AGENT_MODEL_INFO = Gauge(
+    "agent_model_info",
+    "AI model label carrier — value is always 1",
+    ["provider", "model", "version", "environment"],
+)
+
+AGENT_UPTIME_SECONDS = Gauge(
+    "agent_uptime_seconds",
+    "Seconds since the agent process started",
+)
+
+AGENT_CPU_PERCENT = Gauge(
+    "agent_cpu_percent",
+    "CPU usage percent of the agent process",
+)
+
+AGENT_MEMORY_MB = Gauge(
+    "agent_memory_mb",
+    "RSS memory used by the agent process in MB",
+)
+
+SCANNER_LOADED_GAUGE = Gauge(
+    "agent_scanner_loaded",
+    "1 if the AI scanner blueprint loaded successfully, 0 otherwise",
+)
+
+# ── System ────────────────────────────────────────────────────
+SYSTEM_CPU = Gauge(
+    "system_cpu_percent",
+    "System-wide CPU usage percent",
+)
+
+SYSTEM_MEMORY_PERCENT = Gauge(
+    "system_memory_percent",
+    "System memory usage percent",
+)
+
+SYSTEM_MEMORY_USED_MB = Gauge(
+    "system_memory_used_mb",
+    "System memory used in MB",
+)
+
+# ── backward-compat alias ─────────────────────────────────────
+PROCESS_CPU = Gauge(
+    "python_process_cpu_percent",
+    "CPU usage percent of this process (alias of agent_cpu_percent)",
+)
+
+
+# ══════════════════════════════════════════════════════════════
+# METRIC HELPERS
+# ══════════════════════════════════════════════════════════════
+
+def _init_static_metrics() -> None:
+    """
+    Set metrics that never change after startup.
+    Called exactly ONCE — Info.info() raises if called twice.
+    """
+    AGENT_INFO.info({
+        "provider":    _CFG["provider"],
+        "model":       _CFG["model"],
+        "version":     _CFG["version"],
+        "environment": _CFG["environment"],
+        "build":       _CFG["build"],
+        "cloud":       _CFG["cloud"],
+        "region":      _CFG["region"],
+    })
+    AGENT_MODEL_INFO.labels(
+        provider=    _CFG["provider"],
+        model=       _CFG["model"],
+        version=     _CFG["version"],
+        environment= _CFG["environment"],
+    ).set(1)
+    SCANNER_LOADED_GAUGE.set(1 if _SCANNER_LOADED else 0)
+    AGENT_STATUS.set(1)
+
+
+def _update_dynamic_metrics() -> None:
+    """
+    Refresh metrics that change over time.
+    Called before every Prometheus scrape and on /agent/status.
+    Never raises — all psutil errors are caught.
+    """
+    try:
+        cpu    = _PROC.cpu_percent(interval=None)
+        mem_mb = round(_PROC.memory_info().rss / 1024 / 1024, 2)
+        AGENT_CPU_PERCENT.set(cpu)
+        AGENT_MEMORY_MB.set(mem_mb)
+        PROCESS_CPU.set(cpu)
+        AGENT_UPTIME_SECONDS.set(round(time.time() - _START_TIME, 1))
+        AGENT_STATUS.set(1)
+    except (psutil.AccessDenied,
+            psutil.NoSuchProcess,
+            psutil.ZombieProcess) as exc:
+        print(f"⚠️  psutil process error: {exc}")
+        AGENT_STATUS.set(0)
+
+    try:
+        vmem = psutil.virtual_memory()
+        SYSTEM_CPU.set(psutil.cpu_percent(interval=None))
+        SYSTEM_MEMORY_PERCENT.set(vmem.percent)
+        SYSTEM_MEMORY_USED_MB.set(round(vmem.used / 1024 / 1024, 2))
+    except Exception as exc:                        # noqa: BLE001
+        print(f"⚠️  psutil system error: {exc}")
+
+
+def _record(endpoint: str, status: int = 200) -> float:
+    """Increment request counter and return start timestamp."""
+    REQUEST_COUNT.labels(
+        method=   request.method,
+        endpoint= endpoint,
+        status=   str(status),
+    ).inc()
+    return time.perf_counter()
+
+
+def _finish(endpoint: str, start: float) -> None:
+    """Observe request latency in the histogram."""
+    REQUEST_LATENCY.labels(
+        method=   request.method,
+        endpoint= endpoint,
+    ).observe(time.perf_counter() - start)
+
+
+def _safe_system_snapshot() -> dict[str, Any]:
+    """Return system + process metrics — all psutil errors caught."""
+    snap: dict[str, Any] = {
+        "cpu_usage_percent":   -1,
+        "memory_total_mb":     -1,
+        "memory_used_mb":      -1,
+        "memory_percent":      -1,
+        "process_cpu_percent": -1,
+        "process_memory_mb":   -1,
+    }
+    try:
+        vmem = psutil.virtual_memory()
+        snap["cpu_usage_percent"]   = psutil.cpu_percent(interval=None)
+        snap["memory_total_mb"]     = round(vmem.total / 1024 / 1024, 1)
+        snap["memory_used_mb"]      = round(vmem.used  / 1024 / 1024, 1)
+        snap["memory_percent"]      = vmem.percent
+        snap["process_cpu_percent"] = _PROC.cpu_percent(interval=None)
+        snap["process_memory_mb"]   = round(
+            _PROC.memory_info().rss / 1024 / 1024, 1
+        )
+    except (psutil.AccessDenied, psutil.NoSuchProcess) as exc:
+        print(f"⚠️  snapshot error: {exc}")
+    return snap
+
+
+def _check_metrics_auth() -> bool:
+    """
+    True if /metrics request is authorised.
+    Empty METRICS_TOKEN → open (standard Prometheus pull).
+    Set METRICS_TOKEN   → require Authorization: Bearer <token>.
+    """
+    token = _CFG["metrics_token"]
+    if not token:
+        return True
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        return False
+    return hmac.compare_digest(
+        auth[len("Bearer "):].encode(),
+        token.encode(),
+    )
+
+
+def _check_monitor_auth() -> bool:
+    """
+    True if /monitor/status request is authorised.
+    Empty MONITOR_TOKEN → open.
+    Set MONITOR_TOKEN   → require X-Monitor-Token header.
+    """
+    token = _CFG["monitor_token"]
+    if not token:
+        return True
+    provided = request.headers.get("X-Monitor-Token", "")
+    return hmac.compare_digest(
+        provided.encode(),
+        token.encode(),
+    )
+
+
+# ══════════════════════════════════════════════════════════════
+# MONITOR STATUS HANDLER
+# called by app.py  POST /monitor/status
+# ══════════════════════════════════════════════════════════════
+
+def handle_monitor_status() -> tuple[Response, int]:
+    """
+    CI / monitoring webhook receiver.
+    app.py delegates POST /monitor/status entirely to this function.
+    Accepts optional JSON payload — only the token matters for 200 OK.
+    """
+    t = _record("/monitor/status")
+
+    if not _check_monitor_auth():
+        _finish("/monitor/status", t)
+        return jsonify(error="unauthorized"), 401
+
+    _finish("/monitor/status", t)
+    return jsonify(ok=True), 200
+
+
+# ══════════════════════════════════════════════════════════════
+# MONITOR BLUEPRINT  —  /monitor/*
+# ══════════════════════════════════════════════════════════════
+
+monitor_bp = Blueprint("monitor", __name__, url_prefix="/monitor")
+
+
+@monitor_bp.get("/health")
+def monitor_health() -> tuple[Response, int]:
+    """
+    JSON liveness / readiness probe.
+    Returns JSON so ALB, Kubernetes, and Beanstalk health checks
+    can parse the response body.
+    HTTP 200 = healthy | HTTP 503 = degraded
+    """
+    t = _record("/monitor/health")
+
+    checks: dict[str, str] = {
+        "app":     "ok",
+        "scanner": "ok" if _SCANNER_LOADED else "degraded",
+    }
+    healthy = True
+    try:
+        _PROC.status()
+    except (psutil.NoSuchProcess, psutil.ZombieProcess):
+        checks["process"] = "error"
+        healthy = False
+
+    code = 200 if healthy else 503
+    _record("/monitor/health", code)
+    _finish("/monitor/health", t)
+
+    return jsonify(
+        status=         "healthy" if healthy else "degraded",
+        checks=         checks,
+        uptime_seconds= round(time.time() - _START_TIME, 1),
+        version=        _CFG["version"],
+        build=          _CFG["build"],
+        environment=    _CFG["environment"],
+        cloud=          _CFG["cloud"],
+        region=         _CFG["region"],
+    ), code
+
+
+@monitor_bp.get("/api")
+def monitor_api() -> Response:
+    """Hello world — confirms app is alive."""
+    t = _record("/monitor/api")
+    result = jsonify(
+        message= "Hello from SentinelOps-Lite!",
+        status=  "running",
+        version= _CFG["version"],
+        build=   _CFG["build"],
+    )
+    _finish("/monitor/api", t)
+    return result
+
+
+@monitor_bp.get("/api/status")
+def monitor_api_status() -> Response:
+    """Full system status — application, system, agent, deployment."""
+    t = _record("/monitor/api/status")
+    result = jsonify(
+        application={
+            "name":        "SentinelOps-Lite",
+            "version":     _CFG["version"],
+            "build":       _CFG["build"],
+            "environment": _CFG["environment"],
+        },
+        system=     _safe_system_snapshot(),
+        agent={
+            "provider":       _CFG["provider"],
+            "model":          _CFG["model"],
+            "status":         "running",
+            "uptime_seconds": round(time.time() - _START_TIME, 1),
+        },
+        deployment={
+            "version": _CFG["version"],
+            "build":   _CFG["build"],
+            "cloud":   _CFG["cloud"],
+            "region":  _CFG["region"],
+        },
+        scanner={
+            "loaded": _SCANNER_LOADED,
+        },
+    )
+    _finish("/monitor/api/status", t)
+    return result
+
+
+@monitor_bp.get("/agent/status")
+def monitor_agent_status() -> tuple[Response, int]:
+    """AI agent running status — also refreshes dynamic metrics."""
+    t = _record("/monitor/agent/status")
+    _update_dynamic_metrics()
+    AGENT_REQUESTS_TOTAL.labels(
+        provider= _CFG["provider"],
+        model=    _CFG["model"],
+        status=   "success",
+    ).inc()
+    result = jsonify(
+        status=         "running",
+        provider=       _CFG["provider"],
+        model=          _CFG["model"],
+        uptime_seconds= round(time.time() - _START_TIME, 1),
+        scanner_loaded= _SCANNER_LOADED,
+    )
+    _finish("/monitor/agent/status", t)
+    return result, 200
+
+
+@monitor_bp.get("/metrics")
+def monitor_metrics() -> tuple[Response, int]:
+    """
+    Prometheus scrape endpoint.
+    METRICS_TOKEN empty (default) → open.
+    METRICS_TOKEN set             → Authorization: Bearer <token> required.
+    """
+    t = _record("/monitor/metrics")
+    if not _check_metrics_auth():
+        _finish("/monitor/metrics", t)
+        return (
+            Response("Unauthorized\n", status=401, mimetype="text/plain"),
+            401,
+        )
+    _update_dynamic_metrics()
+    payload = generate_latest()
+    _finish("/monitor/metrics", t)
+    return Response(payload, mimetype=CONTENT_TYPE_LATEST), 200
+
+
+# ══════════════════════════════════════════════════════════════
+# SCANNER CONSTANTS
+# ══════════════════════════════════════════════════════════════
+
+IGNORED_DIRS: set[str] = {
+    ".git", ".terraform", "node_modules", "venv", "__pycache__",
+    "dist", "build", "target", "coverage", ".cache", ".idea",
+    ".vscode", ".eggs", ".tox", ".pytest_cache", ".mypy_cache",
+    ".ruff_cache", "vendor", "bower_components", ".next", ".nuxt",
 }
 
-EXT_LANGUAGE: Dict[str, str] = {
-    ".py": "Python", ".pyi": "Python", ".ipynb": "Jupyter Notebook",
-    ".java": "Java", ".kt": "Kotlin", ".kts": "Kotlin", ".scala": "Scala",
-    ".sc": "Scala", ".groovy": "Groovy",
-    ".cs": "C#", ".fs": "F#", ".vb": "VB.NET",
-    ".js": "JavaScript", ".jsx": "JavaScript", ".mjs": "JavaScript",
-    ".cjs": "JavaScript", ".ts": "TypeScript", ".tsx": "TypeScript",
-    ".vue": "Vue", ".svelte": "Svelte",
-    ".go": "Go", ".rs": "Rust", ".rb": "Ruby", ".php": "PHP", ".pl": "Perl",
-    ".lua": "Lua", ".r": "R", ".jl": "Julia", ".dart": "Dart", ".swift": "Swift",
-    ".m": "Objective-C", ".mm": "Objective-C++",
-    ".c": "C", ".h": "C/C++ Header", ".cc": "C++", ".cpp": "C++", ".cxx": "C++",
-    ".hpp": "C++ Header", ".hh": "C++ Header",
-    ".sh": "Shell", ".bash": "Shell", ".zsh": "Shell", ".ksh": "Shell",
-    ".ps1": "PowerShell", ".psm1": "PowerShell", ".psd1": "PowerShell",
-    ".bat": "Batch", ".cmd": "Batch",
-    ".yaml": "YAML", ".yml": "YAML", ".json": "JSON", ".json5": "JSON",
-    ".jsonl": "JSON Lines", ".toml": "TOML", ".ini": "INI", ".cfg": "INI",
-    ".conf": "Config", ".properties": "Properties", ".env": "Env",
+EXTENSION_LANGUAGE_MAP: dict[str, str] = {
+    ".py": "Python", ".pyw": "Python", ".pyi": "Python",
+    ".java": "Java", ".kt": "Kotlin", ".scala": "Scala",
+    ".cs": "C#", ".vb": "VB.NET", ".fs": "F#",
+    ".js": "JavaScript", ".mjs": "JavaScript", ".jsx": "JavaScript",
+    ".ts": "TypeScript", ".tsx": "TypeScript",
+    ".go": "Go", ".rs": "Rust",
+    ".c": "C", ".cpp": "C++", ".cc": "C++", ".h": "C/C++ Header",
+    ".sh": "Shell", ".bash": "Shell", ".zsh": "Shell",
+    ".ps1": "PowerShell", ".psm1": "PowerShell",
+    ".yaml": "YAML", ".yml": "YAML",
+    ".json": "JSON", ".jsonc": "JSON",
+    ".toml": "TOML", ".ini": "INI", ".cfg": "Config", ".conf": "Config",
+    ".xml": "XML", ".html": "HTML", ".htm": "HTML",
+    ".css": "CSS", ".scss": "SCSS",
+    ".sql": "SQL", ".md": "Markdown", ".rst": "reStructuredText",
+    ".txt": "Text", ".env": "Environment",
     ".tf": "Terraform", ".tfvars": "Terraform", ".hcl": "HCL",
-    ".bicep": "Bicep",
-    ".md": "Markdown", ".markdown": "Markdown", ".mdx": "MDX", ".rst": "reStructuredText",
-    ".txt": "Text", ".adoc": "AsciiDoc",
-    ".xml": "XML", ".xsd": "XML", ".xsl": "XML", ".html": "HTML", ".htm": "HTML",
-    ".css": "CSS", ".scss": "SCSS", ".sass": "SASS", ".less": "LESS",
-    ".sql": "SQL", ".psql": "SQL", ".ddl": "SQL",
-    ".graphql": "GraphQL", ".gql": "GraphQL", ".proto": "Protocol Buffers",
-    ".jinja": "Jinja Template", ".jinja2": "Jinja Template", ".j2": "Jinja Template",
-    ".hbs": "Handlebars", ".mustache": "Mustache", ".tmpl": "Template",
-    ".tpl": "Template", ".prompt": "Prompt", ".prompty": "Prompt",
-    ".gradle": "Gradle", ".make": "Makefile", ".mk": "Makefile",
-    ".csproj": "MSBuild", ".sln": "Visual Studio Solution", ".fsproj": "MSBuild",
-    ".gitignore": "Git Config", ".dockerignore": "Docker Config",
+    ".proto": "Protobuf", ".graphql": "GraphQL",
+    ".rb": "Ruby", ".php": "PHP", ".swift": "Swift", ".dart": "Dart",
+    ".ipynb": "Jupyter Notebook",
+    ".dockerfile": "Dockerfile",
 }
 
-FILENAME_LANGUAGE: Dict[str, str] = {
-    "dockerfile": "Dockerfile", "containerfile": "Dockerfile",
-    "makefile": "Makefile", "gnumakefile": "Makefile",
-    "jenkinsfile": "Jenkins Pipeline", "vagrantfile": "Ruby",
-    "procfile": "Procfile", "gemfile": "Ruby", "rakefile": "Ruby",
-    "cmakelists.txt": "CMake", "go.mod": "Go Modules", "go.sum": "Go Modules",
-    "cargo.toml": "Rust Manifest", "package.json": "NPM Manifest",
-    "requirements.txt": "Python Requirements", "pipfile": "Python Requirements",
-    "pyproject.toml": "Python Project", "setup.py": "Python Setup",
-    "setup.cfg": "Python Setup", "pom.xml": "Maven POM",
-    ".env": "Env", ".env.example": "Env", ".env.sample": "Env", ".env.local": "Env",
-    ".gitignore": "Git Config", ".dockerignore": "Docker Config",
-    ".gitlab-ci.yml": "GitLab CI", "readme.md": "Markdown", "license": "Text",
+AI_PROVIDER_PATTERNS: dict[str, dict[str, list[str]]] = {
+    "OpenAI": {
+        "imports":   [r"import openai", r"from openai", r"openai\."],
+        "env_vars":  [r"OPENAI_API_KEY", r"OPENAI_ORG_ID", r"OPENAI_BASE_URL"],
+        "endpoints": [r"api\.openai\.com"],
+        "sdk":       "openai",
+    },
+    "Azure OpenAI": {
+        "imports":   [r"AzureOpenAI", r"openai.*azure"],
+        "env_vars":  [r"AZURE_OPENAI_KEY", r"AZURE_OPENAI_ENDPOINT",
+                      r"AZURE_OPENAI_API_KEY", r"AZURE_OPENAI_API_VERSION"],
+        "endpoints": [r"\.openai\.azure\.com"],
+        "sdk":       "openai (Azure)",
+    },
+    "Anthropic": {
+        "imports":   [r"import anthropic", r"from anthropic", r"anthropic\."],
+        "env_vars":  [r"ANTHROPIC_API_KEY", r"CLAUDE_API_KEY"],
+        "endpoints": [r"api\.anthropic\.com"],
+        "sdk":       "anthropic",
+    },
+    "Google Gemini": {
+        "imports":   [r"import google\.generativeai",
+                      r"from google\.generativeai",
+                      r"genai\.", r"GenerativeModel", r"import vertexai"],
+        "env_vars":  [r"GEMINI_API_KEY", r"GOOGLE_API_KEY",
+                      r"GOOGLE_APPLICATION_CREDENTIALS"],
+        "endpoints": [r"generativelanguage\.googleapis\.com"],
+        "sdk":       "google-generativeai",
+    },
+    "AWS Bedrock": {
+        "imports":   [r"bedrock", r"boto3.*bedrock", r"BedrockRuntime"],
+        "env_vars":  [r"AWS_ACCESS_KEY_ID", r"AWS_SECRET_ACCESS_KEY",
+                      r"BEDROCK_REGION"],
+        "endpoints": [r"bedrock\.amazonaws\.com"],
+        "sdk":       "boto3",
+    },
+    "Groq": {
+        "imports":   [r"import groq", r"from groq", r"groq\."],
+        "env_vars":  [r"GROQ_API_KEY"],
+        "endpoints": [r"api\.groq\.com"],
+        "sdk":       "groq",
+    },
+    "Cohere": {
+        "imports":   [r"import cohere", r"from cohere", r"cohere\."],
+        "env_vars":  [r"COHERE_API_KEY", r"CO_API_KEY"],
+        "endpoints": [r"api\.cohere\.ai"],
+        "sdk":       "cohere",
+    },
+    "Mistral": {
+        "imports":   [r"import mistralai", r"from mistralai", r"MistralClient"],
+        "env_vars":  [r"MISTRAL_API_KEY"],
+        "endpoints": [r"api\.mistral\.ai"],
+        "sdk":       "mistralai",
+    },
+    "Ollama": {
+        "imports":   [r"import ollama", r"from ollama", r"ollama\."],
+        "env_vars":  [r"OLLAMA_HOST", r"OLLAMA_BASE_URL"],
+        "endpoints": [r"localhost:11434"],
+        "sdk":       "ollama",
+    },
+    "HuggingFace": {
+        "imports":   [r"from transformers", r"import transformers",
+                      r"huggingface_hub", r"AutoModel", r"AutoTokenizer",
+                      r"pipeline\("],
+        "env_vars":  [r"HUGGINGFACE_API_KEY", r"HF_TOKEN",
+                      r"HUGGINGFACEHUB_API_TOKEN"],
+        "endpoints": [r"huggingface\.co"],
+        "sdk":       "transformers",
+    },
+    "OpenRouter": {
+        "imports":   [r"openrouter"],
+        "env_vars":  [r"OPENROUTER_API_KEY"],
+        "endpoints": [r"openrouter\.ai/api"],
+        "sdk":       "openai (OpenRouter)",
+    },
+    "DeepSeek": {
+        "imports":   [r"deepseek"],
+        "env_vars":  [r"DEEPSEEK_API_KEY"],
+        "endpoints": [r"api\.deepseek\.com"],
+        "sdk":       "openai (DeepSeek)",
+    },
+    "Perplexity": {
+        "imports":   [r"perplexity"],
+        "env_vars":  [r"PERPLEXITY_API_KEY", r"PPLX_API_KEY"],
+        "endpoints": [r"api\.perplexity\.ai"],
+        "sdk":       "openai (Perplexity)",
+    },
+    "LiteLLM": {
+        "imports":   [r"import litellm", r"from litellm", r"litellm\."],
+        "env_vars":  [r"LITELLM_API_KEY"],
+        "endpoints": [r"litellm"],
+        "sdk":       "litellm",
+    },
 }
 
-SOURCE_LANGS: Set[str] = {
-    "Python", "Java", "Kotlin", "Scala", "Groovy", "C#", "F#", "VB.NET", "JavaScript",
-    "TypeScript", "Vue", "Svelte", "Go", "Rust", "Ruby", "PHP", "Perl", "Lua", "R",
-    "Julia", "Dart", "Swift", "Objective-C", "Objective-C++", "C", "C++",
-    "C/C++ Header", "C++ Header", "Shell", "PowerShell", "Batch", "SQL", "GraphQL",
-    "Protocol Buffers", "Jupyter Notebook",
-}
-CONFIG_LANGS: Set[str] = {
-    "YAML", "JSON", "JSON Lines", "TOML", "INI", "Config", "Properties", "Env", "XML",
-    "NPM Manifest", "Python Requirements", "Python Project", "Python Setup",
-    "Maven POM", "Gradle", "MSBuild", "Visual Studio Solution", "Go Modules",
-    "Rust Manifest", "Git Config", "Docker Config", "CMake", "Procfile",
-}
-DOC_LANGS: Set[str] = {"Markdown", "MDX", "reStructuredText", "Text", "AsciiDoc"}
-INFRA_LANGS: Set[str] = {
-    "Terraform", "HCL", "Bicep", "Dockerfile", "Jenkins Pipeline", "GitLab CI",
-    "Makefile",
-}
-
-# ---------------------------------------------------------------- providers ---------
-# name -> (sdk hint, regex fragments, endpoint hints, env var hints)
-PROVIDER_RULES: List[Dict[str, Any]] = [
-    {"name": "Azure OpenAI", "sdk": "openai / azure-ai-openai",
-     "patterns": [r"AzureOpenAI", r"AzureChatOpenAI", r"AzureOpenAIClient",
-                  r"azure[_\-\.]openai", r"AZURE_OPENAI", r"openai\.azure\.com",
-                  r"Azure\.AI\.OpenAI", r"api-version=\d{4}-\d{2}-\d{2}"],
-     "env": [r"AZURE_OPENAI_\w+", r"AZURE_OPENAI_API_KEY", r"AZURE_OPENAI_KEY"]},
-    {"name": "OpenAI", "sdk": "openai",
-     "patterns": [r"\bfrom\s+openai\b", r"\bimport\s+openai\b", r"require\(['\"]openai['\"]\)",
-                  r"\bOpenAI\(", r"ChatOpenAI", r"OpenAIClient", r"api\.openai\.com",
-                  r"chat\.completions\.create", r"openai\.ChatCompletion"],
-     "env": [r"OPENAI_API_KEY", r"OPENAI_ORG\w*", r"OPENAI_BASE_URL"]},
-    {"name": "Anthropic", "sdk": "anthropic",
-     "patterns": [r"\banthropic\b", r"Anthropic\(", r"ChatAnthropic", r"claude-",
-                  r"api\.anthropic\.com", r"AnthropicBedrock"],
-     "env": [r"ANTHROPIC_API_KEY", r"ANTHROPIC_\w+"]},
-    {"name": "Google Gemini", "sdk": "google-generativeai / google-genai",
-     "patterns": [r"google\.generativeai", r"google\.genai", r"GenerativeModel",
-                  r"ChatGoogleGenerativeAI", r"generativelanguage\.googleapis\.com",
-                  r"\bgemini[-_]", r"VertexAI", r"vertexai"],
-     "env": [r"GEMINI_API_KEY", r"GOOGLE_API_KEY", r"GOOGLE_APPLICATION_CREDENTIALS",
-             r"VERTEX_\w+"]},
-    {"name": "AWS Bedrock", "sdk": "boto3 / aws-sdk bedrock",
-     "patterns": [r"bedrock[-_]runtime", r"\bbedrock\b", r"BedrockChat", r"ChatBedrock",
-                  r"invoke_model", r"BedrockRuntimeClient"],
-     "env": [r"AWS_ACCESS_KEY_ID", r"AWS_SECRET_ACCESS_KEY", r"AWS_REGION",
-             r"AWS_SESSION_TOKEN", r"BEDROCK_\w+"]},
-    {"name": "Mistral", "sdk": "mistralai",
-     "patterns": [r"mistralai", r"MistralClient", r"ChatMistralAI",
-                  r"api\.mistral\.ai", r"\bmistral-", r"\bmixtral"],
-     "env": [r"MISTRAL_API_KEY"]},
-    {"name": "Groq", "sdk": "groq",
-     "patterns": [r"\bfrom\s+groq\b", r"\bimport\s+groq\b", r"\bGroq\(", r"ChatGroq",
-                  r"api\.groq\.com"],
-     "env": [r"GROQ_API_KEY"]},
-    {"name": "Cohere", "sdk": "cohere",
-     "patterns": [r"\bcohere\b", r"ChatCohere", r"api\.cohere\.(ai|com)", r"command-r"],
-     "env": [r"COHERE_API_KEY", r"CO_API_KEY"]},
-    {"name": "Ollama", "sdk": "ollama",
-     "patterns": [r"\bollama\b", r"ChatOllama", r"OllamaLLM", r"localhost:11434",
-                  r"127\.0\.0\.1:11434"],
-     "env": [r"OLLAMA_HOST", r"OLLAMA_\w+"]},
-    {"name": "OpenRouter", "sdk": "openrouter / openai-compatible",
-     "patterns": [r"openrouter", r"openrouter\.ai"],
-     "env": [r"OPENROUTER_API_KEY"]},
-    {"name": "HuggingFace", "sdk": "transformers / huggingface_hub",
-     "patterns": [r"huggingface", r"transformers", r"AutoModel", r"AutoTokenizer",
-                  r"pipeline\(\s*['\"]text-generation", r"InferenceClient",
-                  r"HuggingFaceEndpoint", r"api-inference\.huggingface\.co"],
-     "env": [r"HUGGINGFACE\w*", r"HF_TOKEN", r"HUGGINGFACEHUB_API_TOKEN"]},
-    {"name": "DeepSeek", "sdk": "openai-compatible / deepseek",
-     "patterns": [r"deepseek", r"api\.deepseek\.com"],
-     "env": [r"DEEPSEEK_API_KEY"]},
-    {"name": "Perplexity", "sdk": "openai-compatible / perplexity",
-     "patterns": [r"perplexity", r"api\.perplexity\.ai", r"\bsonar[-_]"],
-     "env": [r"PERPLEXITY_API_KEY", r"PPLX_API_KEY"]},
-    {"name": "Meta Llama", "sdk": "llama-api / local weights",
-     "patterns": [r"\bllama[-_]?\d", r"llama_cpp", r"llama-cpp", r"LlamaCpp",
-                  r"meta-llama"],
-     "env": [r"LLAMA_\w+", r"REPLICATE_API_TOKEN"]},
-    {"name": "Local LLM", "sdk": "local runtime",
-     "patterns": [r"llama_cpp", r"gpt4all", r"lmstudio", r"localai", r"vllm",
-                  r"text-generation-webui", r"LocalAI"],
-     "env": [r"LOCAL_LLM\w*", r"LLM_BASE_URL"]},
-    {"name": "Custom API", "sdk": "custom http client",
-     "patterns": [r"base_url\s*=\s*['\"]https?://(?!api\.openai|api\.anthropic)",
-                  r"LLM_ENDPOINT", r"MODEL_ENDPOINT", r"INFERENCE_URL"],
-     "env": [r"LLM_ENDPOINT", r"MODEL_ENDPOINT", r"INFERENCE_URL", r"CUSTOM_LLM\w*"]},
+AI_MODEL_PATTERNS: list[str] = [
+    r"gpt-?4\.?1(?:-mini|-nano|-preview)?",
+    r"gpt-?4o(?:-mini|-preview|-audio|-realtime)?",
+    r"gpt-?4(?:-turbo|-vision|-32k|-0125|-1106|-0613)?",
+    r"gpt-?3\.?5(?:-turbo(?:-16k|-instruct|-0125|-1106)?)?",
+    r"gpt-?5", r"\bo3(?:-mini|-preview)?\b",
+    r"\bo4(?:-mini)?\b", r"\bo1(?:-mini|-preview)?\b",
+    r"claude-?3(?:\.\d+)?(?:-opus|-sonnet|-haiku)?",
+    r"claude-?3\.?5(?:-sonnet|-haiku)?",
+    r"claude-?4(?:-opus|-sonnet)?", r"claude-?2(?:\.\d+)?",
+    r"gemini-?(?:pro|ultra|flash|nano)?(?:-\d+\.\d+)?(?:-latest|-preview)?",
+    r"gemini-?1\.?5(?:-pro|-flash)?",
+    r"gemini-?2\.?0(?:-flash)?",
+    r"gemini-?2\.?5(?:-flash|-pro)?",
+    r"llama-?3(?:\.\d+)?(?:-\d+[bB])?(?:-instruct|-chat)?",
+    r"llama-?2(?:-\d+[bB])?(?:-chat|-instruct)?",
+    r"llama-?3\.?1(?:-\d+[bB])?", r"llama-?3\.?2(?:-\d+[bB])?",
+    r"mistral-(?:7b|large|medium|small|tiny|nemo)(?:-instruct)?",
+    r"mixtral-?(?:8x7b|8x22b)?(?:-instruct)?",
+    r"deepseek-(?:coder|chat|r1|v\d+|v3)(?:-\d+[bB])?",
+    r"command-?(?:r|r-plus|light|nightly)?(?:-\d+)?",
+    r"phi-?[234](?:-mini|-medium|-vision)?",
+    r"qwen(?:\d+(?:\.\d+)?)?(?:-\d+[bB])?(?:-instruct|-chat)?",
+    r"falcon-?(?:7b|40b|180b)?(?:-instruct)?",
+    r"starcoder(?:-\d+[bB]|-base)?", r"codestral",
+    r"bert-(?:base|large)(?:-uncased|-cased)?",
+    r"t5-(?:small|base|large|xl|xxl)",
 ]
 
-# ---------------------------------------------------------------- models ------------
-MODEL_PATTERNS: List[Tuple[str, str]] = [
-    # (regex, provider)
-    (r"\bgpt-5(?:\.\d+)?(?:-[a-z0-9]+)*\b", "OpenAI"),
-    (r"\bgpt-4\.1(?:-(?:mini|nano))?\b", "OpenAI"),
-    (r"\bgpt-4o(?:-(?:mini|audio|realtime|search)[\w-]*)?\b", "OpenAI"),
-    (r"\bgpt-4(?:-turbo|-32k|-vision-preview)?\b", "OpenAI"),
-    (r"\bgpt-3\.5-turbo(?:-\w+)*\b", "OpenAI"),
-    (r"\bo[134](?:-(?:mini|pro|preview))?\b", "OpenAI"),
-    (r"\btext-embedding-(?:3-(?:small|large)|ada-002)\b", "OpenAI"),
-    (r"\bwhisper-\d\b", "OpenAI"),
-    (r"\bdall-e-\d\b", "OpenAI"),
-    (r"\bclaude-(?:opus|sonnet|haiku)-[\w.\-]+\b", "Anthropic"),
-    (r"\bclaude-\d(?:\.\d)?-(?:opus|sonnet|haiku)[\w.\-]*\b", "Anthropic"),
-    (r"\bclaude-(?:instant|2|3)[\w.\-]*\b", "Anthropic"),
-    (r"\bgemini-(?:\d(?:\.\d)?)-(?:pro|flash|ultra|nano)[\w.\-]*\b", "Google Gemini"),
-    (r"\bgemini-(?:pro|ultra|flash)[\w.\-]*\b", "Google Gemini"),
-    (r"\btext-bison[\w.\-]*\b", "Google Gemini"),
-    (r"\bllama-?[234](?:\.\d)?[\w.\-]*\b", "Meta Llama"),
-    (r"\bmeta-llama/[\w.\-]+\b", "Meta Llama"),
-    (r"\bmistral-(?:tiny|small|medium|large|nemo)[\w.\-]*\b", "Mistral"),
-    (r"\bmixtral-[\w.\-]+\b", "Mistral"),
-    (r"\bcodestral[\w.\-]*\b", "Mistral"),
-    (r"\bdeepseek-(?:chat|coder|reasoner|r1|v\d)[\w.\-]*\b", "DeepSeek"),
-    (r"\bcommand-r(?:-plus)?\b", "Cohere"),
-    (r"\bcommand(?:-light|-nightly)?\b", "Cohere"),
-    (r"\bqwen[\w.\-]*\b", "Alibaba Qwen"),
-    (r"\bphi-?[234][\w.\-]*\b", "Microsoft Phi"),
-    (r"\bgemma-?\d?[\w.\-]*\b", "Google Gemma"),
-    (r"\bgrok-[\w.\-]+\b", "xAI"),
-    (r"\bsonar(?:-(?:pro|reasoning|deep-research))?\b", "Perplexity"),
-    (r"\banthropic\.claude-[\w.\-:]+\b", "AWS Bedrock"),
-    (r"\bamazon\.(?:titan|nova)-[\w.\-:]+\b", "AWS Bedrock"),
-    (r"\bcohere\.command[\w.\-:]*\b", "AWS Bedrock"),
-    (r"\bnomic-embed-text\b", "Ollama"),
-]
-
-# rough public pricing (USD per 1M tokens) -- used ONLY for a clearly-labelled estimate
-MODEL_PRICING: Dict[str, Tuple[float, float]] = {
-    "gpt-5": (1.25, 10.0), "gpt-4.1": (2.0, 8.0), "gpt-4.1-mini": (0.4, 1.6),
-    "gpt-4.1-nano": (0.1, 0.4), "gpt-4o": (2.5, 10.0), "gpt-4o-mini": (0.15, 0.6),
-    "gpt-4-turbo": (10.0, 30.0), "gpt-4": (30.0, 60.0), "gpt-3.5-turbo": (0.5, 1.5),
-    "o3": (2.0, 8.0), "o3-mini": (1.1, 4.4), "o4-mini": (1.1, 4.4), "o1": (15.0, 60.0),
-    "claude-opus": (15.0, 75.0), "claude-sonnet": (3.0, 15.0), "claude-haiku": (0.8, 4.0),
-    "gemini-1.5-pro": (1.25, 5.0), "gemini-1.5-flash": (0.075, 0.3),
-    "gemini-2.0-flash": (0.1, 0.4), "gemini-2.5-pro": (1.25, 10.0),
-    "mistral-large": (2.0, 6.0), "mistral-small": (0.2, 0.6),
-    "deepseek-chat": (0.27, 1.1), "command-r-plus": (2.5, 10.0), "command-r": (0.15, 0.6),
+AI_SDK_PATTERNS: dict[str, list[str]] = {
+    "LangChain":       [r"from langchain", r"import langchain",
+                        r"LLMChain", r"AgentExecutor", r"ChatOpenAI",
+                        r"PromptTemplate", r"ChatPromptTemplate"],
+    "LangGraph":       [r"from langgraph", r"import langgraph",
+                        r"StateGraph", r"MessageGraph"],
+    "Semantic Kernel": [r"semantic_kernel", r"SemanticKernel",
+                        r"KernelPlugin", r"KernelFunction"],
+    "AutoGen":         [r"import autogen", r"from autogen",
+                        r"AssistantAgent", r"UserProxyAgent", r"GroupChat"],
+    "CrewAI":          [r"import crewai", r"from crewai", r"Crew\("],
+    "LlamaIndex":      [r"from llama_index", r"import llama_index",
+                        r"VectorStoreIndex", r"SimpleDirectoryReader"],
+    "Haystack":        [r"import haystack", r"from haystack",
+                        r"DocumentStore"],
+    "DSPy":            [r"import dspy", r"from dspy",
+                        r"dspy\.Predict", r"dspy\.ChainOfThought"],
+    "Transformers":    [r"from transformers", r"import transformers",
+                        r"AutoModel", r"AutoTokenizer", r"pipeline\("],
+    "LiteLLM":         [r"import litellm", r"from litellm",
+                        r"litellm\.completion"],
+    "Instructor":      [r"import instructor", r"from instructor",
+                        r"instructor\.patch"],
+    "Ollama SDK":      [r"import ollama", r"from ollama",
+                        r"ollama\.chat", r"ollama\.generate"],
+    "OpenAI SDK":      [r"from openai import", r"import openai",
+                        r"client\.chat\.completions", r"AsyncOpenAI",
+                        r"OpenAI\("],
+    "Anthropic SDK":   [r"from anthropic import", r"import anthropic",
+                        r"client\.messages\.create", r"AsyncAnthropic"],
+    "Google AI SDK":   [r"import google\.generativeai",
+                        r"from google\.generativeai",
+                        r"genai\.GenerativeModel", r"vertexai\.init"],
+    "Pydantic AI":     [r"from pydantic_ai", r"import pydantic_ai"],
 }
 
-MODEL_CONTEXT: Dict[str, int] = {
-    "gpt-5": 400000, "gpt-4.1": 1047576, "gpt-4.1-mini": 1047576, "gpt-4.1-nano": 1047576,
-    "gpt-4o": 128000, "gpt-4o-mini": 128000, "gpt-4-turbo": 128000, "gpt-4": 8192,
-    "gpt-3.5-turbo": 16385, "o3": 200000, "o3-mini": 200000, "o4-mini": 200000,
-    "o1": 200000, "claude-opus": 200000, "claude-sonnet": 200000, "claude-haiku": 200000,
-    "gemini-1.5-pro": 2000000, "gemini-1.5-flash": 1000000, "gemini-2.0-flash": 1048576,
-    "gemini-2.5-pro": 1048576, "mistral-large": 128000, "mixtral": 32768,
-    "llama-3": 8192, "deepseek-chat": 64000, "command-r-plus": 128000,
+AGENT_DETECTION_PATTERNS: list[str] = [
+    r"class\s+\w*[Aa]gent\w*", r"class\s+\w*[Bb]ot\w*",
+    r"class\s+\w*[Aa]ssistant\w*", r"class\s+\w*[Oo]rchestrat\w*",
+    r"AgentExecutor", r"AssistantAgent", r"UserProxyAgent",
+    r"ConversableAgent", r"Crew\s*\(",
+    r"StateGraph\s*\(", r"MessageGraph\s*\(",
+    r"create_agent", r"build_agent", r"initialize_agent",
+    r"agent\.run\s*\(", r"agent\.invoke\s*\(",
+    r"chat_completion", r"completion\.create",
+    r"messages\.create", r"generate_content",
+    r"chain\.invoke\s*\(", r"chain\.run\s*\(",
+    r"@tool\b", r"tool_calls", r"function_call",
+]
+
+PROMPT_PATTERNS: list[str] = [
+    r"system_prompt\s*=", r"user_prompt\s*=",
+    r"system_message\s*=", r"prompt_template\s*=",
+    r"PromptTemplate\s*\(", r"ChatPromptTemplate",
+    r"SystemMessage\s*\(", r"HumanMessage\s*\(",
+    r'"role"\s*:\s*"system"', r'"role"\s*:\s*"user"',
+    r"SYSTEM_PROMPT", r"USER_PROMPT",
+    r'prompt\s*=\s*f"""', r'prompt\s*=\s*"""',
+    r"system_instruction",
+]
+
+API_KEY_MAP: dict[str, str] = {
+    "OPENAI_API_KEY":           "OpenAI",
+    "AZURE_OPENAI_KEY":         "Azure OpenAI",
+    "AZURE_OPENAI_API_KEY":     "Azure OpenAI",
+    "ANTHROPIC_API_KEY":        "Anthropic",
+    "GEMINI_API_KEY":           "Google Gemini",
+    "GOOGLE_API_KEY":           "Google",
+    "GROQ_API_KEY":             "Groq",
+    "COHERE_API_KEY":           "Cohere",
+    "MISTRAL_API_KEY":          "Mistral",
+    "HUGGINGFACE_API_KEY":      "HuggingFace",
+    "HF_TOKEN":                 "HuggingFace",
+    "HUGGINGFACEHUB_API_TOKEN": "HuggingFace",
+    "AWS_ACCESS_KEY_ID":        "AWS",
+    "AWS_SECRET_ACCESS_KEY":    "AWS",
+    "OPENROUTER_API_KEY":       "OpenRouter",
+    "DEEPSEEK_API_KEY":         "DeepSeek",
+    "PERPLEXITY_API_KEY":       "Perplexity",
+    "OLLAMA_HOST":              "Ollama",
+    "LITELLM_API_KEY":          "LiteLLM",
+    "TOGETHER_API_KEY":         "Together AI",
+    "REPLICATE_API_TOKEN":      "Replicate",
+    "PINECONE_API_KEY":         "Pinecone",
+    "WEAVIATE_API_KEY":         "Weaviate",
+    "QDRANT_API_KEY":           "Qdrant",
+    "SERPAPI_API_KEY":          "SerpAPI",
+    "TAVILY_API_KEY":           "Tavily",
 }
 
-# ---------------------------------------------------------------- SDKs --------------
-SDK_RULES: List[Tuple[str, List[str]]] = [
-    ("OpenAI SDK", [r"\bopenai\b", r"from\s+openai", r"OpenAI\(", r"AzureOpenAI\("]),
-    ("Anthropic SDK", [r"\banthropic\b", r"Anthropic\("]),
-    ("Google GenAI SDK", [r"google\.generativeai", r"google\.genai", r"GenerativeModel"]),
-    ("AWS Bedrock SDK", [r"bedrock-runtime", r"BedrockRuntime", r"bedrock_runtime"]),
-    ("LangChain", [r"\blangchain\b", r"from\s+langchain", r"langchain[_\.]core",
-                   r"langchain[_\.]community", r"@langchain/"]),
-    ("LangGraph", [r"\blanggraph\b", r"StateGraph", r"MessageGraph", r"langgraph\."]),
-    ("Semantic Kernel", [r"semantic_kernel", r"Microsoft\.SemanticKernel",
-                         r"semantic-kernel", r"\bKernel\.CreateBuilder"]),
-    ("AutoGen", [r"\bautogen\b", r"AssistantAgent", r"UserProxyAgent",
-                 r"GroupChatManager", r"autogen_agentchat"]),
-    ("CrewAI", [r"\bcrewai\b", r"from\s+crewai", r"\bCrew\(", r"\bTask\(.*agent="]),
-    ("LlamaIndex", [r"llama_index", r"llamaindex", r"VectorStoreIndex",
-                    r"ServiceContext", r"@llamaindex/"]),
-    ("Haystack", [r"\bhaystack\b", r"haystack\.components", r"Pipeline\(\)"]),
-    ("DSPy", [r"\bdspy\b", r"dspy\.(Module|Predict|ChainOfThought|Signature)"]),
-    ("Transformers", [r"\btransformers\b", r"AutoModelFor", r"AutoTokenizer",
-                      r"pipeline\("]),
-    ("LiteLLM", [r"\blitellm\b", r"litellm\.completion"]),
-    ("Instructor", [r"\binstructor\b", r"instructor\.(patch|from_openai)"]),
-    ("Ollama SDK", [r"\bollama\b", r"ollama\.(chat|generate)"]),
-    ("OpenRouter SDK", [r"openrouter"]),
-    ("Vercel AI SDK", [r"\bai/rsc\b", r"from\s+['\"]ai['\"]", r"@ai-sdk/",
-                       r"streamText\(", r"generateText\("]),
-    ("Pydantic AI", [r"pydantic_ai", r"pydantic-ai"]),
-    ("Guidance", [r"\bguidance\b", r"guidance\.(gen|select)"]),
-    ("Sentence Transformers", [r"sentence_transformers", r"SentenceTransformer"]),
-    ("Spring AI", [r"org\.springframework\.ai", r"spring-ai"]),
-    ("LangChain4j", [r"dev\.langchain4j", r"langchain4j"]),
-]
-
-# ---------------------------------------------------------------- agents ------------
-AGENT_SIGNALS: List[Tuple[str, str]] = [
-    (r"class\s+(\w*Agent\w*)\b", "Agent Class"),
-    (r"class\s+(\w*Assistant\w*)\b", "Assistant Class"),
-    (r"class\s+(\w*Orchestrator\w*)\b", "Orchestrator Class"),
-    (r"class\s+(\w*Copilot\w*)\b", "Copilot Class"),
-    (r"class\s+(\w*Bot\w*)\b", "Bot Class"),
-    (r"class\s+(\w*Chain\w*)\b", "Chain Class"),
-    (r"class\s+(\w*Planner\w*)\b", "Planner Class"),
-    (r"class\s+(\w*Worker\w*)\b", "Worker Class"),
-    (r"class\s+(\w*Crew\w*)\b", "Crew Class"),
-    (r"class\s+(\w*Supervisor\w*)\b", "Supervisor Class"),
-    (r"(?:def|async\s+def|function|func|public\s+\w+)\s+(\w*agent\w*)\s*\(", "Agent Function"),
-    (r"(?:def|async\s+def|function|func)\s+(run_\w*agent\w*)\s*\(", "Agent Runner"),
-]
-AGENT_CONSTRUCTORS: List[Tuple[str, str]] = [
-    (r"\bAgent\s*\(\s*(?:name\s*=\s*)?['\"]([\w \-]+)['\"]", "SDK Agent"),
-    (r"\bAssistantAgent\s*\(\s*(?:name\s*=\s*)?['\"]([\w \-]+)['\"]", "AutoGen Assistant Agent"),
-    (r"\bUserProxyAgent\s*\(\s*(?:name\s*=\s*)?['\"]([\w \-]+)['\"]", "AutoGen User Proxy Agent"),
-    (r"\bConversableAgent\s*\(\s*(?:name\s*=\s*)?['\"]([\w \-]+)['\"]", "AutoGen Conversable Agent"),
-    (r"\bcreate_react_agent\s*\(", "LangGraph ReAct Agent"),
-    (r"\bcreate_openai_functions_agent\s*\(", "LangChain Functions Agent"),
-    (r"\bcreate_tool_calling_agent\s*\(", "LangChain Tool-Calling Agent"),
-    (r"\bAgentExecutor\s*\(", "LangChain Agent Executor"),
-    (r"\binitialize_agent\s*\(", "LangChain Agent"),
-    (r"\bStateGraph\s*\(", "LangGraph State Machine Agent"),
-    (r"\bcrewai\.Agent\s*\(", "CrewAI Agent"),
-    (r"\bKernel\s*\(\)", "Semantic Kernel Agent"),
-    (r"\bChatCompletionAgent\s*\(", "Semantic Kernel Chat Agent"),
-    (r"\bSwarm\s*\(", "Swarm Agent"),
-]
-AI_CALL_PATTERNS: List[str] = [
-    r"chat\.completions\.create", r"completions\.create", r"ChatCompletion\.create",
-    r"messages\.create", r"generate_content", r"invoke_model", r"\.invoke\(",
-    r"\.ainvoke\(", r"\.stream\(", r"\.astream\(", r"\.predict\(", r"\.run\(",
-    r"litellm\.completion", r"ollama\.chat", r"generateText\(", r"streamText\(",
-    r"GetChatMessageContentAsync", r"CompleteChatAsync", r"createChatCompletion",
-    r"\.chat\(", r"\.complete\(", r"embeddings\.create", r"embed_query",
-]
-
-# ---------------------------------------------------------------- tools -------------
-TOOL_RULES: List[Tuple[str, List[str]]] = [
-    ("Web Search", [r"tavily", r"serpapi", r"duckduckgo", r"google_search", r"bing_search",
-                    r"web_search", r"SerperDev", r"brave_search"]),
-    ("Browser", [r"playwright", r"selenium", r"puppeteer", r"browser_tool", r"BrowserBase"]),
-    ("Vector Store", [r"pinecone", r"weaviate", r"qdrant", r"chromadb", r"\bchroma\b",
-                      r"milvus", r"faiss", r"pgvector", r"lancedb", r"opensearch",
-                      r"AzureSearch", r"azure\.search"]),
-    ("RAG", [r"\brag\b", r"retriev(?:er|al)", r"VectorStoreRetriever", r"as_retriever",
-             r"RetrievalQA", r"context_documents"]),
-    ("Database", [r"psycopg2?", r"sqlalchemy", r"pymongo", r"mysql", r"postgres",
-                  r"jdbc:", r"EntityFramework", r"gorm", r"sqlite3", r"redis"]),
-    ("Calculator", [r"calculator", r"\bnumexpr\b", r"math_tool", r"llm_math"]),
-    ("Email", [r"smtplib", r"sendgrid", r"\bmailgun\b", r"javax\.mail", r"nodemailer"]),
-    ("Slack", [r"slack_sdk", r"\bslack\b", r"WebClient\(.*slack", r"@slack/"]),
-    ("GitHub", [r"\bPyGithub\b", r"github3", r"octokit", r"api\.github\.com", r"\bgh api\b"]),
-    ("Azure", [r"azure\.\w+", r"Azure\.\w+", r"az\s+\w+", r"azure-identity",
-               r"DefaultAzureCredential"]),
-    ("AWS", [r"\bboto3\b", r"aws-sdk", r"AmazonS3", r"\bs3\b", r"lambda_client"]),
-    ("GCP", [r"google\.cloud", r"gcloud", r"bigquery"]),
-    ("Filesystem", [r"FileManagementToolkit", r"read_file", r"write_file", r"os\.walk",
-                    r"pathlib", r"fs\.readFile"]),
-    ("Shell", [r"subprocess", r"os\.system", r"ShellTool", r"child_process", r"exec\("]),
-    ("Python REPL", [r"PythonREPL", r"python_repl", r"exec\(", r"PythonAstREPLTool"]),
-    ("Memory", [r"ConversationBufferMemory", r"ConversationSummaryMemory", r"\bmemory\b",
-                r"MemorySaver", r"chat_history", r"checkpointer"]),
-    ("HTTP / API", [r"\brequests\.\w+", r"httpx", r"aiohttp", r"axios", r"fetch\(",
-                    r"RestTemplate", r"HttpClient"]),
-    ("Queue", [r"\bcelery\b", r"rabbitmq", r"\bkafka\b", r"sqs", r"servicebus", r"\bbullmq\b"]),
-    ("Scheduler", [r"\bcron\b", r"APScheduler", r"schedule\.every", r"Quartz"]),
-]
-
-WORKFLOW_RULES: List[Tuple[str, List[str]]] = [
-    ("Planning", [r"\bplan(?:ner|ning)?\b", r"create_plan", r"decompose", r"task_list",
-                  r"SequentialPlanner", r"plan_and_execute"]),
-    ("Execution", [r"\bexecut(?:e|or|ion)\b", r"AgentExecutor", r"run_step", r"act\("]),
-    ("Reflection", [r"\breflect(?:ion)?\b", r"self_critique", r"critic", r"reviewer",
-                    r"self_refine"]),
-    ("Retry", [r"\bretry\b", r"@retry", r"tenacity", r"max_retries", r"Polly", r"retryPolicy"]),
-    ("Backoff", [r"backoff", r"exponential_backoff", r"wait_exponential", r"jitter"]),
-    ("Evaluation", [r"\beval(?:uate|uation)\b", r"ragas", r"deepeval", r"scorer", r"\bjudge\b"]),
-    ("Memory", [r"ConversationBufferMemory", r"MemorySaver", r"chat_history",
-                r"vector_memory", r"checkpointer", r"\bmemory\b"]),
-    ("RAG", [r"retriev", r"RetrievalQA", r"as_retriever", r"rerank", r"\brag\b"]),
-    ("Tool Calling", [r"tool_calls", r"tool_choice", r"bind_tools", r"@tool\b",
-                      r"ToolNode", r"StructuredTool"]),
-    ("Function Calling", [r"function_call", r"functions\s*=\s*\[", r"tools\s*=\s*\[",
-                          r"FunctionDefinition", r"parallel_tool_calls"]),
-    ("Streaming", [r"stream\s*=\s*True", r"\.astream", r"streamText", r"SSE",
-                   r"text/event-stream", r"yield\s+chunk"]),
-    ("Multi-agent", [r"GroupChat", r"multi_agent", r"agents\s*=\s*\[", r"\bCrew\(",
-                     r"handoff", r"Swarm\("]),
-    ("Supervisor", [r"supervisor", r"router_agent", r"orchestrator"]),
-    ("Coordinator", [r"coordinator", r"dispatcher", r"delegat"]),
-    ("Guardrails", [r"guardrail", r"moderation", r"content_filter", r"nemoguardrails"]),
-    ("Human in the Loop", [r"human_in_the_loop", r"interrupt\(", r"approval",
-                           r"HumanApproval"]),
-]
-
-# ---------------------------------------------------------------- env keys ----------
-ENV_KEY_RE = re.compile(
-    r"\b([A-Z][A-Z0-9]*(?:_[A-Z0-9]+)*_(?:API_)?(?:KEY|TOKEN|SECRET|PASSWORD|CREDENTIALS|"
-    r"ENDPOINT|URL|URI|REGION|DEPLOYMENT|VERSION|MODEL|HOST|ID))\b")
-AI_ENV_HINT = re.compile(
-    r"(OPENAI|AZURE|ANTHROPIC|CLAUDE|GEMINI|GOOGLE|VERTEX|BEDROCK|AWS|GROQ|COHERE|"
-    r"MISTRAL|OLLAMA|OPENROUTER|HUGGINGFACE|HF_|DEEPSEEK|PERPLEXITY|PPLX|LLM|MODEL|"
-    r"REPLICATE|TOGETHER|FIREWORKS|XAI|GROK|LANGCHAIN|LANGSMITH|LANGFUSE|TAVILY|"
-    r"PINECONE|WEAVIATE|QDRANT)")
-
-ENV_LOADERS: List[Tuple[str, str]] = [
-    (r"load_dotenv|dotenv\.config|DotEnv", ".env file (dotenv loader)"),
-    (r"os\.environ|os\.getenv|process\.env|System\.getenv|Environment\.GetEnvironmentVariable|"
-     r"std::env::var|os\.Getenv", "Process environment"),
-    (r"KeyVault|SecretClient|azure\.keyvault", "Azure Key Vault"),
-    (r"SecretsManager|secretsmanager|ssm\.get_parameter", "AWS Secrets Manager / SSM"),
-    (r"pydantic_settings|BaseSettings", "Pydantic Settings"),
-    (r"ConfigMap|kind:\s*Secret", "Kubernetes ConfigMap / Secret"),
-    (r"variable\s+\"|TF_VAR_", "Terraform variables"),
-]
-
-# ---------------------------------------------------------------- purposes ----------
-# ordered rules: (purpose, path/name regex, content regex)
-PURPOSE_RULES: List[Tuple[str, Optional[str], Optional[str]]] = [
-    ("AI Agent", r"(agent|copilot|assistant|crew|swarm|orchestrat)", None),
-    ("AI Agent", None, r"class\s+\w*Agent\w*|AgentExecutor|AssistantAgent|crewai|StateGraph"),
-    ("Prompt", r"(prompt|template.*prompt|system_message|persona)", None),
-    ("Prompt", None, r"SYSTEM_PROMPT|system_prompt|PromptTemplate|ChatPromptTemplate"),
-    ("LLM", r"(llm|model|completion|inference|chat)", None),
-    ("LLM", None, r"chat\.completions\.create|generate_content|invoke_model|messages\.create"),
-    ("Memory", r"(memory|history|conversation|context_store|checkpoint)", None),
-    ("Tool", r"(tool|plugin|function_?call|skill)", None),
-    ("Workflow", r"(workflow|pipeline|graph|chain|dag|flow|saga)", None),
-    ("RAG / Vector Store", r"(rag|retriev|embedding|vector|index|ingest|chunk)", None),
-    ("Testing", r"(^|/)(tests?|spec|__tests__)(/|$)|(_test|test_|\.test\.|\.spec\.)", None),
-    ("Docker", r"(dockerfile|docker-compose|containerfile|\.dockerignore)", None),
-    ("Kubernetes", r"(k8s|kubernetes|helm|chart|manifests?)", r"apiVersion:|kind:\s*(Deployment|Service|Pod|ConfigMap|Ingress)"),
-    ("Kubernetes", r"(k8s|kubernetes|helm|chart)", None),
-    ("Terraform", r"\.tf$|\.tfvars$|terraform", None),
-    ("CI/CD Pipeline", r"(\.github/workflows|\.gitlab-ci|azure-pipelines|jenkinsfile|circleci|buildkite|\.drone)", None),
-    ("Deployment", r"(deploy|release|rollout|provision)", None),
-    ("Infrastructure", r"(infra|infrastructure|bicep|cloudformation|pulumi|ansible)", None),
-    ("API", r"(api|rest|graphql|endpoint|resource)", None),
-    ("Controller", r"(controller|handler|route|router|view)", None),
-    ("API", None, r"@app\.(get|post|put|delete|patch)|@router\.|@RestController|app\.(get|post)\(|FastAPI\(|express\(\)"),
-    ("Database", r"(model|entity|schema|migration|repositor|dao|orm|db)", None),
-    ("Database", None, r"CREATE TABLE|sqlalchemy|SELECT .* FROM|@Entity|mongoose\.Schema"),
-    ("Service", r"(service|manager|provider|usecase|business|domain)", None),
-    ("Authentication", r"(auth|login|signin|oauth|jwt|token_service|identity|session)", None),
-    ("Authorization", r"(rbac|permission|policy|acl|authoriz|guard)", None),
-    ("Logging", r"(log|logger|logging|audit)", None),
-    ("Monitoring", r"(monitor|health|probe|trace|otel|telemetry|observab)", None),
-    ("Metrics", r"(metric|prometheus|grafana|stats|usage)", None),
-    ("Scheduler", r"(schedul|cron|job|timer|task_runner|worker)", None),
-    ("Queue", r"(queue|broker|kafka|rabbit|sqs|pubsub|topic|consumer|producer)", None),
-    ("CLI", r"(cli|command|console|main|__main__|entrypoint|bin/)", None),
-    ("CLI", None, r"argparse|click\.command|cobra\.Command|commander|typer\.Typer"),
-    ("Frontend", r"(component|page|ui|view|frontend|client|web/|static|styles?)", None),
-    ("Frontend", None, r"import\s+React|useState\(|<template>|@Component\("),
-    ("Backend", r"(server|backend|app|main|host|startup|program)", None),
-    ("Configuration", r"(config|settings|conf|options|env|properties|\.ini|\.toml)", None),
-    ("Documentation", r"(readme|docs?/|changelog|contributing|license|architecture|adr)", None),
-    ("Utility", r"(util|helper|common|shared|lib|tools?/|misc)", None),
-    ("Package Manifest", r"(package\.json|requirements|pyproject|pom\.xml|build\.gradle|cargo\.toml|go\.mod|\.csproj)", None),
-]
-
-DESCRIPTION_HINTS: Dict[str, str] = {
-    "AI Agent": "Implements or wires an AI agent: builds the LLM client, holds the agent loop and coordinates tools.",
-    "Prompt": "Holds prompt text/templates used to instruct the language model.",
-    "LLM": "Performs direct language-model / inference calls and handles model responses.",
-    "Memory": "Stores or retrieves conversation state, history or agent memory.",
-    "Tool": "Defines callable tools/functions that an agent can invoke.",
-    "Workflow": "Defines orchestration flow: steps, graph nodes, chains or pipeline stages.",
-    "RAG / Vector Store": "Handles embeddings, chunking, indexing and retrieval for grounded generation.",
-    "Testing": "Automated test code validating behaviour of the codebase.",
-    "Docker": "Container build/compose definition for packaging and running the service.",
-    "Kubernetes": "Kubernetes manifest describing workloads, services or configuration.",
-    "Terraform": "Terraform IaC defining cloud resources and their configuration.",
-    "CI/CD Pipeline": "Continuous integration/delivery pipeline definition.",
-    "Deployment": "Deployment scripts or descriptors for shipping the application.",
-    "Infrastructure": "Infrastructure-as-code / platform provisioning assets.",
-    "API": "Exposes HTTP/GraphQL endpoints and request-response contracts.",
-    "Controller": "Routes inbound requests to services and shapes responses.",
-    "Database": "Data models, schema, migrations or persistence access code.",
-    "Service": "Business/domain logic invoked by controllers and agents.",
-    "Authentication": "Verifies caller identity (login, tokens, credentials).",
-    "Authorization": "Enforces access control, roles, scopes and policies.",
-    "Logging": "Log configuration and structured logging helpers.",
-    "Monitoring": "Health checks, tracing and observability wiring.",
-    "Metrics": "Collects and exposes counters, usage and performance metrics.",
-    "Scheduler": "Timed or recurring job execution.",
-    "Queue": "Asynchronous messaging: producers, consumers and brokers.",
-    "CLI": "Command-line entrypoint and argument handling.",
-    "Frontend": "User-interface code, components, views or styling.",
-    "Backend": "Application bootstrap / server composition root.",
-    "Configuration": "Configuration values, settings and environment wiring.",
-    "Documentation": "Human-readable documentation for the repository.",
-    "Utility": "Reusable helper functions shared across modules.",
-    "Package Manifest": "Declares dependencies and build metadata for the package.",
-    "General": "General-purpose source or asset file.",
+TOKEN_CONFIG_PATTERNS: dict[str, str] = {
+    "max_tokens":            r"max_tokens\s*=\s*(\d+)",
+    "temperature":           r"temperature\s*=\s*([\d.]+)",
+    "top_p":                 r"top_p\s*=\s*([\d.]+)",
+    "max_completion_tokens": r"max_completion_tokens\s*=\s*(\d+)",
+    "max_output_tokens":     r"max_output_tokens\s*=\s*(\d+)",
+    "context_window":        r"context_window\s*=\s*(\d+)",
+    "top_k":                 r"top_k\s*=\s*(\d+)",
+    "presence_penalty":      r"presence_penalty\s*=\s*([\d.-]+)",
+    "frequency_penalty":     r"frequency_penalty\s*=\s*([\d.-]+)",
 }
 
-TEST_PATH_RE = re.compile(r"(^|/)(tests?|spec|specs|__tests__|testing)(/|$)|"
-                          r"(^|/)(test_[^/]+|[^/]+_test|[^/]+\.test|[^/]+\.spec)\.\w+$", re.I)
+TOOL_PATTERNS: dict[str, list[str]] = {
+    "Web Search":       [r"serpapi", r"tavily", r"DuckDuckGoSearch",
+                         r"GoogleSearch", r"web_search"],
+    "Vector Store":     [r"pinecone", r"weaviate", r"qdrant", r"chroma",
+                         r"faiss", r"milvus", r"VectorStore"],
+    "Database":         [r"sqlite", r"postgresql", r"mysql", r"mongodb",
+                         r"SQLDatabase"],
+    "RAG":              [r"\bRAG\b", r"retrieval_augmented",
+                         r"VectorStoreRetriever", r"similarity_search"],
+    "Calculator":       [r"calculator", r"Calculator", r"wolfram",
+                         r"LLMMathChain"],
+    "Browser":          [r"playwright", r"selenium", r"puppeteer",
+                         r"WebBrowser"],
+    "Email":            [r"smtp", r"sendgrid", r"mailgun", r"EmailTool"],
+    "Slack":            [r"slack_sdk", r"SlackTool"],
+    "GitHub":           [r"PyGithub", r"github_tool", r"GitHubToolkit"],
+    "Filesystem":       [r"ReadFileTool", r"WriteFileTool",
+                         r"FilesystemTool"],
+    "Shell":            [r"BashProcess", r"ShellTool", r"shell_tool"],
+    "Python REPL":      [r"PythonREPL", r"python_repl",
+                         r"PythonInterpreter"],
+    "Memory":           [r"ConversationBufferMemory", r"MemorySaver",
+                         r"checkpointer", r"ConversationSummaryMemory"],
+    "Code Interpreter": [r"code_interpreter", r"CodeInterpreter", r"E2B"],
+}
 
-AI_KEYWORD_RE = re.compile(
-    r"(openai|anthropic|claude|gemini|bedrock|langchain|langgraph|llama|mistral|groq|"
-    r"cohere|ollama|huggingface|transformers|deepseek|perplexity|semantic_kernel|"
-    r"semantickernel|autogen|crewai|llama_index|llamaindex|haystack|litellm|dspy|"
-    r"instructor|openrouter|\bllm\b|\bgpt-|prompt|embedding|completion|inference|"
-    r"chat_model|chatmodel|agent|vertexai|azure_openai|azureopenai)", re.I)
+WORKFLOW_PATTERNS: dict[str, list[str]] = {
+    "Planning":        [r"plan\s*\(", r"planner", r"PlanAndExecute"],
+    "Execution":       [r"execute\s*\(", r"executor", r"AgentExecutor"],
+    "Reflection":      [r"reflect\s*\(", r"reflection", r"self_critique"],
+    "Retry":           [r"retry", r"backoff", r"tenacity", r"max_retries"],
+    "Evaluation":      [r"evaluate\s*\(", r"evaluator", r"QAEvalChain"],
+    "Memory":          [r"memory\s*=", r"ConversationMemory",
+                        r"MemorySaver"],
+    "RAG":             [r"retrieve\s*\(", r"retriever\s*=",
+                        r"similarity_search"],
+    "Tool Calling":    [r"tool_calls", r"function_call", r"@tool",
+                        r"Tool\s*\("],
+    "Streaming":       [r"stream\s*\(", r"streaming\s*=\s*True",
+                        r"stream_tokens"],
+    "Multi-agent":     [r"MultiAgent", r"GroupChat", r"Crew\s*\(",
+                        r"supervisor"],
+    "Supervisor":      [r"supervisor", r"SupervisorAgent",
+                        r"orchestrator"],
+    "Function Calling":[r"functions\s*=\s*\[", r"tools\s*=\s*\["],
+}
 
-# =====================================================================================
-# SECTION 2 -- DATA MODEL
-# =====================================================================================
 
+# ══════════════════════════════════════════════════════════════
+# DATA CLASSES
+# ══════════════════════════════════════════════════════════════
 
 @dataclass
 class FileRecord:
-    serial: int = 0
-    rel_path: str = ""
-    name: str = ""
-    ext: str = ""
-    language: str = "Unknown"
-    category: str = "Other"
-    purpose: str = "General"
-    description: str = ""
-    size_bytes: int = 0
-    size_human: str = ""
-    lines_total: int = 0
-    lines_code: int = 0
-    is_used: str = NA
-    is_referenced: str = "No"
-    is_ai_related: str = "No"
-    dependencies: List[str] = field(default_factory=list)
-    internal_dependencies: List[str] = field(default_factory=list)
-    classes: List[str] = field(default_factory=list)
-    functions: List[str] = field(default_factory=list)
-    endpoints: List[str] = field(default_factory=list)
-    providers: List[str] = field(default_factory=list)
-    models: List[str] = field(default_factory=list)
-    sdks: List[str] = field(default_factory=list)
-    tools: List[str] = field(default_factory=list)
-    workflows: List[str] = field(default_factory=list)
-    env_vars: List[str] = field(default_factory=list)
-    agents: List[str] = field(default_factory=list)
-    prompt_count: int = 0
-    ai_calls: int = 0
-    module_names: List[str] = field(default_factory=list)
-    sha1: str = ""
-    binary: bool = False
-
-
-# =====================================================================================
-# SECTION 3 -- HELPERS
-# =====================================================================================
-
-
-def human_size(n: int) -> str:
-    step = 1024.0
-    val = float(n)
-    for unit in ("B", "KB", "MB", "GB", "TB"):
-        if val < step or unit == "TB":
-            return f"{val:.0f} {unit}" if unit == "B" else f"{val:.1f} {unit}"
-        val /= step
-    return f"{n} B"
-
-
-def uniq(seq: Iterable[str]) -> List[str]:
-    return sorted({s for s in seq if s})
-
-
-def safe_read(path: str, max_bytes: int) -> Tuple[str, bool]:
-    """Return (text, is_binary). Never raises."""
-    try:
-        if os.path.getsize(path) > max_bytes:
-            with open(path, "rb") as fh:
-                raw = fh.read(max_bytes)
-        else:
-            with open(path, "rb") as fh:
-                raw = fh.read()
-    except OSError:
-        return "", True
-    if b"\x00" in raw[:8000]:
-        return "", True
-    for enc in ("utf-8", "utf-16", "latin-1"):
-        try:
-            return raw.decode(enc), False
-        except (UnicodeDecodeError, LookupError):
-            continue
-    return "", True
-
-
-def strip_noise(text: str) -> str:
-    """Remove comment-only noise for code-line counting (best effort, language agnostic)."""
-    out = []
-    for line in text.splitlines():
-        s = line.strip()
-        if not s:
-            continue
-        if s.startswith(("#", "//", "/*", "*", "--", "<!--", ";")):
-            continue
-        out.append(line)
-    return "\n".join(out)
-
-
-def findall(patterns: Sequence[str], text: str, flags: int = re.I) -> List[str]:
-    hits: List[str] = []
-    for p in patterns:
-        try:
-            for m in re.finditer(p, text, flags):
-                hits.append(m.group(0))
-        except re.error:
-            continue
-    return hits
-
-
-def count_matches(patterns: Sequence[str], text: str, flags: int = re.I) -> int:
-    total = 0
-    for p in patterns:
-        try:
-            total += len(re.findall(p, text, flags))
-        except re.error:
-            pass
-    return total
-
-
-def estimate_tokens(text: str) -> int:
-    """~4 characters per token heuristic (documented as an estimate everywhere)."""
-    return max(0, int(len(text) / 4))
-
-
-def norm_model(model: str) -> str:
-    return model.strip().strip("\"'").lower()
-
-
-def price_for(model: str) -> Optional[Tuple[float, float]]:
-    m = norm_model(model)
-    best: Optional[Tuple[str, Tuple[float, float]]] = None
-    for key, val in MODEL_PRICING.items():
-        if key in m and (best is None or len(key) > len(best[0])):
-            best = (key, val)
-    return best[1] if best else None
-
-
-def context_for(model: str) -> Optional[int]:
-    m = norm_model(model)
-    best: Optional[Tuple[str, int]] = None
-    for key, val in MODEL_CONTEXT.items():
-        if key in m and (best is None or len(key) > len(best[0])):
-            best = (key, val)
-    return best[1] if best else None
-
-
-# =====================================================================================
-# SECTION 4 -- LANGUAGE / CATEGORY / PURPOSE CLASSIFICATION
-# =====================================================================================
-
-
-def detect_language(name: str, ext: str) -> str:
-    low = name.lower()
-    if low in FILENAME_LANGUAGE:
-        return FILENAME_LANGUAGE[low]
-    for key, lang in FILENAME_LANGUAGE.items():
-        if low == key or low.startswith(key + "."):
-            return lang
-    if low.startswith("dockerfile"):
-        return "Dockerfile"
-    if low.startswith(".env"):
-        return "Env"
-    if ext in EXT_LANGUAGE:
-        return EXT_LANGUAGE[ext]
-    if not ext and low.isupper():
-        return "Text"
-    return "Unknown"
-
-
-def detect_category(rel: str, language: str) -> str:
-    if TEST_PATH_RE.search(rel):
-        return "Test"
-    if language in INFRA_LANGS:
-        return "Infrastructure"
-    if language in DOC_LANGS:
-        return "Documentation"
-    if language in CONFIG_LANGS:
-        return "Configuration"
-    if language in SOURCE_LANGS:
-        return "Source"
-    if language in ("Jinja Template", "Handlebars", "Mustache", "Template", "Prompt"):
-        return "Template"
-    if language in ("HTML", "CSS", "SCSS", "SASS", "LESS", "MDX"):
-        return "Frontend Asset"
-    return "Other"
-
-
-def detect_purpose(rel: str, name: str, text: str, category: str) -> str:
-    path_key = rel.lower()
-    body = text[:200000]
-    if category == "Test":
-        return "Testing"
-    for purpose, path_re, content_re in PURPOSE_RULES:
-        if path_re and re.search(path_re, path_key, re.I):
-            return purpose
-        if content_re and body and re.search(content_re, body):
-            return purpose
-    if category == "Documentation":
-        return "Documentation"
-    if category == "Configuration":
-        return "Configuration"
-    return "General"
-
-
-def build_description(rec: FileRecord, text: str) -> str:
-    """Prefer a real docstring/header comment; otherwise synthesise from signals."""
-    doc = extract_doc_summary(text, rec.language)
-    if doc:
-        return doc
-    parts: List[str] = [DESCRIPTION_HINTS.get(rec.purpose, DESCRIPTION_HINTS["General"])]
-    extra: List[str] = []
-    if rec.agents:
-        extra.append("Defines agent(s): " + ", ".join(rec.agents[:4]))
-    if rec.providers:
-        extra.append("Provider(s): " + ", ".join(rec.providers))
-    if rec.models:
-        extra.append("Model(s): " + ", ".join(rec.models[:4]))
-    if rec.sdks:
-        extra.append("SDK(s): " + ", ".join(rec.sdks[:4]))
-    if rec.endpoints:
-        extra.append(f"{len(rec.endpoints)} HTTP endpoint(s)")
-    if rec.classes or rec.functions:
-        extra.append(f"{len(rec.classes)} class(es), {len(rec.functions)} function(s)")
-    if extra:
-        parts.append(" | ".join(extra) + ".")
-    return " ".join(parts)
-
-
-def extract_doc_summary(text: str, language: str) -> str:
-    if not text:
-        return ""
-    head = text[:4000]
-    m = re.search(r'^\s*(?:#!.*\n)?(?:#.*\n)*\s*(?:"""|\'\'\')(.{10,400}?)(?:"""|\'\'\')',
-                  head, re.S)
-    if m:
-        return " ".join(m.group(1).split())[:300]
-    m = re.search(r"/\*\*(.{10,400}?)\*/", head, re.S)
-    if m:
-        cleaned = re.sub(r"^\s*\*\s?", "", m.group(1), flags=re.M)
-        return " ".join(cleaned.split())[:300]
-    if language in DOC_LANGS:
-        for line in head.splitlines():
-            s = line.strip().lstrip("#").strip()
-            if len(s) > 15 and not s.startswith(("!", "[", "|", "-", "=")):
-                return s[:300]
-    lines = head.splitlines()[:6]
-    comments = [l.strip().lstrip("#/;-* ").strip() for l in lines
-                if l.strip().startswith(("#", "//", ";", "--"))]
-    comments = [c for c in comments if len(c) > 15 and "!/" not in c]
-    if comments:
-        return " ".join(comments)[:300]
-    return ""
-
-
-# =====================================================================================
-# SECTION 5 -- STRUCTURAL EXTRACTION (classes, functions, imports, endpoints)
-# =====================================================================================
-
-CLASS_RES = [
-    r"^\s*class\s+([A-Za-z_]\w*)",                                   # py/js/ts/php/scala
-    r"\b(?:public|private|internal|protected|abstract|sealed|final|static)?\s*"
-    r"(?:class|interface|record|enum|struct)\s+([A-Za-z_]\w*)",      # java/c#/kotlin
-    r"^\s*type\s+([A-Za-z_]\w*)\s+struct",                           # go
-    r"^\s*(?:pub\s+)?struct\s+([A-Za-z_]\w*)",                       # rust
-    r"^\s*(?:pub\s+)?trait\s+([A-Za-z_]\w*)",                        # rust
-]
-FUNC_RES = [
-    r"^\s*(?:async\s+)?def\s+([A-Za-z_]\w*)",                        # python
-    r"^\s*(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_]\w*)",     # js/ts
-    r"^\s*(?:export\s+)?const\s+([A-Za-z_]\w*)\s*=\s*(?:async\s*)?\(", # js arrow
-    r"^\s*func\s+(?:\([^)]*\)\s*)?([A-Za-z_]\w*)",                   # go
-    r"^\s*(?:pub\s+)?(?:async\s+)?fn\s+([A-Za-z_]\w*)",              # rust
-    r"^\s*(?:public|private|protected|internal|static|final|override|suspend|virtual|async)"
-    r"[\w<>\[\],\s\.]*\s+([A-Za-z_]\w*)\s*\([^;]*\)\s*\{",           # java/c#/kotlin
-    r"^\s*(?:fun)\s+([A-Za-z_]\w*)",                                 # kotlin
-    r"^\s*(?:function)\s+([A-Za-z_]\w*)\s*\{",                       # shell
-    r"^\s*([A-Za-z_]\w*)\s*\(\)\s*\{",                               # shell
-]
-IMPORT_RES = [
-    r"^\s*import\s+([\w\.]+)",
-    r"^\s*from\s+([\w\.]+)\s+import",
-    r"^\s*using\s+([\w\.]+)\s*;",
-    r"require\(\s*['\"]([^'\"]+)['\"]\s*\)",
-    r"^\s*import\s+.*?from\s+['\"]([^'\"]+)['\"]",
-    r"^\s*import\s+['\"]([^'\"]+)['\"]",
-    r"^\s*use\s+([\w:]+)",
-    r"^\s*#include\s+[<\"]([^>\"]+)[>\"]",
-    r"^\s*source\s+([\w\./\-]+)",
-    r"^\s*@?Import\(\s*['\"]?([\w\./\-]+)",
-]
-ENDPOINT_RES = [
-    r"@(?:app|router|api|bp|blueprint)\.(get|post|put|delete|patch|head|options)\(\s*['\"]([^'\"]+)['\"]",
-    r"@(?:Get|Post|Put|Delete|Patch)Mapping\(\s*(?:value\s*=\s*)?['\"]([^'\"]+)['\"]",
-    r"@RequestMapping\(\s*(?:value\s*=\s*)?['\"]([^'\"]+)['\"]",
-    r"\[Http(Get|Post|Put|Delete|Patch)\(\s*\"([^\"]*)\"\s*\)\]",
-    r"(?:app|router)\.(get|post|put|delete|patch)\(\s*['\"]([^'\"]+)['\"]",
-    r"http\.HandleFunc\(\s*\"([^\"]+)\"",
-    r"\.route\(\s*['\"]([^'\"]+)['\"]",
-    r"path\(\s*['\"]([^'\"]+)['\"]",
-]
-
-
-def extract_structure(text: str) -> Tuple[List[str], List[str], List[str], List[str]]:
-    classes: List[str] = []
-    functions: List[str] = []
-    imports: List[str] = []
-    endpoints: List[str] = []
-    body = text[:400000]
-    for pat in CLASS_RES:
-        classes += re.findall(pat, body, re.M)
-    for pat in FUNC_RES:
-        functions += re.findall(pat, body, re.M)
-    for pat in IMPORT_RES:
-        imports += re.findall(pat, body, re.M)
-    for pat in ENDPOINT_RES:
-        for m in re.finditer(pat, body, re.M):
-            groups = [g for g in m.groups() if g]
-            if not groups:
-                continue
-            if len(groups) >= 2:
-                endpoints.append(f"{groups[0].upper()} {groups[1]}")
-            else:
-                endpoints.append(groups[0])
-    keywords = {"if", "for", "while", "switch", "catch", "return", "new", "class",
-                "function", "def", "get", "set", "try", "else", "do", "main_"}
-    functions = [f for f in functions if f.lower() not in keywords]
-    return uniq(classes), uniq(functions), uniq(imports), uniq(endpoints)
-
-
-# =====================================================================================
-# SECTION 6 -- AI DETECTION
-# =====================================================================================
-
-
-def detect_providers(text: str) -> List[Tuple[str, str]]:
-    found: List[Tuple[str, str]] = []
-    for rule in PROVIDER_RULES:
-        if count_matches(rule["patterns"], text) > 0:
-            found.append((rule["name"], rule["sdk"]))
-    names = {n for n, _ in found}
-    # Azure OpenAI implies OpenAI SDK usage, keep both only when both signals are strong
-    if "Azure OpenAI" in names and "OpenAI" in names:
-        if count_matches([r"api\.openai\.com", r"OpenAI\(\s*api_key"], text) == 0:
-            found = [f for f in found if f[0] != "OpenAI"]
-    return sorted(set(found))
-
-
-def detect_models(text: str) -> List[Tuple[str, str, int]]:
-    """Match model ids, keeping only the longest match at each text position so that
-    e.g. 'gpt-4.1-mini' is not also reported as 'gpt-4'."""
-    spans: List[Tuple[int, int, str, str]] = []
-    for pat, provider in MODEL_PATTERNS:
-        for m in re.finditer(pat, text, re.I):
-            spans.append((m.start(), m.end(), m.group(0), provider))
-    spans.sort(key=lambda s: (s[0], -(s[1] - s[0]), s[2]))
-    kept: List[Tuple[int, int, str, str]] = []
-    for s in spans:
-        if any(s[0] >= k[0] and s[1] <= k[1] for k in kept):
-            continue  # fully contained in a longer match
-        kept.append(s)
-    out: Dict[str, Tuple[str, int]] = {}
-    for _, _, name, provider in kept:
-        key = name.lower()
-        prev = out.get(key)
-        out[key] = (prev[0] if prev else provider, (prev[1] if prev else 0) + 1)
-    return sorted([(k, v[0], v[1]) for k, v in out.items()])
-
-
-def detect_sdks(text: str) -> List[str]:
-    return sorted({name for name, pats in SDK_RULES if count_matches(pats, text) > 0})
-
-
-def detect_tools(text: str) -> List[str]:
-    return sorted({name for name, pats in TOOL_RULES if count_matches(pats, text) > 0})
-
-
-def detect_workflows(text: str) -> List[str]:
-    return sorted({name for name, pats in WORKFLOW_RULES if count_matches(pats, text) > 0})
-
-
-def detect_env_vars(text: str) -> List[str]:
-    hits = set(ENV_KEY_RE.findall(text))
-    for pat in (r"os\.getenv\(\s*['\"]([A-Za-z_][\w]*)['\"]",
-                r"os\.environ(?:\.get)?[\(\[]\s*['\"]([A-Za-z_][\w]*)['\"]",
-                r"process\.env\.([A-Za-z_]\w*)",
-                r"process\.env\[['\"]([A-Za-z_]\w*)['\"]\]",
-                r"System\.getenv\(\s*\"([A-Za-z_]\w*)\"",
-                r"Environment\.GetEnvironmentVariable\(\s*\"([A-Za-z_]\w*)\"",
-                r"os\.Getenv\(\s*\"([A-Za-z_]\w*)\"",
-                r"env::var\(\s*\"([A-Za-z_]\w*)\"",
-                r"^\s*([A-Z][A-Z0-9_]{2,})\s*=", ):
-        hits.update(re.findall(pat, text, re.M))
-    noise = re.compile(r"(PROMPT|TEMPLATE|MESSAGE|INSTRUCTION|PERSONA|SCHEMA|QUERY|SQL)$")
-    return sorted({h for h in hits if len(h) > 2 and h.isupper() and not noise.search(h)})
-
-
-def detect_agents(text: str, rel_path: str) -> List[Dict[str, str]]:
-    agents: List[Dict[str, str]] = []
-    seen: Set[str] = set()
-    for pat, kind in AGENT_SIGNALS:
-        for m in re.finditer(pat, text, re.M):
-            name = m.group(1)
-            if not name or name.lower() in {"agent", "baseagent"} and kind == "Agent Function":
-                pass
-            key = name.lower()
-            if key in seen:
-                continue
-            seen.add(key)
-            agents.append({"name": name, "type": kind})
-    for pat, kind in AGENT_CONSTRUCTORS:
-        for m in re.finditer(pat, text):
-            name = m.group(1) if m.groups() else ""
-            if not name:
-                name = os.path.splitext(os.path.basename(rel_path))[0]
-            key = name.lower() + "|" + kind
-            if key in seen:
-                continue
-            seen.add(key)
-            agents.append({"name": name, "type": kind})
-    return agents
-
-
-def detect_prompts(text: str, rel: str, language: str) -> List[Dict[str, Any]]:
-    """Locate prompts: dedicated prompt files + inline prompt strings/templates."""
-    prompts: List[Dict[str, Any]] = []
-    low_rel = rel.lower()
-    is_prompt_file = bool(re.search(r"(prompt|persona|instruction|system_message|template)",
-                                    low_rel))
-
-    def add(name: str, kind: str, content: str, line: int) -> None:
-        content = content.strip()
-        if len(content) < 12:
-            return
-        prompts.append({
-            "name": name, "type": kind, "line": line,
-            "chars": len(content), "estimated_tokens": estimate_tokens(content),
-            "preview": " ".join(content.split())[:160],
-        })
-
-    # 1) whole-file prompts
-    if is_prompt_file and language in (DOC_LANGS | {"Prompt", "Jinja Template", "Template",
-                                                    "Handlebars", "Mustache", "Text"}):
-        kind = {"Markdown": "Markdown Prompt File"}.get(language, "Prompt File")
-        add(os.path.basename(rel), kind, text, 1)
-        return prompts
-
-    # 2) structured prompts inside json/yaml
-    if language in ("JSON", "YAML") and is_prompt_file:
-        for m in re.finditer(r"^[ \t\-]*['\"]?([\w .\-]*(?:prompt|instruction|system|persona|"
-                             r"message|template)[\w .\-]*)['\"]?\s*[:=]\s*(.+)$",
-                             text, re.I | re.M):
-            add(m.group(1).strip(), f"{language} Prompt", m.group(2), text[:m.start()].count("\n") + 1)
-        if prompts:
-            return prompts
-
-    # 3) named constants holding prompts
-    for m in re.finditer(
-            r"([A-Za-z_][\w\.]*(?:PROMPT|prompt|INSTRUCTION|instruction|SYSTEM_MESSAGE|"
-            r"TEMPLATE|template|PERSONA|persona)[\w]*)\s*[:=]\s*"
-            r"(?:f|r|rb|b)?(\"\"\"|'''|`|\"|')(.*?)\2", text, re.S):
-        name, _, body = m.group(1), m.group(2), m.group(3)
-        kind = "System Prompt" if re.search(r"system", name, re.I) else \
-               "User Prompt" if re.search(r"user", name, re.I) else \
-               "Developer Prompt" if re.search(r"developer", name, re.I) else \
-               "Prompt Template" if re.search(r"template", name, re.I) else "Named Prompt"
-        add(name, kind, body, text[:m.start()].count("\n") + 1)
-
-    # 4) role-tagged inline messages
-    for m in re.finditer(r"['\"]role['\"]\s*:\s*['\"](system|user|assistant|developer)['\"]"
-                         r"\s*,\s*['\"]content['\"]\s*:\s*"
-                         r"(?:f|r)?(\"\"\"|'''|`|\"|')(.*?)\2", text, re.S | re.I):
-        role = m.group(1).capitalize()
-        add(f"{role} message", f"{role} Prompt", m.group(3), text[:m.start()].count("\n") + 1)
-
-    # 5) framework prompt builders
-    for m in re.finditer(r"(?:SystemMessage|HumanMessage|AIMessage|SystemMessagePromptTemplate|"
-                         r"HumanMessagePromptTemplate|PromptTemplate\.from_template|"
-                         r"ChatPromptTemplate\.from_template|from_messages)\s*\(\s*"
-                         r"(?:content\s*=\s*)?(\"\"\"|'''|`|\"|')(.*?)\1", text, re.S):
-        add("Framework prompt", "Prompt Template", m.group(2),
-            text[:m.start()].count("\n") + 1)
-
-    # 6) prompt-ish long strings in obvious prompt files
-    if is_prompt_file and not prompts:
-        for m in re.finditer(r"(\"\"\"|''')(.*?)\1", text, re.S):
-            add("Inline prompt", "Inline Prompt", m.group(2),
-                text[:m.start()].count("\n") + 1)
-
-    # dedupe deterministically
-    out, seen = [], set()
-    for p in prompts:
-        key = (p["name"], p["preview"][:60])
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(p)
-    return out
-
-
-NUM_PARAM_RES: Dict[str, List[str]] = {
-    "max_tokens": [r"max_tokens\s*[:=]\s*(\d+)", r"maxTokens\s*[:=]\s*(\d+)",
-                   r"max_output_tokens\s*[:=]\s*(\d+)", r"MaxTokens\s*=\s*(\d+)",
-                   r"max_completion_tokens\s*[:=]\s*(\d+)", r"maxOutputTokens\s*[:=]\s*(\d+)"],
-    "temperature": [r"temperature\s*[:=]\s*([0-9.]+)", r"Temperature\s*=\s*([0-9.]+)"],
-    "top_p": [r"top_p\s*[:=]\s*([0-9.]+)", r"topP\s*[:=]\s*([0-9.]+)", r"TopP\s*=\s*([0-9.]+)"],
-    "timeout": [r"timeout\s*[:=]\s*([0-9.]+)", r"Timeout\s*=\s*([0-9.]+)",
-                r"request_timeout\s*[:=]\s*([0-9.]+)"],
-    "max_retries": [r"max_retries\s*[:=]\s*(\d+)", r"maxRetries\s*[:=]\s*(\d+)",
-                    r"retries\s*[:=]\s*(\d+)", r"retry_count\s*[:=]\s*(\d+)"],
-    "context_window": [r"context_window\s*[:=]\s*(\d+)", r"num_ctx\s*[:=]\s*(\d+)",
-                       r"max_context\w*\s*[:=]\s*(\d+)"],
-}
-RATE_LIMIT_RES: Dict[str, List[str]] = {
-    "requests_per_minute": [r"(?:rpm|requests_per_minute|requestsPerMinute|"
-                            r"rate_limit_rpm)\s*[:=]\s*(\d+)"],
-    "requests_per_day": [r"(?:rpd|requests_per_day|requestsPerDay|daily_limit)\s*[:=]\s*(\d+)"],
-    "requests_per_month": [r"(?:requests_per_month|monthly_limit|monthly_quota)\s*[:=]\s*(\d+)"],
-    "tokens_per_minute": [r"(?:tpm|tokens_per_minute|tokensPerMinute)\s*[:=]\s*(\d+)"],
-    "concurrency": [r"(?:max_concurrency|concurrency|max_workers|parallelism)\s*[:=]\s*(\d+)"],
-}
-
-
-def extract_numeric_params(text: str) -> Dict[str, List[str]]:
-    out: Dict[str, List[str]] = {}
-    for key, pats in {**NUM_PARAM_RES, **RATE_LIMIT_RES}.items():
-        vals: List[str] = []
-        for p in pats:
-            vals += re.findall(p, text)
-        if vals:
-            out[key] = sorted(set(vals), key=lambda v: (len(v), v))
-    return out
-
-
-# =====================================================================================
-# SECTION 7 -- SCANNER
-# =====================================================================================
-
-
-class RepositoryAuditor:
-    def __init__(self, root: str, max_file_mb: float = 3.0, quiet: bool = False,
-                 follow_symlinks: bool = False):
-        self.root = os.path.abspath(root)
-        self.max_bytes = int(max_file_mb * 1024 * 1024)
-        self.quiet = quiet
-        self.follow_symlinks = follow_symlinks
-        self.files: List[FileRecord] = []
-        self.dirs: List[str] = []
-        self.errors: List[str] = []
-        self.agents: List[Dict[str, Any]] = []
-        self.prompts: List[Dict[str, Any]] = []
-        self.providers: Dict[str, Dict[str, Any]] = {}
-        self.models: Dict[str, Dict[str, Any]] = {}
-        self.sdks: Dict[str, List[str]] = defaultdict(list)
-        self.tools: Dict[str, List[str]] = defaultdict(list)
-        self.workflows: Dict[str, List[str]] = defaultdict(list)
-        self.env_keys: Dict[str, Dict[str, Any]] = {}
-        self.params: Dict[str, Dict[str, List[str]]] = {}
-        self.runtime_metrics: List[Dict[str, str]] = []
-        self.scan_started = _dt.datetime.now()
-
-    # ---------------------------------------------------------------- logging
-    def log(self, msg: str) -> None:
-        if not self.quiet:
-            print(msg, flush=True)
-
-    # ---------------------------------------------------------------- walk
-    def walk(self) -> None:
-        ignored = IGNORE_DIRS | IGNORE_DIR_EXTRAS
-        for dirpath, dirnames, filenames in os.walk(self.root, followlinks=self.follow_symlinks):
-            dirnames[:] = sorted(d for d in dirnames
-                                 if d not in ignored and not d.endswith(".egg-info"))
-            filenames.sort()
-            rel_dir = os.path.relpath(dirpath, self.root)
-            if rel_dir != ".":
-                self.dirs.append(rel_dir.replace(os.sep, "/"))
-            for fn in filenames:
-                full = os.path.join(dirpath, fn)
-                if os.path.islink(full) and not self.follow_symlinks:
-                    continue
+    serial:        int  = 0
+    relative_path: str  = ""
+    file_name:     str  = ""
+    extension:     str  = ""
+    language:      str  = ""
+    category:      str  = ""
+    purpose:       str  = ""
+    description:   str  = ""
+    size_bytes:    int  = 0
+    lines_of_code: int  = 0
+    is_used:       str  = "Unknown"
+    is_referenced: str  = "Unknown"
+    is_ai_related: bool = False
+    dependencies:  list = field(default_factory=list)
+    classes:       list = field(default_factory=list)
+    functions:     list = field(default_factory=list)
+    imports:       list = field(default_factory=list)
+
+
+@dataclass
+class AgentRecord:
+    name:         str  = ""
+    file:         str  = ""
+    agent_type:   str  = ""
+    purpose:      str  = ""
+    provider:     str  = "Unknown"
+    sdk:          str  = "Unknown"
+    model:        str  = "Not Specified"
+    tools:        list = field(default_factory=list)
+    workflows:    list = field(default_factory=list)
+    prompts:      list = field(default_factory=list)
+    token_config: dict = field(default_factory=dict)
+    line_number:  int  = 0
+
+
+@dataclass
+class ProviderRecord:
+    name:        str  = ""
+    sdk:         str  = ""
+    endpoint:    str  = ""
+    auth_method: str  = "API Key"
+    env_vars:    list = field(default_factory=list)
+    files:       list = field(default_factory=list)
+
+
+@dataclass
+class ModelRecord:
+    name:            str  = ""
+    provider:        str  = ""
+    files:           list = field(default_factory=list)
+    reference_count: int  = 0
+
+
+@dataclass
+class PromptRecord:
+    name:            str = ""
+    location:        str = ""
+    line_number:     int = 0
+    prompt_type:     str = ""
+    agent:           str = "Unknown"
+    content_preview: str = ""
+
+
+@dataclass
+class APIKeyRecord:
+    variable_name: str  = ""
+    provider:      str  = ""
+    used_in:       list = field(default_factory=list)
+    loaded_from:   str  = "Unknown"
+
+
+@dataclass
+class SDKRecord:
+    name:         str  = ""
+    files:        list = field(default_factory=list)
+    import_count: int  = 0
+
+
+@dataclass
+class ToolRecord:
+    name:  str  = ""
+    files: list = field(default_factory=list)
+
+
+@dataclass
+class WorkflowRecord:
+    name:  str  = ""
+    files: list = field(default_factory=list)
+
+
+@dataclass
+class ScanResult:
+    scan_date:       str  = ""
+    root_path:       str  = ""
+    repo_name:       str  = ""
+    total_dirs:      int  = 0
+    total_files:     int  = 0
+    source_files:    int  = 0
+    config_files:    int  = 0
+    doc_files:       int  = 0
+    test_files:      int  = 0
+    infra_files:     int  = 0
+    ai_files:        int  = 0
+    total_agents:    int  = 0
+    total_providers: int  = 0
+    total_models:    int  = 0
+    total_prompts:   int  = 0
+    total_sdks:      int  = 0
+    total_tools:     int  = 0
+    total_api_keys:  int  = 0
+    total_workflows: int  = 0
+    total_classes:   int  = 0
+    total_functions: int  = 0
+    total_endpoints: int  = 0
+    files:           list = field(default_factory=list)
+    agents:          list = field(default_factory=list)
+    providers:       dict = field(default_factory=dict)
+    models:          dict = field(default_factory=dict)
+    prompts:         list = field(default_factory=list)
+    api_keys:        dict = field(default_factory=dict)
+    sdks:            dict = field(default_factory=dict)
+    tools:           dict = field(default_factory=dict)
+    workflows:       dict = field(default_factory=dict)
+    directory_tree:  str  = ""
+    errors:          list = field(default_factory=list)
+
+
+# ══════════════════════════════════════════════════════════════
+# SCANNER ENGINE
+# ══════════════════════════════════════════════════════════════
+
+class RepoScanner:
+    """Pure static-analysis scanner. Never executes or modifies files."""
+
+    def __init__(self, root: str) -> None:
+        self.root   = Path(root).resolve()
+        self.result = ScanResult(
+            scan_date = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            root_path = str(self.root),
+            repo_name = self.root.name,
+        )
+        self._ref_files: set[str]            = set()
+        self._all_paths: set[str]            = set()
+        self._dep_graph: dict[str, list[str]] = defaultdict(list)
+
+    def scan(self) -> ScanResult:
+        self._discover()
+        self._analyse()
+        self._resolve_deps()
+        self._mark_refs()
+        self._build_tree()
+        self._finalise_counts()
+        return self.result
+
+    # ── discovery ─────────────────────────────────────────────
+    def _discover(self) -> None:
+        serial = 0
+        dirs: list[str] = []
+        for dirpath, dirnames, filenames in os.walk(self.root):
+            dirnames[:] = sorted(
+                d for d in dirnames
+                if d not in IGNORED_DIRS
+                and not (d.startswith(".")
+                         and d not in {".github", ".circleci", ".gitlab"})
+                and not d.endswith(".egg-info")
+            )
+            dirs.append(str(Path(dirpath).relative_to(self.root)) or "/")
+            for fname in sorted(filenames):
+                fpath = Path(dirpath) / fname
                 try:
-                    if not os.path.isfile(full):
-                        continue
+                    stat = fpath.stat()
                 except OSError:
                     continue
-                self.analyze_file(full)
-        self.files.sort(key=lambda r: r.rel_path)
-        for i, rec in enumerate(self.files, 1):
-            rec.serial = i
+                serial += 1
+                rel  = str(fpath.relative_to(self.root))
+                ext  = self._ext(fpath)
+                lang = EXTENSION_LANGUAGE_MAP.get(ext, "Unknown")
+                self._all_paths.add(rel)
+                self.result.files.append(FileRecord(
+                    serial=        serial,
+                    relative_path= rel,
+                    file_name=     fname,
+                    extension=     ext,
+                    language=      lang,
+                    category=      self._quick_cat(rel, fname, ext),
+                    size_bytes=    stat.st_size,
+                ))
+        self.result.total_dirs  = len(dirs)
+        self.result.total_files = len(self.result.files)
 
-    # ---------------------------------------------------------------- per file
-    def analyze_file(self, full: str) -> None:
-        rel = os.path.relpath(full, self.root).replace(os.sep, "/")
-        name = os.path.basename(full)
-        ext = os.path.splitext(name)[1].lower()
-        rec = FileRecord(rel_path=rel, name=name, ext=ext or "(none)")
-        try:
-            rec.size_bytes = os.path.getsize(full)
-        except OSError as exc:
-            self.errors.append(f"{rel}: {exc}")
-            return
-        rec.size_human = human_size(rec.size_bytes)
-        rec.language = detect_language(name, ext)
-        rec.category = detect_category(rel, rec.language)
-
-        if ext in BINARY_EXTS:
-            rec.binary = True
-            rec.description = "Binary or non-text asset (not statically analysed)."
-            rec.purpose = detect_purpose(rel, name, "", rec.category)
-            rec.is_used = NA
-            self.files.append(rec)
-            return
-
-        text, is_bin = safe_read(full, self.max_bytes)
-        if is_bin:
-            rec.binary = True
-            rec.description = "Binary or undecodable file (not statically analysed)."
-            rec.purpose = detect_purpose(rel, name, "", rec.category)
-            self.files.append(rec)
-            return
-
-        rec.sha1 = hashlib.sha1(text.encode("utf-8", "ignore")).hexdigest()[:12]
-        rec.lines_total = text.count("\n") + (1 if text and not text.endswith("\n") else 0)
-        rec.lines_code = len(strip_noise(text).splitlines())
-
-        classes, functions, imports, endpoints = extract_structure(text)
-        rec.classes, rec.functions, rec.endpoints = classes, functions, endpoints
-        rec.dependencies = imports[:200]
-
-        providers = detect_providers(text)
-        rec.providers = [p for p, _ in providers]
-        models = detect_models(text)
-        rec.models = [m for m, _, _ in models]
-        rec.sdks = detect_sdks(text)
-        rec.tools = detect_tools(text)
-        rec.workflows = detect_workflows(text)
-        rec.env_vars = detect_env_vars(text)
-        rec.ai_calls = count_matches(AI_CALL_PATTERNS, text, 0)
-
-        prompts = detect_prompts(text, rel, rec.language)
-        rec.prompt_count = len(prompts)
-
-        ai_score = (len(rec.providers) * 3 + len(rec.models) * 3 + len(rec.sdks) * 3 +
-                    min(rec.ai_calls, 5) * 2 + rec.prompt_count)
-        keyword_hits = len(AI_KEYWORD_RE.findall(text[:150000]))
-        is_ai = ai_score >= 3 or (keyword_hits >= 4 and (rec.providers or rec.sdks or rec.models))
-        rec.is_ai_related = "Yes" if is_ai else "No"
-
-        detected_agents: List[Dict[str, str]] = []
-        if rec.category != "Test" and (
-                is_ai or rec.ai_calls or
-                re.search(r"agent|assistant|orchestrat|crew|copilot", rel, re.I)):
-            detected_agents = detect_agents(text, rel)
-            # only keep agents in files with genuine AI signal
-            if not (rec.providers or rec.sdks or rec.models or rec.ai_calls):
-                detected_agents = [a for a in detected_agents
-                                   if re.search(r"agent|assistant|crew|copilot|orchestrat",
-                                                a["name"], re.I)]
-            detected_agents = self._dedupe_agents(detected_agents, rel)
-        rec.agents = [a["name"] for a in detected_agents]
-
-        rec.purpose = detect_purpose(rel, name, text, rec.category)
-        if is_ai and rec.purpose in ("General", "Service", "Backend", "Utility"):
-            if detected_agents:
-                rec.purpose = "AI Agent"
-            elif rec.prompt_count:
-                rec.purpose = "Prompt"
-            elif rec.ai_calls or rec.models:
-                rec.purpose = "LLM"
-        rec.description = build_description(rec, text)
-
-        params = extract_numeric_params(text)
-        if params:
-            self.params[rel] = params
-
-        self._register_ai(rel, rec, providers, models, prompts, detected_agents, text)
-        self._register_runtime_metrics(rel, text)
-        self.files.append(rec)
-
-    # ---------------------------------------------------------------- registries
-    def _register_ai(self, rel: str, rec: FileRecord,
-                     providers: List[Tuple[str, str]],
-                     models: List[Tuple[str, str, int]],
-                     prompts: List[Dict[str, Any]],
-                     agents: List[Dict[str, str]], text: str) -> None:
-        for pname, sdk in providers:
-            entry = self.providers.setdefault(pname, {
-                "provider": pname, "sdk": sdk, "endpoints": set(), "api_versions": set(),
-                "auth_methods": set(), "env_vars": set(), "files": set(),
-            })
-            entry["files"].add(rel)
-            for url in re.findall(r"https?://[\w\.\-]+(?:/[\w\.\-/{}$]*)?", text):
-                if re.search(r"(openai|anthropic|google|gemini|bedrock|amazonaws|groq|"
-                             r"cohere|mistral|ollama|11434|openrouter|huggingface|deepseek|"
-                             r"perplexity|azure)", url, re.I):
-                    entry["endpoints"].add(url.rstrip("\"',"))
-            for v in re.findall(r"api[_\-]?version\s*[:=]\s*['\"]?([\w\-\.]+)", text, re.I):
-                entry["api_versions"].add(v)
-            for v in re.findall(r"['\"](\d{4}-\d{2}-\d{2}(?:-preview)?)['\"]", text):
-                entry["api_versions"].add(v)
-            for pat, label in ((r"api[_\-]?key", "API Key"),
-                               (r"Bearer\s", "Bearer Token"),
-                               (r"DefaultAzureCredential|ManagedIdentity|AzureCliCredential",
-                                "Azure Managed Identity / AAD"),
-                               (r"boto3|AWS_ACCESS_KEY|sigv4|Signature", "AWS IAM / SigV4"),
-                               (r"service_account|GOOGLE_APPLICATION_CREDENTIALS",
-                                "GCP Service Account"),
-                               (r"no auth|localhost:11434", "None / Local")):
-                if re.search(pat, text, re.I):
-                    entry["auth_methods"].add(label)
-            rule = next((r for r in PROVIDER_RULES if r["name"] == pname), None)
-            if rule:
-                for epat in rule["env"]:
-                    for ev in re.findall(epat, text):
-                        entry["env_vars"].add(ev if isinstance(ev, str) else ev[0])
-
-        for mname, mprovider, cnt in models:
-            entry = self.models.setdefault(mname, {
-                "model": mname, "provider": mprovider, "files": set(), "references": 0,
-            })
-            entry["files"].add(rel)
-            entry["references"] += cnt
-
-        for sdk in rec.sdks:
-            self.sdks[sdk].append(rel)
-        for tool in rec.tools:
-            self.tools[tool].append(rel)
-        for wf in rec.workflows:
-            self.workflows[wf].append(rel)
-
-        for ev in rec.env_vars:
-            provider = self._provider_for_env(ev)
-            entry = self.env_keys.setdefault(ev, {
-                "variable": ev, "provider": provider, "files": set(), "loaded_from": set(),
-                "ai_related": bool(AI_ENV_HINT.search(ev)),
-            })
-            entry["files"].add(rel)
-            if entry["provider"] == "Unknown" and provider != "Unknown":
-                entry["provider"] = provider
-            for pat, label in ENV_LOADERS:
-                if re.search(pat, text):
-                    entry["loaded_from"].add(label)
-            if rel.lower().endswith((".env", ".env.example", ".env.sample")) or \
-                    os.path.basename(rel).startswith(".env"):
-                entry["loaded_from"].add(f"{os.path.basename(rel)} file")
-
-        for p in prompts:
-            self.prompts.append({**p, "file": rel, "purpose": self._prompt_purpose(p),
-                                 "agent": ", ".join(rec.agents) if rec.agents else NA})
-
-        for a in agents:
-            self.agents.append({
-                "name": a["name"], "type": a["type"], "file": rel,
-                "providers": rec.providers, "models": rec.models, "sdks": rec.sdks,
-                "tools": rec.tools, "workflows": rec.workflows,
-                "prompts": [p["name"] for p in prompts],
-                "env_vars": [e for e in rec.env_vars if AI_ENV_HINT.search(e)],
-                "ai_calls": rec.ai_calls,
-                "purpose": self._agent_purpose(a, rec),
-            })
-
-    @staticmethod
-    def _dedupe_agents(agents: List[Dict[str, str]], rel: str) -> List[Dict[str, str]]:
-        """Collapse framework-constructor hits that merely restate a class already found
-        in the same file (e.g. StateGraph() inside supervisor.py -> SupervisorAgent)."""
-        explicit = [a for a in agents if "Class" in a["type"] or "Function" in a["type"]]
-        stem = os.path.splitext(os.path.basename(rel))[0].lower().replace("_", "")
-        out: List[Dict[str, str]] = []
-        for a in agents:
-            if a in explicit:
-                out.append(a)
+    # ── content analysis ──────────────────────────────────────
+    def _analyse(self) -> None:
+        for rec in self.result.files:
+            content = self._read(self.root / rec.relative_path)
+            if content is None:
                 continue
-            nm = a["name"].lower().replace("_", "")
-            if explicit and (nm == stem or any(nm in e["name"].lower() or
-                                               e["name"].lower().startswith(nm)
-                                               for e in explicit)):
-                continue  # framework construction of an already-named agent
-            out.append(a)
-        return out
+            rec.lines_of_code = content.count("\n") + 1
+            rec.imports        = self._imports(content, rec.language)
+            rec.classes        = self._classes(content, rec.language)
+            rec.functions      = self._functions(content, rec.language)
+            rec.is_ai_related  = self._is_ai(content, rec.relative_path)
+            rec.purpose, rec.description = self._purpose(rec, content)
+            rec.dependencies   = rec.imports[:8]
+            if rec.is_ai_related and rec.category not in (
+                "Test", "Configuration", "Documentation"
+            ):
+                rec.category = "AI"
+            self.result.total_classes   += len(rec.classes)
+            self.result.total_functions += len(rec.functions)
+            self.result.total_endpoints += len(re.findall(
+                r'@(?:app|router|blueprint)\s*\.\s*'
+                r'(?:get|post|put|delete|patch|route)',
+                content, re.IGNORECASE,
+            ))
+            self._detect_providers(content, rec.relative_path)
+            self._detect_models(content, rec.relative_path)
+            self._detect_prompts(content, rec.relative_path)
+            self._detect_api_keys(content, rec.relative_path)
+            self._detect_sdks(content, rec.relative_path)
+            self._detect_tools(content, rec.relative_path)
+            self._detect_workflows(content, rec.relative_path)
+            self._detect_agents(content, rec)
 
-    @staticmethod
-    def _prompt_purpose(p: Dict[str, Any]) -> str:
-        t = p["type"].lower()
-        if "system" in t:
-            return "Defines the model's role, rules and behaviour"
-        if "user" in t:
-            return "User-turn message sent to the model"
-        if "developer" in t:
-            return "Developer instruction layer"
-        if "template" in t:
-            return "Parameterised prompt rendered at runtime"
-        if "file" in t:
-            return "Standalone prompt asset loaded by the application"
-        return "Instruction text supplied to the language model"
+    # ── dependency resolution ─────────────────────────────────
+    def _resolve_deps(self) -> None:
+        name_map: dict[str, str] = {}
+        for f in self.result.files:
+            name_map[Path(f.file_name).stem] = f.relative_path
+            name_map[f.file_name]            = f.relative_path
+        for f in self.result.files:
+            for imp in f.imports:
+                key = imp.split(".")[-1]
+                if key in name_map and name_map[key] != f.relative_path:
+                    self._dep_graph[f.relative_path].append(name_map[key])
+                    self._ref_files.add(name_map[key])
 
-    @staticmethod
-    def _agent_purpose(a: Dict[str, str], rec: FileRecord) -> str:
-        n = a["name"].lower()
-        bits: List[str] = []
-        if "supervisor" in n or "orchestr" in n or "coordinat" in n or "router" in n:
-            bits.append("Coordinates and routes work across other agents")
-        elif "plan" in n:
-            bits.append("Decomposes goals into an executable plan")
-        elif "research" in n or "search" in n:
-            bits.append("Gathers and synthesises external information")
-        elif "review" in n or "critic" in n or "eval" in n:
-            bits.append("Reviews / critiques output for quality")
-        elif "write" in n or "summar" in n or "report" in n:
-            bits.append("Generates written content from inputs")
-        elif "code" in n or "dev" in n:
-            bits.append("Produces or modifies code")
-        elif "chat" in n or "support" in n or "assistant" in n:
-            bits.append("Conversational assistant handling user turns")
-        else:
-            bits.append("Executes an LLM-backed task loop")
-        if rec.tools:
-            bits.append("tools: " + ", ".join(rec.tools[:4]))
-        if rec.workflows:
-            bits.append("patterns: " + ", ".join(rec.workflows[:4]))
-        return "; ".join(bits)
-
-    @staticmethod
-    def _provider_for_env(ev: str) -> str:
-        table = [
-            ("AZURE_OPENAI", "Azure OpenAI"), ("AZURE", "Azure"), ("OPENAI", "OpenAI"),
-            ("ANTHROPIC", "Anthropic"), ("CLAUDE", "Anthropic"),
-            ("GEMINI", "Google Gemini"), ("VERTEX", "Google Gemini"),
-            ("GOOGLE_API", "Google Gemini"), ("GOOGLE_APPLICATION", "Google Cloud"),
-            ("BEDROCK", "AWS Bedrock"), ("AWS", "AWS"), ("GROQ", "Groq"),
-            ("COHERE", "Cohere"), ("CO_API", "Cohere"), ("MISTRAL", "Mistral"),
-            ("OLLAMA", "Ollama"), ("OPENROUTER", "OpenRouter"),
-            ("HUGGINGFACE", "HuggingFace"), ("HF_", "HuggingFace"),
-            ("DEEPSEEK", "DeepSeek"), ("PERPLEXITY", "Perplexity"), ("PPLX", "Perplexity"),
-            ("REPLICATE", "Replicate"), ("TOGETHER", "Together AI"),
-            ("FIREWORKS", "Fireworks AI"), ("XAI", "xAI"), ("GROK", "xAI"),
-            ("LANGCHAIN", "LangChain / LangSmith"), ("LANGSMITH", "LangSmith"),
-            ("LANGFUSE", "Langfuse"), ("TAVILY", "Tavily (tool)"),
-            ("PINECONE", "Pinecone (vector store)"), ("QDRANT", "Qdrant (vector store)"),
-            ("WEAVIATE", "Weaviate (vector store)"),
-        ]
-        up = ev.upper()
-        for key, prov in table:
-            if key in up:
-                return prov
-        return "Unknown"
-
-    def _register_runtime_metrics(self, rel: str, text: str) -> None:
-        """Look for evidence that the repo records real usage at runtime."""
-        signals = [
-            (r"usage\.(?:total_tokens|prompt_tokens|completion_tokens)", "Token usage read from API response"),
-            (r"(?:prompt|completion|total)_tokens", "Token counters present in code"),
-            (r"tiktoken|count_tokens|token_counter", "Token counting implemented"),
-            (r"x-ratelimit-(?:remaining|limit)", "Rate-limit headers inspected"),
-            (r"prometheus|Counter\(|Histogram\(|opentelemetry", "Metrics exporter present"),
-            (r"langsmith|langfuse|helicone|wandb|mlflow", "LLM observability platform wired"),
-            (r"cost_?(?:per_?token|estimate|usd)", "Cost tracking implemented"),
-        ]
-        for pat, label in signals:
-            if re.search(pat, text, re.I):
-                self.runtime_metrics.append({"file": rel, "signal": label})
-
-    # ---------------------------------------------------------------- graphs
-    def build_graphs(self) -> Dict[str, Any]:
-        """Resolve imports to internal files and compute references / orphans."""
-        by_module: Dict[str, List[str]] = defaultdict(list)
-        by_stem: Dict[str, List[str]] = defaultdict(list)
-        for rec in self.files:
-            stem = os.path.splitext(rec.name)[0]
-            by_stem[stem.lower()].append(rec.rel_path)
-            dotted = os.path.splitext(rec.rel_path)[0].replace("/", ".")
-            by_module[dotted.lower()].append(rec.rel_path)
-            parts = dotted.split(".")
-            for i in range(len(parts)):
-                by_module[".".join(parts[i:]).lower()].append(rec.rel_path)
-            rec.module_names = uniq([stem, dotted])
-
-        referenced: Set[str] = set()
-        edges: List[Tuple[str, str]] = []
-        for rec in self.files:
-            resolved: Set[str] = set()
-            for dep in rec.dependencies:
-                d = dep.strip().strip("./").replace("/", ".").replace("\\", ".")
-                d = re.sub(r"\.(js|ts|jsx|tsx|py|mjs|cjs)$", "", d, flags=re.I)
-                cands = by_module.get(d.lower()) or by_stem.get(d.split(".")[-1].lower())
-                if not cands:
-                    continue
-                for c in cands:
-                    if c != rec.rel_path:
-                        resolved.add(c)
-            # textual references to filenames (covers configs, docker, k8s, docs)
-            rec.internal_dependencies = sorted(resolved)
-            for target in resolved:
-                referenced.add(target)
-                edges.append((rec.rel_path, target))
-
-        # second pass: literal path/name mentions inside any text file
-        name_index: Dict[str, str] = {}
-        for rec in self.files:
-            name_index.setdefault(rec.name, rec.rel_path)
-        for rec in self.files:
-            if rec.binary:
-                continue
-            full = os.path.join(self.root, rec.rel_path)
-            text, is_bin = safe_read(full, min(self.max_bytes, 400000))
-            if is_bin or not text:
-                continue
-            for other in self.files:
-                if other.rel_path == rec.rel_path:
-                    continue
-                if other.rel_path in referenced:
-                    continue
-                if other.name and len(other.name) > 3 and other.name in text:
-                    referenced.add(other.rel_path)
-                    edges.append((rec.rel_path, other.rel_path))
-
-        entrypoint_re = re.compile(
-            r"(^|/)(main|index|app|server|program|__main__|manage|cli|setup|conftest)\.\w+$|"
-            r"(^|/)(readme|license|changelog|contributing)|"
-            r"(dockerfile|makefile|jenkinsfile|\.github/|\.gitlab-ci|requirements|"
-            r"package\.json|pyproject|go\.mod|cargo\.toml|pom\.xml|\.tf$|\.env)", re.I)
-
-        orphans: List[str] = []
-        for rec in self.files:
-            is_entry = bool(entrypoint_re.search(rec.rel_path))
-            is_test = rec.category == "Test"
-            is_doc = rec.category in ("Documentation", "Configuration", "Infrastructure")
-            rec.is_referenced = "Yes" if rec.rel_path in referenced else "No"
-            if rec.rel_path in referenced:
-                rec.is_used = "Yes"
-            elif is_entry:
-                rec.is_used = "Yes (entrypoint / conventional file)"
-            elif is_test:
-                rec.is_used = "Yes (test executed by test runner)"
-            elif is_doc:
-                rec.is_used = "Likely (declarative asset)"
+    # ── mark references ───────────────────────────────────────
+    def _mark_refs(self) -> None:
+        for f in self.result.files:
+            if f.relative_path in self._ref_files:
+                f.is_referenced = "Yes"
+                f.is_used       = "Yes"
             else:
-                rec.is_used = "No reference found"
-                orphans.append(rec.rel_path)
+                f.is_referenced = "No"
+                f.is_used = "Likely" if any(
+                    x in f.file_name.lower()
+                    for x in ["main", "app", "server", "index",
+                               "__init__", "config", "settings"]
+                ) else "Unknown"
 
-        agent_graph = []
-        for a in self.agents:
-            agent_graph.append({
-                "agent": a["name"], "file": a["file"],
-                "providers": a["providers"] or [NA],
-                "models": a["models"] or [NA],
-                "sdks": a["sdks"] or [NA],
-                "tools": a["tools"] or [],
-            })
-        model_graph = [{"model": m, "provider": d["provider"],
-                        "files": sorted(d["files"])} for m, d in sorted(self.models.items())]
+    # ── directory tree ────────────────────────────────────────
+    def _build_tree(self) -> None:
+        lines = [self.root.name + "/"]
+        self._tree_walk(self.root, "", lines, 0, 5)
+        self.result.directory_tree = "\n".join(lines)
 
-        return {
-            "import_edges": sorted(set(edges)),
-            "file_dependency_graph": {r.rel_path: r.internal_dependencies
-                                      for r in self.files if r.internal_dependencies},
-            "agent_dependency_graph": agent_graph,
-            "model_dependency_graph": model_graph,
-            "orphan_files": sorted(orphans),
-            "unused_files": sorted(orphans),
-            "dead_code_candidates": self._dead_code(),
-        }
+    def _tree_walk(
+        self, path: Path, prefix: str,
+        lines: list, depth: int, max_depth: int,
+    ) -> None:
+        if depth >= max_depth:
+            return
+        try:
+            entries = sorted(path.iterdir())
+        except PermissionError:
+            return
+        entries = [
+            e for e in entries
+            if e.name not in IGNORED_DIRS
+            and not (e.name.startswith(".")
+                     and e.name not in {".github", ".circleci", ".gitlab"})
+        ]
+        all_e = [e for e in entries if e.is_dir()] + \
+                [e for e in entries if e.is_file()]
+        for i, entry in enumerate(all_e):
+            last = i == len(all_e) - 1
+            lines.append(prefix + ("└── " if last else "├── ") +
+                         entry.name + ("/" if entry.is_dir() else ""))
+            if entry.is_dir():
+                self._tree_walk(entry, prefix + ("    " if last else "│   "),
+                                lines, depth + 1, max_depth)
 
-    def _dead_code(self) -> List[Dict[str, str]]:
-        """Symbols defined once and never mentioned anywhere else (best-effort)."""
-        defined: Dict[str, str] = {}
-        for rec in self.files:
-            if rec.category not in ("Source",):
-                continue
-            for sym in rec.classes + rec.functions:
-                if len(sym) < 5 or sym.startswith("_"):
-                    continue
-                defined.setdefault(sym, rec.rel_path)
-        if not defined:
-            return []
-        counts: Counter = Counter()
-        for rec in self.files:
-            if rec.binary:
-                continue
-            text, is_bin = safe_read(os.path.join(self.root, rec.rel_path),
-                                     min(self.max_bytes, 400000))
-            if is_bin or not text:
-                continue
-            for sym in defined:
-                if sym in text:
-                    counts[sym] += text.count(sym)
-        out = []
-        for sym, path in sorted(defined.items()):
-            if counts[sym] <= 1:
-                out.append({"symbol": sym, "defined_in": path,
-                            "note": "Defined once, no other textual reference found"})
-        return out[:500]
+    # ── finalise counts ───────────────────────────────────────
+    def _finalise_counts(self) -> None:
+        cats = Counter(f.category for f in self.result.files)
+        self.result.source_files    = cats.get("Source", 0)
+        self.result.config_files    = cats.get("Configuration", 0)
+        self.result.doc_files       = cats.get("Documentation", 0)
+        self.result.test_files      = cats.get("Test", 0)
+        self.result.infra_files     = cats.get("Infrastructure", 0)
+        self.result.ai_files        = sum(1 for f in self.result.files
+                                          if f.is_ai_related)
+        self.result.total_agents    = len(self.result.agents)
+        self.result.total_providers = len(self.result.providers)
+        self.result.total_models    = len(self.result.models)
+        self.result.total_prompts   = len(self.result.prompts)
+        self.result.total_sdks      = len(self.result.sdks)
+        self.result.total_tools     = len(self.result.tools)
+        self.result.total_api_keys  = len(self.result.api_keys)
+        self.result.total_workflows = len(self.result.workflows)
 
-    # ---------------------------------------------------------------- token math
-    def token_analysis(self) -> List[Dict[str, Any]]:
-        rows: List[Dict[str, Any]] = []
-        prompts_by_file: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
-        for p in self.prompts:
-            prompts_by_file[p["file"]].append(p)
-
-        for a in sorted(self.agents, key=lambda x: (x["file"], x["name"])):
-            params = self.params.get(a["file"], {})
-            fprompts = prompts_by_file.get(a["file"], [])
-            in_tokens = sum(p["estimated_tokens"] for p in fprompts)
-            max_tokens = params.get("max_tokens", [])
-            max_tok_val = max((int(v) for v in max_tokens), default=None)
-            out_tokens = max_tok_val if max_tok_val else None
-            model = a["models"][0] if a["models"] else None
-            ctx = None
-            if params.get("context_window"):
-                ctx = int(params["context_window"][0])
-            elif model:
-                ctx = context_for(model)
-            cost = NA
-            if model and out_tokens is not None:
-                pr = price_for(model)
-                if pr:
-                    c = (in_tokens / 1e6) * pr[0] + (out_tokens / 1e6) * pr[1]
-                    cost = f"~${c:.6f} per request (list price estimate)"
-            avg = (in_tokens + out_tokens) if (out_tokens is not None) else None
-            rows.append({
-                "agent": a["name"], "file": a["file"],
-                "model": model or NA,
-                "estimated_input_tokens": in_tokens if fprompts else 0,
-                "estimated_input_tokens_note":
-                    "Sum of static prompt text (~4 chars/token)" if fprompts
-                    else "No static prompt text found in this file",
-                "estimated_output_tokens": out_tokens if out_tokens is not None
-                    else NA + " (no max_tokens configured)",
-                "average_request_tokens": avg if avg is not None else NA,
-                "max_tokens_configured": max_tok_val if max_tok_val is not None else NA,
-                "temperature": params.get("temperature", [NA])[0],
-                "top_p": params.get("top_p", [NA])[0],
-                "context_window": ctx if ctx else NA,
-                "estimated_cost": cost,
-                "current_tokens_used": NA,
-                "todays_tokens_used": NA,
-                "monthly_tokens_used": NA,
-                "remaining_tokens": NA,
-                "percentage_used": NA,
-            })
-        return rows
-
-    def request_analysis(self) -> Dict[str, Any]:
-        agg: Dict[str, Set[str]] = defaultdict(set)
-        for rel, params in sorted(self.params.items()):
-            for key in ("requests_per_minute", "requests_per_day", "requests_per_month",
-                        "tokens_per_minute", "concurrency", "timeout", "max_retries"):
-                for v in params.get(key, []):
-                    agg[key].add(f"{v} ({rel})")
-        retry_files = sorted(self.workflows.get("Retry", []))
-        backoff_files = sorted(self.workflows.get("Backoff", []))
-        return {
-            "requests_per_minute": sorted(agg.get("requests_per_minute", [])) or NA,
-            "requests_per_day": sorted(agg.get("requests_per_day", [])) or NA,
-            "requests_per_month": sorted(agg.get("requests_per_month", [])) or NA,
-            "tokens_per_minute": sorted(agg.get("tokens_per_minute", [])) or NA,
-            "max_concurrency": sorted(agg.get("concurrency", [])) or NA,
-            "current_requests_used": NA,
-            "remaining_requests": NA,
-            "rate_limits_configured": sorted(
-                set(list(agg.get("requests_per_minute", [])) +
-                    list(agg.get("requests_per_day", [])) +
-                    list(agg.get("tokens_per_minute", [])))) or NA,
-            "retry_logic": retry_files or NA,
-            "backoff_logic": backoff_files or NA,
-            "timeout": sorted(agg.get("timeout", [])) or NA,
-            "max_retries": sorted(agg.get("max_retries", [])) or NA,
-            "runtime_usage_note":
-                "Live request counters and remaining quota are runtime values held by the "
-                "provider; they cannot be derived from source code.",
-            "runtime_instrumentation_found":
-                sorted({m["signal"] for m in self.runtime_metrics}) or
-                ["No runtime usage instrumentation detected in source"],
-        }
-
-    # ---------------------------------------------------------------- stats
-    def statistics(self) -> Dict[str, Any]:
-        f = self.files
-        lang_counter = Counter(r.language for r in f)
-        cat_counter = Counter(r.category for r in f)
-        purpose_counter = Counter(r.purpose for r in f)
-        packages = {os.path.dirname(r.rel_path) for r in f if os.path.dirname(r.rel_path)}
-        k8s = [r.rel_path for r in f if r.purpose == "Kubernetes"]
-        docker = [r.rel_path for r in f
-                  if r.language == "Dockerfile" or "docker-compose" in r.name.lower()]
-        return {
-            "total_directories": len(self.dirs),
-            "total_files": len(f),
-            "total_source_files": cat_counter.get("Source", 0),
-            "total_configuration_files": cat_counter.get("Configuration", 0),
-            "total_documentation_files": cat_counter.get("Documentation", 0),
-            "total_test_files": cat_counter.get("Test", 0),
-            "total_infrastructure_files": cat_counter.get("Infrastructure", 0),
-            "total_ai_related_files": sum(1 for r in f if r.is_ai_related == "Yes"),
-            "total_lines": sum(r.lines_total for r in f),
-            "total_code_lines": sum(r.lines_code for r in f),
-            "total_size_bytes": sum(r.size_bytes for r in f),
-            "total_size_human": human_size(sum(r.size_bytes for r in f)),
-            "total_classes": sum(len(r.classes) for r in f),
-            "total_functions": sum(len(r.functions) for r in f),
-            "total_apis": sum(1 for r in f if r.endpoints),
-            "total_endpoints": sum(len(r.endpoints) for r in f),
-            "total_modules": sum(1 for r in f if r.category == "Source"),
-            "total_packages": len(packages),
-            "total_tests": cat_counter.get("Test", 0),
-            "total_docker_files": len(docker),
-            "total_yaml_files": lang_counter.get("YAML", 0),
-            "total_terraform_files": lang_counter.get("Terraform", 0) + lang_counter.get("HCL", 0),
-            "total_kubernetes_files": len(k8s),
-            "total_prompts": len(self.prompts),
-            "total_models": len(self.models),
-            "total_providers": len(self.providers),
-            "total_agents": len(self.agents),
-            "total_sdks": len(self.sdks),
-            "total_tools": len(self.tools),
-            "total_workflows": len(self.workflows),
-            "total_env_vars": len(self.env_keys),
-            "total_ai_env_vars": sum(1 for v in self.env_keys.values() if v["ai_related"]),
-            "languages": dict(sorted(lang_counter.items(), key=lambda kv: (-kv[1], kv[0]))),
-            "categories": dict(sorted(cat_counter.items(), key=lambda kv: (-kv[1], kv[0]))),
-            "purposes": dict(sorted(purpose_counter.items(), key=lambda kv: (-kv[1], kv[0]))),
-        }
-
-    def directory_tree(self, max_entries: int = 4000) -> List[str]:
-        lines = [os.path.basename(self.root) + "/"]
-        tree: Dict[str, List[str]] = defaultdict(list)
-        for r in self.files:
-            tree[os.path.dirname(r.rel_path)].append(r.name)
-        all_dirs = sorted(set(self.dirs) | {""})
-        count = 0
-        for d in all_dirs:
-            depth = 0 if d == "" else d.count("/") + 1
-            if d:
-                lines.append("│   " * (depth - 1) + "├── " + os.path.basename(d) + "/")
-            for fn in sorted(tree.get(d, [])):
-                count += 1
-                if count > max_entries:
-                    lines.append("│   " * depth + "└── ... (truncated)")
-                    return lines
-                lines.append("│   " * depth + "├── " + fn)
-        return lines
-
-    # ---------------------------------------------------------------- assemble
-    def build_report(self) -> Dict[str, Any]:
-        graphs = self.build_graphs()
-        stats = self.statistics()
-        providers = []
-        for name, d in sorted(self.providers.items()):
-            providers.append({
-                "provider": name, "sdk": d["sdk"],
-                "endpoint": sorted(d["endpoints"]) or [NA],
-                "api_version": sorted(d["api_versions"]) or [NA],
-                "authentication_method": sorted(d["auth_methods"]) or [NA],
-                "environment_variables": sorted(d["env_vars"]) or [NA],
-                "files": sorted(d["files"]),
-                "file_count": len(d["files"]),
-            })
-        models = []
-        for name, d in sorted(self.models.items()):
-            mv = re.search(r"[\d]{4}-[\d]{2}-[\d]{2}|v?\d+(?:\.\d+)*", name)
-            models.append({
-                "model": name, "version": mv.group(0) if mv else NA,
-                "provider": d["provider"], "files": sorted(d["files"]),
-                "reference_count": d["references"],
-            })
-        agents = []
-        for a in sorted(self.agents, key=lambda x: (x["file"], x["name"])):
-            agents.append({
-                "name": a["name"], "type": a["type"], "file": a["file"],
-                "purpose": a["purpose"],
-                "providers": a["providers"] or [NA],
-                "models": a["models"] or [NA],
-                "sdks": a["sdks"] or [NA],
-                "tools": a["tools"] or [],
-                "workflows": a["workflows"] or [],
-                "prompts": a["prompts"] or [],
-                "env_vars": a["env_vars"] or [],
-                "ai_call_sites": a["ai_calls"],
-            })
-        report: Dict[str, Any] = {
-            "meta": {
-                "tool": "AI Repository Auditor",
-                "version": VERSION,
-                "analysis_mode": "Static analysis only (no repository code executed, "
-                                 "no files modified)",
-                "token_estimation_method": "Character heuristic (~4 characters per token)",
-                "unavailable_marker": NA,
-            },
-            "repository": {
-                "repository_name": os.path.basename(self.root) or self.root,
-                "repository_root": self.root,
-                "scan_date": self.scan_started.strftime("%Y-%m-%d %H:%M:%S"),
-                "scan_duration_seconds": round(
-                    (_dt.datetime.now() - self.scan_started).total_seconds(), 2),
-                "total_directories": stats["total_directories"],
-                "total_files": stats["total_files"],
-                "total_source_files": stats["total_source_files"],
-                "total_configuration_files": stats["total_configuration_files"],
-                "total_documentation_files": stats["total_documentation_files"],
-                "total_test_files": stats["total_test_files"],
-                "total_infrastructure_files": stats["total_infrastructure_files"],
-                "total_ai_related_files": stats["total_ai_related_files"],
-                "total_size": stats["total_size_human"],
-                "total_lines": stats["total_lines"],
-            },
-            "statistics": stats,
-            "directory_tree": self.directory_tree(),
-            "file_inventory": [self._file_row(r) for r in self.files],
-            "ai_agents": {"total_ai_agents": len(agents), "agents": agents},
-            "ai_providers": providers,
-            "ai_models": models,
-            "prompts": sorted(self.prompts, key=lambda p: (p["file"], p["name"])),
-            "api_keys": [
-                {"variable": k, "provider": v["provider"],
-                 "used_in": sorted(v["files"]),
-                 "loaded_from": sorted(v["loaded_from"]) or [NA],
-                 "ai_related": "Yes" if v["ai_related"] else "No"}
-                for k, v in sorted(self.env_keys.items())],
-            "token_usage": {
-                "per_agent": self.token_analysis(),
-                "runtime_usage": {
-                    "current_tokens_used": NA, "todays_tokens_used": NA,
-                    "monthly_tokens_used": NA, "remaining_tokens": NA,
-                    "percentage_used": NA,
-                    "note": "Runtime token counters live in the provider dashboard / "
-                            "telemetry backend and are not present in source code.",
-                    "instrumentation_found":
-                        sorted({m["signal"] for m in self.runtime_metrics}) or
-                        ["No token-usage instrumentation detected in source"],
-                    "instrumentation_files":
-                        sorted({m["file"] for m in self.runtime_metrics}) or [],
-                },
-            },
-            "request_usage": self.request_analysis(),
-            "ai_sdks": [{"sdk": k, "files": sorted(set(v)), "file_count": len(set(v))}
-                        for k, v in sorted(self.sdks.items())],
-            "tools": [{"tool": k, "files": sorted(set(v)), "file_count": len(set(v))}
-                      for k, v in sorted(self.tools.items())],
-            "workflows": [{"pattern": k, "files": sorted(set(v)), "file_count": len(set(v))}
-                          for k, v in sorted(self.workflows.items())],
-            "model_parameters": {k: v for k, v in sorted(self.params.items())},
-            "dependencies": graphs,
-            "scan_errors": self.errors,
-        }
-        return report
+    # ── static helpers ────────────────────────────────────────
+    @staticmethod
+    def _ext(p: Path) -> str:
+        if p.name.lower() in ("dockerfile", "makefile",
+                               "jenkinsfile", "procfile"):
+            return p.name.lower()
+        return p.suffix.lower()
 
     @staticmethod
-    def _file_row(r: FileRecord) -> Dict[str, Any]:
-        d = asdict(r)
-        d.pop("sha1", None)
-        return d
-
-
-# =====================================================================================
-# SECTION 8 -- REPORT WRITERS
-# =====================================================================================
-
-
-def md_table(headers: Sequence[str], rows: Sequence[Sequence[Any]]) -> str:
-    def cell(v: Any) -> str:
-        s = ", ".join(str(x) for x in v) if isinstance(v, (list, tuple, set)) else str(v)
-        s = s.replace("|", "\\|").replace("\n", " ").strip()
-        return s if s else "-"
-    out = ["| " + " | ".join(headers) + " |",
-           "|" + "|".join(["---"] * len(headers)) + "|"]
-    for row in rows:
-        out.append("| " + " | ".join(cell(c) for c in row) + " |")
-    if not rows:
-        out.append("| " + " | ".join(["-"] * len(headers)) + " |")
-    return "\n".join(out)
-
-
-def write_markdown(report: Dict[str, Any], path: str) -> None:
-    R, S = report["repository"], report["statistics"]
-    L: List[str] = []
-    A = L.append
-
-    A(f"# AI Repository Audit — {R['repository_name']}\n")
-    A(f"> Generated by **AI Repository Auditor v{VERSION}** · "
-      f"{report['meta']['analysis_mode']}\n")
-    A("## 1. Repository Summary\n")
-    A(md_table(["Metric", "Value"], [
-        ["Repository Name", R["repository_name"]],
-        ["Repository Root", R["repository_root"]],
-        ["Scan Date", R["scan_date"]],
-        ["Scan Duration", f"{R['scan_duration_seconds']} s"],
-        ["Total Directories", R["total_directories"]],
-        ["Total Files", R["total_files"]],
-        ["Total Source Files", R["total_source_files"]],
-        ["Total Configuration Files", R["total_configuration_files"]],
-        ["Total Documentation Files", R["total_documentation_files"]],
-        ["Total Test Files", R["total_test_files"]],
-        ["Total Infrastructure Files", R["total_infrastructure_files"]],
-        ["Total AI Related Files", R["total_ai_related_files"]],
-        ["Total Size", R["total_size"]],
-        ["Total Lines", R["total_lines"]],
-    ]))
-
-    A("\n## 2. Repository Statistics\n")
-    A(md_table(["Statistic", "Count"], [
-        ["Total Classes", S["total_classes"]], ["Total Functions", S["total_functions"]],
-        ["Total APIs (files exposing endpoints)", S["total_apis"]],
-        ["Total Endpoints", S["total_endpoints"]],
-        ["Total Modules", S["total_modules"]], ["Total Packages", S["total_packages"]],
-        ["Total Tests", S["total_tests"]], ["Total Docker Files", S["total_docker_files"]],
-        ["Total YAML Files", S["total_yaml_files"]],
-        ["Total Terraform Files", S["total_terraform_files"]],
-        ["Total Kubernetes Files", S["total_kubernetes_files"]],
-        ["Total Prompts", S["total_prompts"]], ["Total Models", S["total_models"]],
-        ["Total Providers", S["total_providers"]], ["Total Agents", S["total_agents"]],
-        ["Total SDKs", S["total_sdks"]], ["Total Tools", S["total_tools"]],
-        ["Total Workflow Patterns", S["total_workflows"]],
-        ["Total Environment Variables", S["total_env_vars"]],
-        ["AI Environment Variables", S["total_ai_env_vars"]],
-    ]))
-
-    A("\n### Languages\n")
-    A(md_table(["Language", "Files"], sorted(S["languages"].items(),
-                                             key=lambda kv: (-kv[1], kv[0]))))
-    A("\n### File Purposes\n")
-    A(md_table(["Purpose", "Files"], sorted(S["purposes"].items(),
-                                            key=lambda kv: (-kv[1], kv[0]))))
-
-    A("\n## 3. Directory Tree\n")
-    A("```\n" + "\n".join(report["directory_tree"][:1500]) + "\n```")
-
-    A("\n## 4. File Inventory\n")
-    rows = [[r["serial"], r["rel_path"], r["name"], r["ext"], r["language"], r["category"],
-             r["purpose"], r["description"][:220], r["size_human"], r["lines_code"],
-             r["is_used"], r["is_referenced"], r["is_ai_related"],
-             ", ".join(r["dependencies"][:6]) or "-"] for r in report["file_inventory"]]
-    A(md_table(["#", "Relative Path", "File Name", "Ext", "Language", "Category", "Purpose",
-                "Description", "Size", "LOC", "Used", "Referenced", "AI Related",
-                "Dependencies"], rows))
-
-    A("\n## 5. AI Agents\n")
-    A(f"**Total AI Agents: {report['ai_agents']['total_ai_agents']}**\n")
-    A(md_table(["Agent Name", "Type", "File", "Purpose", "Provider", "Model", "SDK",
-                "Tools", "Workflows", "Prompts"],
-               [[a["name"], a["type"], a["file"], a["purpose"], a["providers"],
-                 a["models"], a["sdks"], a["tools"], a["workflows"], a["prompts"]]
-                for a in report["ai_agents"]["agents"]]))
-
-    A("\n## 6. AI Providers\n")
-    A(md_table(["Provider", "SDK", "Endpoint", "API Version", "Authentication",
-                "Environment Variables", "Files"],
-               [[p["provider"], p["sdk"], p["endpoint"][:3], p["api_version"][:3],
-                 p["authentication_method"], p["environment_variables"][:6],
-                 p["files"][:6]] for p in report["ai_providers"]]))
-
-    A("\n## 7. AI Models\n")
-    A(md_table(["Model", "Version", "Provider", "Files Using It", "References"],
-               [[m["model"], m["version"], m["provider"], m["files"][:6],
-                 m["reference_count"]] for m in report["ai_models"]]))
-
-    A("\n## 8. Prompt Inventory\n")
-    A(md_table(["Prompt Name", "Type", "Location", "Purpose", "Agent Using It",
-                "Est. Tokens", "Preview"],
-               [[p["name"], p["type"], f"{p['file']}:{p['line']}", p["purpose"],
-                 p["agent"], p["estimated_tokens"], p["preview"][:110]]
-                for p in report["prompts"]]))
-
-    A("\n## 9. API Keys / Environment Variables\n")
-    A(md_table(["Variable Name", "Provider", "AI Related", "Used In", "Loaded From"],
-               [[k["variable"], k["provider"], k["ai_related"], k["used_in"][:5],
-                 k["loaded_from"]] for k in report["api_keys"]]))
-
-    A("\n## 10. Token Usage Analysis (static estimates)\n")
-    A(md_table(["Agent", "File", "Model", "Est. Input Tokens", "Est. Output Tokens",
-                "Avg Request Tokens", "Max Tokens", "Temperature", "Top P",
-                "Context Window", "Estimated Cost"],
-               [[t["agent"], t["file"], t["model"], t["estimated_input_tokens"],
-                 t["estimated_output_tokens"], t["average_request_tokens"],
-                 t["max_tokens_configured"], t["temperature"], t["top_p"],
-                 t["context_window"], t["estimated_cost"]]
-                for t in report["token_usage"]["per_agent"]]))
-    ru = report["token_usage"]["runtime_usage"]
-    A("\n**Runtime token usage**\n")
-    A(md_table(["Metric", "Value"], [
-        ["Current Tokens Used", ru["current_tokens_used"]],
-        ["Today's Tokens Used", ru["todays_tokens_used"]],
-        ["Monthly Tokens Used", ru["monthly_tokens_used"]],
-        ["Remaining Tokens", ru["remaining_tokens"]],
-        ["Percentage Used", ru["percentage_used"]],
-        ["Instrumentation Found", ", ".join(ru["instrumentation_found"])],
-    ]))
-    A(f"\n_{ru['note']}_\n")
-
-    A("\n## 11. Request Usage Analysis\n")
-    q = report["request_usage"]
-    A(md_table(["Metric", "Value"], [
-        ["Requests Per Minute", q["requests_per_minute"]],
-        ["Requests Per Day", q["requests_per_day"]],
-        ["Requests Per Month", q["requests_per_month"]],
-        ["Tokens Per Minute", q["tokens_per_minute"]],
-        ["Max Concurrency", q["max_concurrency"]],
-        ["Current Requests Used", q["current_requests_used"]],
-        ["Remaining Requests", q["remaining_requests"]],
-        ["Rate Limits", q["rate_limits_configured"]],
-        ["Retry Logic", q["retry_logic"]],
-        ["Backoff Logic", q["backoff_logic"]],
-        ["Timeout", q["timeout"]],
-        ["Max Retries", q["max_retries"]],
-    ]))
-    A(f"\n_{q['runtime_usage_note']}_\n")
-
-    A("\n## 12. AI SDKs / Frameworks\n")
-    A(md_table(["SDK / Framework", "Files", "File Count"],
-               [[s["sdk"], s["files"][:8], s["file_count"]] for s in report["ai_sdks"]]))
-
-    A("\n## 13. Tools Used by Agents\n")
-    A(md_table(["Tool", "Files", "File Count"],
-               [[t["tool"], t["files"][:8], t["file_count"]] for t in report["tools"]]))
-
-    A("\n## 14. Agentic Workflow Patterns\n")
-    A(md_table(["Pattern", "Files", "File Count"],
-               [[w["pattern"], w["files"][:8], w["file_count"]] for w in report["workflows"]]))
-
-    A("\n## 15. Dependencies\n")
-    dep = report["dependencies"]
-    A("### File Dependency Graph (internal imports)\n")
-    A(md_table(["File", "Depends On"],
-               [[k, v[:10]] for k, v in sorted(dep["file_dependency_graph"].items())]))
-    A("\n### Agent Dependency Graph\n")
-    A(md_table(["Agent", "File", "Providers", "Models", "SDKs", "Tools"],
-               [[a["agent"], a["file"], a["providers"], a["models"], a["sdks"], a["tools"]]
-                for a in dep["agent_dependency_graph"]]))
-    A("\n### Model Dependency Graph\n")
-    A(md_table(["Model", "Provider", "Files"],
-               [[m["model"], m["provider"], m["files"][:8]]
-                for m in dep["model_dependency_graph"]]))
-    A("\n### Unused / Orphan Files\n")
-    A(md_table(["File"], [[f] for f in dep["orphan_files"]]))
-    A("\n### Dead Code Candidates\n")
-    A(md_table(["Symbol", "Defined In", "Note"],
-               [[d["symbol"], d["defined_in"], d["note"]]
-                for d in dep["dead_code_candidates"][:200]]))
-
-    A("\n---\n")
-    A(f"_Report generated {R['scan_date']} · static analysis only · "
-      f"values that cannot be derived from source are reported as "
-      f"\"{NA}\"._\n")
-
-    with open(path, "w", encoding="utf-8") as fh:
-        fh.write("\n".join(L))
-
-
-def write_json(report: Dict[str, Any], path: str) -> None:
-    with open(path, "w", encoding="utf-8") as fh:
-        json.dump(report, fh, indent=2, sort_keys=False, default=str)
-
-
-CSV_COLUMNS = ["serial", "rel_path", "name", "ext", "language", "category", "purpose",
-               "description", "size_bytes", "size_human", "lines_total", "lines_code",
-               "is_used", "is_referenced", "is_ai_related", "dependencies",
-               "internal_dependencies", "classes", "functions", "endpoints", "providers",
-               "models", "sdks", "tools", "workflows", "env_vars", "agents",
-               "prompt_count", "ai_calls"]
-
-
-def write_csv(report: Dict[str, Any], path: str) -> None:
-    with open(path, "w", encoding="utf-8", newline="") as fh:
-        w = csv.writer(fh)
-        w.writerow([c.replace("_", " ").title() for c in CSV_COLUMNS])
-        for r in report["file_inventory"]:
-            row = []
-            for c in CSV_COLUMNS:
-                v = r.get(c, "")
-                row.append("; ".join(str(x) for x in v) if isinstance(v, list) else v)
-            w.writerow(row)
-
-
-def write_xlsx(report: Dict[str, Any], path: str) -> Optional[str]:
-    try:
-        from openpyxl import Workbook
-        from openpyxl.styles import Alignment, Font, PatternFill
-        from openpyxl.utils import get_column_letter
-    except Exception:
+    def _read(p: Path) -> str | None:
+        if p.stat().st_size > 5 * 1024 * 1024:
+            return None
+        for enc in ("utf-8", "latin-1"):
+            try:
+                return p.read_text(encoding=enc, errors="ignore")
+            except Exception:
+                continue
         return None
 
-    wb = Workbook()
-    head_fill = PatternFill("solid", fgColor="1F3864")
-    head_font = Font(color="FFFFFF", bold=True)
+    @staticmethod
+    def _quick_cat(rel: str, fname: str, ext: str) -> str:
+        pl = (rel + "/" + fname).lower()
+        if re.search(r"test_|_test\.|spec\.|/tests?/|__tests__", pl):
+            return "Test"
+        if re.search(r"config|settings|\.env|\.yaml$|\.yml$|\.toml$|\.ini$", pl):
+            return "Configuration"
+        if re.search(r"\.md$|readme|changelog|license|docs?/", pl):
+            return "Documentation"
+        if re.search(r"\.tf$|dockerfile|docker-compose|kubernetes|k8s|"
+                     r"helm|terraform", pl):
+            return "Infrastructure"
+        if re.search(r"agent|llm|prompt|openai|anthropic|gemini|gpt|"
+                     r"claude|llama|mistral|groq|langchain|transformer|"
+                     r"semantic_kernel|autogen|crewai", pl):
+            return "AI"
+        if ext in (".py", ".js", ".ts", ".java", ".cs", ".go", ".rs",
+                   ".kt", ".scala", ".rb", ".php", ".swift", ".c", ".cpp"):
+            return "Source"
+        return "Other"
 
-    def sheet(title: str, headers: Sequence[str], rows: Sequence[Sequence[Any]],
-              first: bool = False):
-        ws = wb.active if first else wb.create_sheet()
-        ws.title = title[:31]
-        ws.append(list(headers))
-        for c in ws[1]:
-            c.fill, c.font = head_fill, head_font
-            c.alignment = Alignment(vertical="center")
-        for row in rows:
-            ws.append(["; ".join(str(x) for x in v) if isinstance(v, (list, tuple, set))
-                       else v for v in row])
-        for i, h in enumerate(headers, 1):
-            width = max(len(str(h)) + 2,
-                        *(len(str(r[i - 1])[:60]) + 2 for r in rows[:300])) if rows \
-                    else len(str(h)) + 2
-            ws.column_dimensions[get_column_letter(i)].width = min(max(width, 10), 60)
-        ws.freeze_panes = "A2"
-        if rows:
-            ws.auto_filter.ref = ws.dimensions
-        return ws
+    @staticmethod
+    def _imports(content: str, lang: str) -> list[str]:
+        if lang == "Python":
+            return list(dict.fromkeys(
+                m.group(1)
+                for m in re.finditer(
+                    r'^(?:import|from)\s+([\w.]+)', content, re.MULTILINE
+                )
+            ))[:25]
+        if lang in ("JavaScript", "TypeScript"):
+            return list(dict.fromkeys(
+                m.group(1)
+                for m in re.finditer(
+                    r"(?:import|require)\s*\(?['\"]([^'\"]+)['\"]", content
+                )
+            ))[:25]
+        if lang in ("Java", "Kotlin", "Scala"):
+            return list(dict.fromkeys(
+                m.group(1)
+                for m in re.finditer(
+                    r'^import\s+([\w.]+)', content, re.MULTILINE
+                )
+            ))[:25]
+        if lang == "Go":
+            return list(dict.fromkeys(
+                m.group(1)
+                for m in re.finditer(r'"([^"]+)"', content)
+            ))[:25]
+        if lang == "C#":
+            return list(dict.fromkeys(
+                m.group(1)
+                for m in re.finditer(
+                    r'^using\s+([\w.]+)', content, re.MULTILINE
+                )
+            ))[:25]
+        if lang == "Rust":
+            return list(dict.fromkeys(
+                m.group(1)
+                for m in re.finditer(
+                    r'^use\s+([\w:]+)', content, re.MULTILINE
+                )
+            ))[:25]
+        return []
 
-    R, S = report["repository"], report["statistics"]
-    sheet("Summary", ["Metric", "Value"],
-          [[k.replace("_", " ").title(), v] for k, v in R.items()] +
-          [["", ""]] +
-          [[k.replace("_", " ").title(), v] for k, v in S.items()
-           if not isinstance(v, dict)], first=True)
-    sheet("File Inventory", [c.replace("_", " ").title() for c in CSV_COLUMNS],
-          [[r.get(c, "") for c in CSV_COLUMNS] for r in report["file_inventory"]])
-    sheet("AI Agents", ["Name", "Type", "File", "Purpose", "Providers", "Models", "SDKs",
-                        "Tools", "Workflows", "Prompts", "AI Call Sites"],
-          [[a["name"], a["type"], a["file"], a["purpose"], a["providers"], a["models"],
-            a["sdks"], a["tools"], a["workflows"], a["prompts"], a["ai_call_sites"]]
-           for a in report["ai_agents"]["agents"]])
-    sheet("Providers", ["Provider", "SDK", "Endpoint", "API Version", "Authentication",
-                        "Env Vars", "Files"],
-          [[p["provider"], p["sdk"], p["endpoint"], p["api_version"],
-            p["authentication_method"], p["environment_variables"], p["files"]]
-           for p in report["ai_providers"]])
-    sheet("Models", ["Model", "Version", "Provider", "Files", "References"],
-          [[m["model"], m["version"], m["provider"], m["files"], m["reference_count"]]
-           for m in report["ai_models"]])
-    sheet("Prompts", ["Name", "Type", "File", "Line", "Purpose", "Agent", "Chars",
-                      "Est Tokens", "Preview"],
-          [[p["name"], p["type"], p["file"], p["line"], p["purpose"], p["agent"],
-            p["chars"], p["estimated_tokens"], p["preview"]] for p in report["prompts"]])
-    sheet("API Keys", ["Variable", "Provider", "AI Related", "Used In", "Loaded From"],
-          [[k["variable"], k["provider"], k["ai_related"], k["used_in"], k["loaded_from"]]
-           for k in report["api_keys"]])
-    sheet("Token Usage", ["Agent", "File", "Model", "Est Input Tokens", "Est Output Tokens",
-                          "Avg Request Tokens", "Max Tokens", "Temperature", "Top P",
-                          "Context Window", "Estimated Cost", "Current Tokens Used",
-                          "Today Tokens Used", "Monthly Tokens Used", "Remaining Tokens",
-                          "Percentage Used"],
-          [[t["agent"], t["file"], t["model"], t["estimated_input_tokens"],
-            t["estimated_output_tokens"], t["average_request_tokens"],
-            t["max_tokens_configured"], t["temperature"], t["top_p"], t["context_window"],
-            t["estimated_cost"], t["current_tokens_used"], t["todays_tokens_used"],
-            t["monthly_tokens_used"], t["remaining_tokens"], t["percentage_used"]]
-           for t in report["token_usage"]["per_agent"]])
-    q = report["request_usage"]
-    sheet("Request Usage", ["Metric", "Value"],
-          [[k.replace("_", " ").title(), v] for k, v in q.items()])
-    sheet("SDKs", ["SDK", "File Count", "Files"],
-          [[s["sdk"], s["file_count"], s["files"]] for s in report["ai_sdks"]])
-    sheet("Tools", ["Tool", "File Count", "Files"],
-          [[t["tool"], t["file_count"], t["files"]] for t in report["tools"]])
-    sheet("Workflows", ["Pattern", "File Count", "Files"],
-          [[w["pattern"], w["file_count"], w["files"]] for w in report["workflows"]])
-    dep = report["dependencies"]
-    sheet("Dependencies", ["File", "Depends On"],
-          [[k, v] for k, v in sorted(dep["file_dependency_graph"].items())])
-    sheet("Unused Files", ["File"], [[f] for f in dep["orphan_files"]])
-    sheet("Dead Code", ["Symbol", "Defined In", "Note"],
-          [[d["symbol"], d["defined_in"], d["note"]] for d in dep["dead_code_candidates"]])
-    wb.save(path)
-    return path
+    @staticmethod
+    def _classes(content: str, lang: str) -> list[str]:
+        if lang == "Python":
+            return re.findall(r'^class\s+(\w+)', content, re.MULTILINE)[:20]
+        if lang in ("Java", "Kotlin", "Scala", "C#"):
+            return re.findall(r'(?:class|interface)\s+(\w+)', content)[:20]
+        if lang in ("JavaScript", "TypeScript"):
+            return re.findall(r'class\s+(\w+)', content)[:20]
+        if lang == "Go":
+            return re.findall(r'type\s+(\w+)\s+struct', content)[:20]
+        return []
+
+    @staticmethod
+    def _functions(content: str, lang: str) -> list[str]:
+        if lang == "Python":
+            return re.findall(
+                r'^(?:async\s+)?def\s+(\w+)\s*\(', content, re.MULTILINE
+            )[:40]
+        if lang in ("JavaScript", "TypeScript"):
+            return re.findall(r'function\s+(\w+)\s*\(', content)[:40]
+        if lang == "Go":
+            return re.findall(
+                r'^func\s+(?:\(\w+\s+\*?\w+\)\s+)?(\w+)\s*\(',
+                content, re.MULTILINE
+            )[:40]
+        if lang == "Rust":
+            return re.findall(
+                r'^(?:pub\s+)?fn\s+(\w+)', content, re.MULTILINE
+            )[:40]
+        return []
+
+    @staticmethod
+    def _is_ai(content: str, rel: str) -> bool:
+        kws = ["agent", "llm", "prompt", "openai", "anthropic", "gemini",
+               "langchain", "embedding", "vector", "rag", "gpt", "claude",
+               "llama", "mistral", "groq", "semantic_kernel", "autogen",
+               "crewai", "llamaindex"]
+        if any(k in rel.lower() for k in kws):
+            return True
+        sample = content[:4000].lower()
+        return sum(
+            1 for k in ["openai", "anthropic", "langchain", "llm",
+                         "gpt-4", "gpt-3", "claude", "gemini", "llama",
+                         "completion", "embedding", "chat_completion",
+                         "messages.create", "generate_content",
+                         "prompt_template", "system_prompt"]
+            if k in sample
+        ) >= 2
+
+    @staticmethod
+    def _purpose(rec: FileRecord, content: str) -> tuple[str, str]:
+        kws: dict[str, list[str]] = {
+            "AI Agent":          ["agent", "autonomous"],
+            "LLM Wrapper":       ["llm", "language_model", "chat_model"],
+            "Prompt Management": ["prompt", "template", "system_message"],
+            "RAG Pipeline":      ["rag", "retrieval", "vectorstore"],
+            "Embedding":         ["embedding", "embed"],
+            "Workflow":          ["workflow", "pipeline", "chain", "graph"],
+            "API Controller":    ["controller", "router", "endpoint", "route"],
+            "Service Layer":     ["service", "manager", "handler"],
+            "Data Model":        ["model", "schema", "entity"],
+            "Database Access":   ["repository", "dao", "database", "db"],
+            "Authentication":    ["auth", "login", "jwt", "oauth"],
+            "Configuration":     ["config", "settings", "constants"],
+            "Logging":           ["logging", "logger"],
+            "Testing":           ["test", "spec", "unittest", "pytest"],
+            "Deployment":        ["deploy", "dockerfile", "terraform"],
+            "Utility":           ["util", "helper", "common", "shared"],
+            "Documentation":     ["readme", "docs", "changelog"],
+        }
+        pl  = (rec.relative_path + "/" + rec.file_name).lower()
+        cl  = content[:2000].lower()
+        matched = [
+            p for p, ws in kws.items()
+            if any(w in pl or w in cl for w in ws)
+        ]
+        primary = matched[0] if matched else "Utility"
+        parts: list[str] = []
+        if rec.classes:
+            parts.append(f"Classes: {', '.join(rec.classes[:3])}")
+        if rec.functions:
+            parts.append(f"{len(rec.functions)} function(s)")
+        if len(matched) > 1:
+            parts.append(f"Roles: {', '.join(matched[:3])}")
+        return primary, "; ".join(parts) or f"{primary} file"
+
+    # ── AI component detectors ────────────────────────────────
+    def _detect_providers(self, content: str, rel: str) -> None:
+        for name, cfg in AI_PROVIDER_PATTERNS.items():
+            found = (
+                any(re.search(p, content, re.I)
+                    for p in cfg.get("imports", []))
+                or any(re.search(p, content, re.I)
+                       for p in cfg.get("endpoints", []))
+            )
+            evs = [
+                p.rstrip("$")
+                for p in cfg.get("env_vars", [])
+                if re.search(p, content, re.I)
+            ]
+            if found or evs:
+                if name not in self.result.providers:
+                    self.result.providers[name] = asdict(ProviderRecord(
+                        name=name, sdk=cfg.get("sdk", ""),
+                        env_vars=evs, files=[rel],
+                    ))
+                else:
+                    pr = self.result.providers[name]
+                    if rel not in pr["files"]:
+                        pr["files"].append(rel)
+                    for ev in evs:
+                        if ev not in pr["env_vars"]:
+                            pr["env_vars"].append(ev)
+
+    def _detect_models(self, content: str, rel: str) -> None:
+        for pat in AI_MODEL_PATTERNS:
+            for m in re.finditer(pat, content, re.I):
+                name = m.group(0).lower().strip()
+                if len(name) < 3:
+                    continue
+                if name not in self.result.models:
+                    self.result.models[name] = asdict(ModelRecord(
+                        name=name,
+                        provider=self._infer_provider(name),
+                        files=[rel], reference_count=1,
+                    ))
+                else:
+                    mr = self.result.models[name]
+                    mr["reference_count"] += 1
+                    if rel not in mr["files"]:
+                        mr["files"].append(rel)
+
+    @staticmethod
+    def _infer_provider(mn: str) -> str:
+        if any(x in mn for x in ["gpt", "o1", "o2", "o3", "o4",
+                                   "dall-e", "whisper"]):
+            return "OpenAI"
+        if "claude"  in mn:  return "Anthropic"
+        if any(x in mn for x in ["gemini", "palm", "bard"]): return "Google"
+        if "llama"   in mn:  return "Meta"
+        if any(x in mn for x in ["mistral", "mixtral", "codestral"]):
+            return "Mistral"
+        if "deepseek" in mn: return "DeepSeek"
+        if any(x in mn for x in ["command", "aya"]): return "Cohere"
+        if "phi"     in mn:  return "Microsoft"
+        if "qwen"    in mn:  return "Alibaba"
+        return "Unknown"
+
+    def _detect_prompts(self, content: str, rel: str) -> None:
+        for pat in PROMPT_PATTERNS:
+            for m in re.finditer(pat, content, re.I | re.M):
+                ln      = content[:m.start()].count("\n") + 1
+                snippet = content[m.end():m.end() + 120].strip()[:80]
+                ptype   = (
+                    "System Prompt" if "system"   in pat.lower() else
+                    "User Prompt"   if "user"     in pat.lower() else
+                    "Template"      if "template" in pat.lower() else
+                    "Prompt"
+                )
+                self.result.prompts.append(asdict(PromptRecord(
+                    name=            f"Prompt @ line {ln}",
+                    location=        rel,
+                    line_number=     ln,
+                    prompt_type=     ptype,
+                    content_preview= snippet.replace("\n", " "),
+                )))
+                break
+
+        if any(rel.endswith(e)
+               for e in [".prompt", ".j2", ".jinja", ".jinja2"]):
+            self.result.prompts.append(asdict(PromptRecord(
+                name=        Path(rel).name,
+                location=    rel,
+                line_number= 1,
+                prompt_type= "Template File",
+                content_preview= content[:80].replace("\n", " "),
+            )))
+
+    def _detect_api_keys(self, content: str, rel: str) -> None:
+        for var, provider in API_KEY_MAP.items():
+            if not re.search(r'\b' + re.escape(var) + r'\b', content):
+                continue
+            loaded = (
+                "os.environ"  if "os.environ"  in content else
+                "os.getenv"   if "os.getenv"   in content else
+                ".env file"   if ("load_dotenv" in content
+                                   or "dotenv" in content) else
+                f"Config ({rel})" if rel.endswith(
+                    (".yaml", ".yml", ".json")
+                ) else "Unknown"
+            )
+            if var not in self.result.api_keys:
+                self.result.api_keys[var] = asdict(APIKeyRecord(
+                    variable_name=var, provider=provider,
+                    used_in=[rel], loaded_from=loaded,
+                ))
+            elif rel not in self.result.api_keys[var]["used_in"]:
+                self.result.api_keys[var]["used_in"].append(rel)
+
+    def _detect_sdks(self, content: str, rel: str) -> None:
+        for sdk, pats in AI_SDK_PATTERNS.items():
+            if any(re.search(p, content, re.I) for p in pats):
+                if sdk not in self.result.sdks:
+                    self.result.sdks[sdk] = asdict(SDKRecord(
+                        name=sdk, files=[rel], import_count=1,
+                    ))
+                else:
+                    sr = self.result.sdks[sdk]
+                    sr["import_count"] += 1
+                    if rel not in sr["files"]:
+                        sr["files"].append(rel)
+
+    def _detect_tools(self, content: str, rel: str) -> None:
+        for tool, pats in TOOL_PATTERNS.items():
+            if any(re.search(p, content, re.I) for p in pats):
+                if tool not in self.result.tools:
+                    self.result.tools[tool] = asdict(ToolRecord(
+                        name=tool, files=[rel],
+                    ))
+                elif rel not in self.result.tools[tool]["files"]:
+                    self.result.tools[tool]["files"].append(rel)
+
+    def _detect_workflows(self, content: str, rel: str) -> None:
+        for wf, pats in WORKFLOW_PATTERNS.items():
+            if any(re.search(p, content, re.I) for p in pats):
+                if wf not in self.result.workflows:
+                    self.result.workflows[wf] = asdict(WorkflowRecord(
+                        name=wf, files=[rel],
+                    ))
+                elif rel not in self.result.workflows[wf]["files"]:
+                    self.result.workflows[wf]["files"].append(rel)
+
+    def _detect_agents(self, content: str, rec: FileRecord) -> None:
+        existing = sum(
+            1 for a in self.result.agents
+            if a["file"] == rec.relative_path
+        )
+        if existing >= 8:
+            return
+        for pat in AGENT_DETECTION_PATTERNS:
+            for m in re.finditer(pat, content, re.I):
+                ln   = content[:m.start()].count("\n") + 1
+                text = m.group(0)
+                cm   = re.match(r'class\s+(\w+)', text)
+                name = (
+                    cm.group(1)      if cm                       else
+                    "AgentExecutor"  if "AgentExecutor"  in text else
+                    "AssistantAgent" if "AssistantAgent"  in text else
+                    "UserProxyAgent" if "UserProxyAgent"  in text else
+                    "CrewAI Agent"   if "Crew"            in text else
+                    "LangGraph Agent"if "StateGraph"      in text else
+                    "AI Agent"
+                )
+                cs  = max(0, m.start() - 400)
+                ce  = min(len(content), m.end() + 400)
+                ctx = content[cs:ce]
+                tc: dict[str, str] = {
+                    k: mm.group(1)
+                    for k, p in TOKEN_CONFIG_PATTERNS.items()
+                    if (mm := re.search(p, ctx, re.I))
+                }
+                agent_type = (
+                    "Class-based Agent" if "class"        in text.lower() else
+                    "LangChain Agent"   if "AgentExecutor"in text         else
+                    "CrewAI Agent"      if "Crew"         in text         else
+                    "LangGraph Agent"   if "StateGraph"   in text
+                                          or "MessageGraph" in text        else
+                    "AutoGen Agent"     if "AssistantAgent" in text
+                                          or "UserProxyAgent" in text      else
+                    "API-based Agent"
+                )
+                self.result.agents.append(asdict(AgentRecord(
+                    name=         name,
+                    file=         rec.relative_path,
+                    agent_type=   agent_type,
+                    purpose=      rec.purpose,
+                    provider=     self._ctx_provider(ctx),
+                    sdk=          self._ctx_sdk(ctx),
+                    model=        self._ctx_model(ctx),
+                    tools=        self._ctx_tools(ctx),
+                    workflows=    self._ctx_workflows(ctx),
+                    token_config= tc,
+                    line_number=  ln,
+                )))
+                existing += 1
+                if existing >= 8:
+                    return
+
+    @staticmethod
+    def _ctx_provider(ctx: str) -> str:
+        for name, cfg in AI_PROVIDER_PATTERNS.items():
+            if any(re.search(p, ctx, re.I) for p in cfg.get("imports", [])):
+                return name
+        return "Unknown"
+
+    @staticmethod
+    def _ctx_model(ctx: str) -> str:
+        for pat in AI_MODEL_PATTERNS:
+            m = re.search(pat, ctx, re.I)
+            if m:
+                return m.group(0)
+        return "Not Specified"
+
+    @staticmethod
+    def _ctx_sdk(ctx: str) -> str:
+        for sdk, pats in AI_SDK_PATTERNS.items():
+            if any(re.search(p, ctx, re.I) for p in pats):
+                return sdk
+        return "Unknown"
+
+    @staticmethod
+    def _ctx_tools(ctx: str) -> list[str]:
+        return [
+            t for t, pats in TOOL_PATTERNS.items()
+            if any(re.search(p, ctx, re.I) for p in pats)
+        ]
+
+    @staticmethod
+    def _ctx_workflows(ctx: str) -> list[str]:
+        return [
+            w for w, pats in WORKFLOW_PATTERNS.items()
+            if any(re.search(p, ctx, re.I) for p in pats)
+        ]
 
 
-# =====================================================================================
-# SECTION 9 -- HTML DASHBOARD
-# =====================================================================================
+# ══════════════════════════════════════════════════════════════
+# SCAN STATE  —  thread-safe module-level singleton
+# ══════════════════════════════════════════════════════════════
 
-HTML_TEMPLATE = r"""<!DOCTYPE html>
-<html lang="en" data-theme="dark">
+_scan_lock:    Lock              = Lock()
+_last_result:  ScanResult | None = None
+_scan_running: bool              = False
+_scan_start:   float             = 0.0
+
+
+def _run_scan_background(path: str) -> None:
+    global _last_result, _scan_running, _scan_start
+    _scan_start   = time.time()
+    _scan_running = True
+    try:
+        _last_result = RepoScanner(path).scan()
+    except Exception as exc:
+        if _last_result is None:
+            _last_result = ScanResult(errors=[str(exc)])
+        else:
+            _last_result.errors.append(str(exc))
+    finally:
+        _scan_running = False
+
+
+# ══════════════════════════════════════════════════════════════
+# HTML DASHBOARD
+# ══════════════════════════════════════════════════════════════
+
+_DASHBOARD_HTML = r"""
+<!DOCTYPE html>
+<html lang="en">
 <head>
-<meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>AI Repository Audit — __REPO__</title>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SentinelOps · AI Scanner</title>
 <style>
-:root{--bg:#0e1117;--panel:#161b22;--panel2:#1c2230;--txt:#e6edf3;--muted:#8b949e;
---acc:#4f9cf9;--acc2:#7ee787;--warn:#f0883e;--bad:#f85149;--brd:#30363d;}
-html[data-theme="light"]{--bg:#f5f7fa;--panel:#ffffff;--panel2:#eef2f7;--txt:#1b2430;
---muted:#5b6673;--acc:#1a63d8;--acc2:#1a7f37;--warn:#b45309;--bad:#b91c1c;--brd:#d5dbe3;}
-*{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--txt);
-font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
-header{position:sticky;top:0;z-index:50;background:var(--panel);border-bottom:1px solid var(--brd);
-padding:14px 20px;display:flex;flex-wrap:wrap;gap:12px;align-items:center;justify-content:space-between}
-h1{font-size:18px;margin:0}
-h2{font-size:17px;margin:0 0 12px;padding-bottom:8px;border-bottom:1px solid var(--brd)}
-h3{font-size:14px;margin:18px 0 8px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em}
-.sub{color:var(--muted);font-size:12px}
-.btn{background:var(--panel2);color:var(--txt);border:1px solid var(--brd);border-radius:8px;
-padding:7px 12px;cursor:pointer;font-size:13px}
-.btn:hover{border-color:var(--acc);color:var(--acc)}
-.wrap{max-width:1680px;margin:0 auto;padding:20px}
-nav{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:18px}
-nav a{padding:6px 11px;border-radius:20px;background:var(--panel);border:1px solid var(--brd);
-color:var(--muted);text-decoration:none;font-size:12.5px}
-nav a:hover{color:var(--acc);border-color:var(--acc)}
-section{background:var(--panel);border:1px solid var(--brd);border-radius:12px;
-padding:18px;margin-bottom:18px}
-.cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(165px,1fr));gap:12px}
-.card{background:var(--panel2);border:1px solid var(--brd);border-radius:10px;padding:14px}
-.card .v{font-size:24px;font-weight:700;color:var(--acc)}
-.card .l{font-size:11.5px;color:var(--muted);text-transform:uppercase;letter-spacing:.05em}
-.tblwrap{overflow:auto;max-height:640px;border:1px solid var(--brd);border-radius:10px}
-table{border-collapse:collapse;width:100%;font-size:12.5px}
-th,td{padding:7px 9px;border-bottom:1px solid var(--brd);text-align:left;vertical-align:top}
-th{background:var(--panel2);position:sticky;top:0;cursor:pointer;white-space:nowrap;z-index:2}
-th:hover{color:var(--acc)}
-tbody tr:hover{background:rgba(79,156,249,.08)}
-td.desc{max-width:420px}
-input,select{background:var(--panel2);color:var(--txt);border:1px solid var(--brd);
-border-radius:8px;padding:7px 10px;font-size:13px}
-.controls{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:10px;align-items:center}
-.tag{display:inline-block;background:var(--panel2);border:1px solid var(--brd);border-radius:6px;
-padding:1px 7px;margin:1px 3px 1px 0;font-size:11.5px}
-.yes{color:var(--acc2);font-weight:600}.no{color:var(--muted)}.na{color:var(--warn)}
-pre{background:var(--panel2);border:1px solid var(--brd);border-radius:10px;padding:14px;
-overflow:auto;max-height:520px;font-size:12px;margin:0}
-.charts{display:grid;grid-template-columns:repeat(auto-fit,minmax(330px,1fr));gap:16px}
-.chart{background:var(--panel2);border:1px solid var(--brd);border-radius:10px;padding:14px}
-.chart h4{margin:0 0 10px;font-size:13px;color:var(--muted)}
-.bar{display:flex;align-items:center;gap:8px;margin:5px 0}
-.bar .nm{width:38%;font-size:11.5px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;
-white-space:nowrap}
-.bar .tr{flex:1;background:var(--bg);border-radius:5px;height:15px;overflow:hidden}
-.bar .fl{height:100%;background:linear-gradient(90deg,var(--acc),var(--acc2));border-radius:5px}
-.bar .ct{width:52px;text-align:right;font-size:11.5px;color:var(--txt)}
-.note{background:rgba(240,136,62,.1);border-left:3px solid var(--warn);padding:10px 12px;
-border-radius:0 8px 8px 0;font-size:12.5px;margin:10px 0}
-footer{color:var(--muted);font-size:12px;text-align:center;padding:22px}
-@media(max-width:720px){.wrap{padding:12px}header{padding:10px 12px}td.desc{max-width:200px}}
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#0d1117;--surface:#161b22;--border:#30363d;
+  --text:#e6edf3;--muted:#8b949e;--blue:#58a6ff;
+  --green:#3fb950;--red:#f85149;--orange:#d29922;
+  --purple:#bc8cff;--teal:#39d353;
+  --shadow:0 4px 24px rgba(0,0,0,.4);--r:10px;
+  --font:'Segoe UI',-apple-system,sans-serif;
+  --mono:'Cascadia Code','Fira Code',monospace;
+}
+body{font-family:var(--font);background:var(--bg);color:var(--text);
+     display:flex;min-height:100vh}
+/* sidebar */
+.sb{width:230px;min-height:100vh;background:#0d1117;
+    border-right:1px solid var(--border);position:fixed;
+    left:0;top:0;bottom:0;display:flex;flex-direction:column;
+    z-index:50;overflow-y:auto}
+.sb-logo{padding:18px 14px 10px;border-bottom:1px solid var(--border)}
+.sb-logo h2{color:var(--blue);font-size:14px;font-weight:700}
+.sb-logo p{color:var(--muted);font-size:10px;margin-top:2px}
+.sb-nav{flex:1;padding:6px 0}
+.nav-a{display:flex;align-items:center;gap:7px;padding:8px 14px;
+       color:var(--muted);text-decoration:none;font-size:12px;
+       border-left:3px solid transparent;transition:all .15s}
+.nav-a:hover,.nav-a.active{color:var(--text);
+  border-left-color:var(--blue);background:rgba(88,166,255,.07)}
+.sb-foot{padding:10px 14px;border-top:1px solid var(--border)}
+.dk-btn{width:100%;padding:7px;background:rgba(255,255,255,.06);
+        color:var(--muted);border:1px solid var(--border);
+        border-radius:6px;cursor:pointer;font-size:11px}
+/* main */
+.main{margin-left:230px;flex:1;padding:20px;
+      max-width:calc(100vw - 230px)}
+.topbar{display:flex;justify-content:space-between;
+        align-items:center;margin-bottom:16px}
+.topbar h1{font-size:18px;color:var(--blue)}
+.topbar-r{display:flex;gap:7px;align-items:center}
+/* buttons */
+.btn{padding:6px 13px;border:none;border-radius:6px;cursor:pointer;
+     font-size:12px;font-weight:600;transition:all .15s;
+     display:inline-flex;align-items:center;gap:5px}
+.btn-g{background:#238636;color:#fff}
+.btn-b{background:#1f6feb;color:#fff}
+.btn-gr{background:rgba(255,255,255,.08);color:var(--text);
+        border:1px solid var(--border)}
+.btn:hover{opacity:.85;transform:translateY(-1px)}
+/* search bar */
+.sb-bar{display:flex;gap:9px;flex-wrap:wrap;margin-bottom:16px;
+        background:var(--surface);padding:12px;
+        border-radius:var(--r);border:1px solid var(--border)}
+.sb-bar input,.sb-bar select{
+  padding:6px 10px;background:var(--bg);color:var(--text);
+  border:1px solid var(--border);border-radius:6px;font-size:12px}
+.sb-bar input{flex:1;min-width:180px}
+/* stats */
+.sg{display:grid;grid-template-columns:repeat(auto-fill,minmax(130px,1fr));
+    gap:10px;margin-bottom:16px}
+.sc{background:var(--surface);border:1px solid var(--border);
+    border-radius:var(--r);padding:14px;text-align:center;border-top:3px solid;
+    transition:transform .15s}
+.sc:hover{transform:translateY(-2px)}
+.si{font-size:22px;margin-bottom:5px}
+.sv{font-size:22px;font-weight:800;margin-bottom:2px}
+.sl{font-size:9px;color:var(--muted);text-transform:uppercase;
+    letter-spacing:.5px}
+.cb{border-color:var(--blue)}.cb .sv{color:var(--blue)}
+.cg{border-color:var(--green)}.cg .sv{color:var(--green)}
+.cr{border-color:var(--red)}.cr .sv{color:var(--red)}
+.co{border-color:var(--orange)}.co .sv{color:var(--orange)}
+.cp{border-color:var(--purple)}.cp .sv{color:var(--purple)}
+.ct{border-color:var(--teal)}.ct .sv{color:var(--teal)}
+/* section */
+section{margin-bottom:32px;scroll-margin-top:14px}
+.st{font-size:15px;font-weight:700;margin-bottom:12px;
+    padding-bottom:7px;border-bottom:1px solid var(--border);
+    display:flex;align-items:center;gap:8px}
+.bdg{display:inline-flex;align-items:center;padding:2px 7px;
+     border-radius:10px;font-size:10px;font-weight:600}
+.bdg-b{background:rgba(88,166,255,.15);color:var(--blue)}
+.bdg-r{background:rgba(248,81,73,.15);color:var(--red)}
+.bdg-g{background:rgba(63,185,80,.15);color:var(--green)}
+.bdg-o{background:rgba(210,153,34,.15);color:var(--orange)}
+.bdg-p{background:rgba(188,140,255,.15);color:var(--purple)}
+/* tables */
+.tw{overflow-x:auto;border-radius:var(--r);border:1px solid var(--border)}
+table{width:100%;border-collapse:collapse;font-size:11px;
+      background:var(--surface)}
+thead{position:sticky;top:0;z-index:5}
+th{background:#161b22;color:var(--muted);padding:9px 11px;
+   text-align:left;font-size:9px;text-transform:uppercase;
+   letter-spacing:.5px;border-bottom:1px solid var(--border);
+   cursor:pointer;white-space:nowrap;user-select:none}
+th:hover{color:var(--text)}
+td{padding:7px 11px;border-bottom:1px solid var(--border);
+   vertical-align:middle}
+tbody tr:last-child td{border-bottom:none}
+tbody tr:hover{background:rgba(88,166,255,.04)}
+tbody tr.air{background:rgba(248,81,73,.03)}
+tbody tr.hid{display:none}
+.mono{font-family:var(--mono);font-size:10px}
+.pth{font-family:var(--mono);font-size:9px;color:var(--muted);
+     max-width:200px;overflow:hidden;text-overflow:ellipsis;
+     white-space:nowrap;display:block}
+.pill{display:inline-block;padding:1px 6px;border-radius:8px;
+      font-size:9px;font-weight:600;white-space:nowrap}
+.pai{background:rgba(248,81,73,.15);color:var(--red)}
+.pbl{background:rgba(88,166,255,.12);color:var(--blue)}
+.pgr{background:rgba(63,185,80,.12);color:var(--green)}
+.por{background:rgba(210,153,34,.12);color:var(--orange)}
+.ppu{background:rgba(188,140,255,.12);color:var(--purple)}
+.pgy{background:rgba(255,255,255,.08);color:var(--muted)}
+/* tree */
+.tree{background:#0d1117;border:1px solid var(--border);
+      border-radius:var(--r);padding:16px;
+      font-family:var(--mono);font-size:11px;line-height:1.8;
+      color:#a8b2d8;overflow-x:auto;max-height:400px;overflow-y:auto}
+/* info boxes */
+.ib{padding:10px 14px;border-radius:7px;font-size:12px;
+    margin-bottom:12px;border-left:3px solid}
+.iw{background:rgba(210,153,34,.1);border-color:var(--orange);
+    color:var(--orange)}
+.ii{background:rgba(88,166,255,.08);border-color:var(--blue);
+    color:var(--blue)}
+/* cards */
+.cg2{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));
+     gap:12px}
+.pc{background:var(--surface);border:1px solid var(--border);
+    border-radius:var(--r);padding:14px;border-left:4px solid var(--blue)}
+.pn{font-size:14px;font-weight:700;color:var(--blue);margin-bottom:7px}
+.pr{display:flex;justify-content:space-between;font-size:10px;
+    padding:2px 0;color:var(--muted)}
+.pr span:last-child{color:var(--text)}
+.evl{margin-top:7px;display:flex;flex-wrap:wrap;gap:3px}
+.evt{background:rgba(210,153,34,.1);color:var(--orange);
+     padding:1px 5px;border-radius:3px;font-size:9px;
+     font-family:var(--mono)}
+/* chips */
+.chg{display:flex;flex-wrap:wrap;gap:7px}
+.ch{background:var(--surface);border:1px solid var(--border);
+    border-radius:7px;padding:9px 12px;font-size:11px;font-weight:600;
+    display:flex;flex-direction:column;gap:2px}
+.ch small{color:var(--muted);font-size:9px;font-weight:400}
+/* spinner */
+.sp{display:none;align-items:center;gap:7px;color:var(--blue);font-size:12px}
+.spin{width:14px;height:14px;border:2px solid var(--border);
+      border-top-color:var(--blue);border-radius:50%;
+      animation:spin .7s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+.empty{padding:32px;text-align:center;color:var(--muted);font-size:12px;
+       background:var(--surface);border-radius:var(--r);
+       border:1px solid var(--border)}
+@media(max-width:768px){
+  .sb{width:0;overflow:hidden}.main{margin-left:0;max-width:100vw;padding:14px}
+}
+@media print{.sb,.topbar-r,.sb-bar{display:none!important}.main{margin-left:0}}
 </style>
 </head>
 <body>
-<header>
-  <div><h1>AI Repository Audit — __REPO__</h1>
-  <div class="sub">__ROOT__ · scanned __DATE__ · static analysis only</div></div>
-  <div style="display:flex;gap:8px;flex-wrap:wrap">
-    <button class="btn" onclick="toggleTheme()">🌓 Theme</button>
-    <button class="btn" onclick="exportJSON()">⬇ JSON</button>
-    <button class="btn" onclick="exportCSV()">⬇ CSV (inventory)</button>
-    <button class="btn" onclick="window.print()">🖨 Print / PDF</button>
+<aside class="sb">
+  <div class="sb-logo">
+    <h2>🔍 AI Scanner</h2>
+    <p>SentinelOps-Lite</p>
   </div>
-</header>
-<div class="wrap">
-<nav>
-  <a href="#overview">Overview</a><a href="#stats">File Statistics</a>
-  <a href="#charts">Charts</a><a href="#tree">Directory Tree</a>
-  <a href="#files">File Purpose Table</a><a href="#agents">AI Agents</a>
-  <a href="#providers">Providers</a><a href="#models">Models</a>
-  <a href="#prompts">Prompts</a><a href="#tokens">Token Usage</a>
-  <a href="#requests">Request Usage</a><a href="#sdks">SDKs</a>
-  <a href="#tools">Tools &amp; Workflows</a><a href="#deps">Dependencies</a>
-  <a href="#unused">Unused Files</a>
-</nav>
-
-<section id="overview"><h2>Repository Overview</h2><div class="cards" id="ovCards"></div></section>
-<section id="stats"><h2>File Statistics</h2><div class="cards" id="stCards"></div></section>
-<section id="charts"><h2>Charts</h2><div class="charts" id="chartArea"></div></section>
-<section id="tree"><h2>Directory Tree</h2><pre id="tree_pre"></pre></section>
-
-<section id="files"><h2>File Purpose Table</h2>
-  <div class="controls">
-    <input id="q" placeholder="Search path, purpose, description…" style="min-width:280px;flex:1"/>
-    <select id="fCat"></select><select id="fLang"></select>
-    <select id="fPurpose"></select><select id="fAI"></select>
-    <button class="btn" onclick="resetFilters()">Reset</button>
-    <span class="sub" id="cnt"></span>
+  <nav class="sb-nav">
+    <a href="#overview"  class="nav-a active">📊 Overview</a>
+    <a href="#tree"      class="nav-a">📁 Directory Tree</a>
+    <a href="#files"     class="nav-a">📄 File Inventory</a>
+    <a href="#agents"    class="nav-a">🤖 AI Agents</a>
+    <a href="#providers" class="nav-a">☁️ Providers</a>
+    <a href="#models"    class="nav-a">🧠 Models</a>
+    <a href="#sdks"      class="nav-a">🛠️ SDKs</a>
+    <a href="#prompts"   class="nav-a">💬 Prompts</a>
+    <a href="#apikeys"   class="nav-a">🔑 API Keys</a>
+    <a href="#tools"     class="nav-a">⚙️ Tools</a>
+    <a href="#workflows" class="nav-a">🔄 Workflows</a>
+    <a href="#tokens"    class="nav-a">🪙 Token Config</a>
+    <a href="#unused"    class="nav-a">🗑️ Unused Files</a>
+  </nav>
+  <div class="sb-foot">
+    <button class="dk-btn" onclick="toggleDark()">🌙 Toggle theme</button>
   </div>
-  <div class="tblwrap"><table id="tFiles"><thead></thead><tbody></tbody></table></div>
-</section>
+</aside>
 
-<section id="agents"><h2>AI Agents <span class="sub">(total: __AGENTS__)</span></h2>
-  <div class="tblwrap"><table id="tAgents"><thead></thead><tbody></tbody></table></div></section>
-<section id="providers"><h2>AI Providers</h2>
-  <div class="tblwrap"><table id="tProv"><thead></thead><tbody></tbody></table></div></section>
-<section id="models"><h2>AI Models</h2>
-  <div class="tblwrap"><table id="tModels"><thead></thead><tbody></tbody></table></div></section>
-<section id="prompts"><h2>Prompt Inventory</h2>
-  <div class="controls"><input id="qp" placeholder="Search prompts…" style="min-width:280px;flex:1"/></div>
-  <div class="tblwrap"><table id="tPrompts"><thead></thead><tbody></tbody></table></div></section>
-<section id="keys"><h2>API Keys / Environment Variables</h2>
-  <div class="tblwrap"><table id="tKeys"><thead></thead><tbody></tbody></table></div></section>
+<div class="main">
+  <div class="topbar">
+    <h1>🔍 AI Repository Scanner</h1>
+    <div class="topbar-r">
+      <div class="sp" id="spinner"><div class="spin"></div>Scanning…</div>
+      <button class="btn btn-g" onclick="triggerScan()">▶ Scan Repo</button>
+      <button class="btn btn-gr" onclick="exportJSON()">⬇ JSON</button>
+      <button class="btn btn-gr" onclick="exportCSV()">⬇ CSV</button>
+    </div>
+  </div>
 
-<section id="tokens"><h2>Token Usage</h2>
-  <div class="note">Token figures below are <b>static estimates</b> derived from prompt text
-  (~4 characters per token) and configured <code>max_tokens</code>. Live consumption is a
-  runtime value and is reported as “__NA__”.</div>
-  <div class="tblwrap"><table id="tTokens"><thead></thead><tbody></tbody></table></div>
-  <h3>Runtime Token Usage</h3>
-  <div class="tblwrap"><table id="tRuntime"><thead></thead><tbody></tbody></table></div>
-</section>
+  <div class="sb-bar">
+    <input id="gs" type="text"
+           placeholder="🔍 Search files, agents, models…"
+           oninput="globalSearch(this.value)">
+    <select id="fc" onchange="applyFilters()">
+      <option value="">All Categories</option>
+      <option>AI</option><option>Source</option><option>Test</option>
+      <option>Configuration</option><option>Documentation</option>
+      <option>Infrastructure</option><option>Other</option>
+    </select>
+    <select id="fa" onchange="applyFilters()">
+      <option value="">All Files</option>
+      <option value="true">AI Related</option>
+      <option value="false">Non-AI</option>
+    </select>
+    <select id="fl" onchange="applyFilters()">
+      <option value="">All Languages</option>
+    </select>
+  </div>
 
-<section id="requests"><h2>Request Usage</h2>
-  <div class="tblwrap"><table id="tReq"><thead></thead><tbody></tbody></table></div></section>
-<section id="sdks"><h2>AI SDKs / Frameworks</h2>
-  <div class="tblwrap"><table id="tSdks"><thead></thead><tbody></tbody></table></div></section>
-<section id="tools"><h2>Tools &amp; Workflow Patterns</h2>
-  <h3>Tools</h3><div class="tblwrap"><table id="tTools"><thead></thead><tbody></tbody></table></div>
-  <h3>Workflows</h3><div class="tblwrap"><table id="tWf"><thead></thead><tbody></tbody></table></div>
-</section>
-<section id="deps"><h2>Dependencies</h2>
-  <h3>File Dependency Graph</h3>
-  <div class="tblwrap"><table id="tDeps"><thead></thead><tbody></tbody></table></div>
-  <h3>Agent Dependency Graph</h3>
-  <div class="tblwrap"><table id="tADeps"><thead></thead><tbody></tbody></table></div>
-</section>
-<section id="unused"><h2>Unused / Orphan Files &amp; Dead Code</h2>
-  <h3>Unused / Orphan Files</h3>
-  <div class="tblwrap"><table id="tOrph"><thead></thead><tbody></tbody></table></div>
-  <h3>Dead Code Candidates</h3>
-  <div class="tblwrap"><table id="tDead"><thead></thead><tbody></tbody></table></div>
-</section>
+  <section id="overview">
+    <div class="st">📊 Repository Overview</div>
+    <div id="meta" style="font-size:11px;color:var(--muted);margin-bottom:12px">
+      No scan yet — click <strong>▶ Scan Repo</strong> to start.
+    </div>
+    <div class="sg" id="sg"></div>
+  </section>
 
-<footer>AI Repository Auditor v__VERSION__ · deterministic static analysis ·
-no repository code was executed and no files were modified.</footer>
+  <section id="tree">
+    <div class="st">📁 Directory Tree</div>
+    <pre class="tree" id="tree-box">Run a scan to see the directory tree.</pre>
+  </section>
+
+  <section id="files">
+    <div class="st">📄 File Inventory
+      <span class="bdg bdg-b" id="fc-bdg"></span>
+    </div>
+    <div class="tw">
+      <table id="ft">
+        <thead><tr>
+          <th onclick="srt('ft',0)">#</th>
+          <th onclick="srt('ft',1)">Path</th>
+          <th onclick="srt('ft',2)">File</th>
+          <th onclick="srt('ft',3)">Ext</th>
+          <th onclick="srt('ft',4)">Language</th>
+          <th onclick="srt('ft',5)">Category</th>
+          <th onclick="srt('ft',6)">Purpose</th>
+          <th onclick="srt('ft',7)">Lines</th>
+          <th onclick="srt('ft',8)">Size</th>
+          <th onclick="srt('ft',9)">AI</th>
+          <th onclick="srt('ft',10)">Used</th>
+        </tr></thead>
+        <tbody id="ftb"><tr><td colspan="11" class="empty">Run a scan first.</td></tr></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="agents">
+    <div class="st">🤖 AI Agents
+      <span class="bdg bdg-r" id="ag-bdg"></span>
+    </div>
+    <div class="tw">
+      <table id="at">
+        <thead><tr>
+          <th>#</th><th>Name</th><th>File</th><th>Type</th>
+          <th>Provider</th><th>SDK</th><th>Model</th>
+          <th>Tools</th><th>Workflows</th><th>Line</th>
+        </tr></thead>
+        <tbody id="atb"><tr><td colspan="10" class="empty">Run a scan first.</td></tr></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="providers">
+    <div class="st">☁️ Providers
+      <span class="bdg bdg-b" id="pv-bdg"></span>
+    </div>
+    <div class="cg2" id="pv-grid"><div class="empty">Run a scan first.</div></div>
+  </section>
+
+  <section id="models">
+    <div class="st">🧠 Models
+      <span class="bdg bdg-p" id="md-bdg"></span>
+    </div>
+    <div class="tw">
+      <table id="mt">
+        <thead><tr>
+          <th onclick="srt('mt',0)">#</th>
+          <th onclick="srt('mt',1)">Model</th>
+          <th onclick="srt('mt',2)">Provider</th>
+          <th onclick="srt('mt',3)">Files</th>
+          <th onclick="srt('mt',4)">References</th>
+        </tr></thead>
+        <tbody id="mtb"><tr><td colspan="5" class="empty">Run a scan first.</td></tr></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="sdks">
+    <div class="st">🛠️ SDKs &amp; Frameworks
+      <span class="bdg bdg-g" id="sdk-bdg"></span>
+    </div>
+    <div class="tw">
+      <table id="skt">
+        <thead><tr>
+          <th>#</th><th>SDK / Framework</th>
+          <th>Files</th><th>Imports</th>
+        </tr></thead>
+        <tbody id="sktb"><tr><td colspan="4" class="empty">Run a scan first.</td></tr></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="prompts">
+    <div class="st">💬 Prompts
+      <span class="bdg bdg-o" id="pr-bdg"></span>
+    </div>
+    <div class="tw">
+      <table id="prt">
+        <thead><tr>
+          <th>#</th><th>Type</th><th>Location</th>
+          <th>Line</th><th>Preview</th>
+        </tr></thead>
+        <tbody id="prtb"><tr><td colspan="5" class="empty">Run a scan first.</td></tr></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="apikeys">
+    <div class="st">🔑 API Keys &amp; Env Vars
+      <span class="bdg bdg-r" id="kv-bdg"></span>
+    </div>
+    <div class="ib ii">
+      ℹ️ These are variable <strong>references</strong> in source code.
+      Actual secret values are never stored or displayed.
+    </div>
+    <div class="tw">
+      <table id="kvt">
+        <thead><tr>
+          <th>#</th><th>Variable</th><th>Provider</th>
+          <th>Loaded From</th><th>Files</th>
+        </tr></thead>
+        <tbody id="kvtb"><tr><td colspan="5" class="empty">Run a scan first.</td></tr></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="tools">
+    <div class="st">⚙️ Agent Tools</div>
+    <div class="chg" id="tl-grid"><div class="empty">Run a scan first.</div></div>
+  </section>
+
+  <section id="workflows">
+    <div class="st">🔄 Workflow Patterns</div>
+    <div class="chg" id="wf-grid"><div class="empty">Run a scan first.</div></div>
+  </section>
+
+  <section id="tokens">
+    <div class="st">🪙 Token Configuration</div>
+    <div class="ib iw">
+      ⚠️ Runtime token usage is <strong>Not Available from Source Code</strong>.
+      Only static values configured in source are shown.
+    </div>
+    <div class="tw">
+      <table id="tkt">
+        <thead><tr>
+          <th>Agent</th><th>File</th><th>Model</th>
+          <th>Parameter</th><th>Value</th>
+          <th>Runtime Usage</th><th>Remaining</th>
+        </tr></thead>
+        <tbody id="tktb"><tr><td colspan="7" class="empty">Run a scan first.</td></tr></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="unused">
+    <div class="st">🗑️ Potentially Unused Files</div>
+    <div class="tw">
+      <table id="ut">
+        <thead><tr>
+          <th>#</th><th>File</th><th>Language</th>
+          <th>Lines</th><th>Size</th>
+        </tr></thead>
+        <tbody id="utb"><tr><td colspan="5" class="empty">Run a scan first.</td></tr></tbody>
+      </table>
+    </div>
+  </section>
 </div>
 
-<script id="auditdata" type="application/json">__DATA__</script>
 <script>
-const DATA = JSON.parse(document.getElementById('auditdata').textContent);
-const NA = "__NA__";
-const esc = s => String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-const tags = a => (Array.isArray(a)?a:[a]).filter(x=>x!==''&&x!=null)
-    .map(x=>`<span class="tag">${esc(x)}</span>`).join('') || '<span class="no">—</span>';
-const flag = v => v==='Yes' ? '<span class="yes">Yes</span>'
-    : (String(v).startsWith('Yes')||String(v).startsWith('Likely')) ? `<span class="yes">${esc(v)}</span>`
-    : String(v)===NA ? `<span class="na">${esc(v)}</span>` : `<span class="no">${esc(v)}</span>`;
+let _d=null,_ss={},_scanning=false;
 
-function card(l,v){return `<div class="card"><div class="v">${esc(v)}</div><div class="l">${esc(l)}</div></div>`;}
-function fillCards(id, obj){document.getElementById(id).innerHTML =
-  Object.entries(obj).map(([k,v])=>card(k,v)).join('');}
-
-function renderTable(id, headers, rows, opts){
-  opts = opts||{};
-  const t = document.getElementById(id);
-  t.querySelector('thead').innerHTML = '<tr>'+headers.map((h,i)=>
-     `<th onclick="sortTable('${id}',${i})">${esc(h)} ⇅</th>`).join('')+'</tr>';
-  t.querySelector('tbody').innerHTML = rows.length ? rows.map(r=>'<tr>'+r.map((c,i)=>
-     `<td class="${opts.descCols&&opts.descCols.includes(i)?'desc':''}">${c}</td>`).join('')+'</tr>').join('')
-     : `<tr><td colspan="${headers.length}" class="no">No entries detected.</td></tr>`;
+function toggleDark(){
+  document.documentElement.style.setProperty('--bg',
+    getComputedStyle(document.documentElement).getPropertyValue('--bg').trim()==='#0d1117'
+    ?'#ffffff':'#0d1117');
 }
-function sortTable(id, col){
-  const tb = document.querySelector('#'+id+' tbody');
-  const rows = Array.from(tb.rows);
-  const dir = tb.dataset.sc==String(col) && tb.dataset.sd=='asc' ? 'desc':'asc';
-  tb.dataset.sc = col; tb.dataset.sd = dir;
+
+// sidebar active
+const _secs=document.querySelectorAll('section[id]');
+const _navs=document.querySelectorAll('.nav-a');
+window.addEventListener('scroll',()=>{
+  let cur='';
+  _secs.forEach(s=>{if(window.scrollY>=s.offsetTop-80)cur=s.id;});
+  _navs.forEach(a=>a.classList.toggle('active',a.getAttribute('href')==='#'+cur));
+},{passive:true});
+
+async function triggerScan(){
+  if(_scanning)return;
+  _scanning=true;
+  document.getElementById('spinner').style.display='flex';
+  try{
+    await fetch('/scanner/api/scan',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({path:'.'})
+    });
+    let attempts=0;
+    while(attempts<120){
+      await new Promise(r=>setTimeout(r,1500));
+      const r=await fetch('/scanner/api/report');
+      if(r.ok){const j=await r.json();if(!j.scanning){_d=j;renderAll();break;}}
+      attempts++;
+    }
+  }catch(e){alert('Scan error: '+e);}
+  finally{_scanning=false;document.getElementById('spinner').style.display='none';}
+}
+
+async function loadReport(){
+  try{
+    const r=await fetch('/scanner/api/report');
+    if(r.ok){const j=await r.json();if(!j.scanning&&j.total_files>0){_d=j;renderAll();}}
+  }catch(_){}
+}
+
+function renderAll(){
+  if(!_d)return;
+  rMeta();rStats();rTree();rFiles();rAgents();rProviders();
+  rModels();rSDKs();rPrompts();rAPIKeys();rTools();rWorkflows();
+  rTokens();rUnused();
+}
+
+function rMeta(){
+  document.getElementById('meta').innerHTML=
+    `📂 <strong>${e(_d.root_path)}</strong> &nbsp;|&nbsp;
+     📅 <strong>${e(_d.scan_date)}</strong> &nbsp;|&nbsp;
+     📦 <strong>${e(_d.repo_name)}</strong>`;
+}
+
+function rStats(){
+  const cards=[
+    ['📁','Directories',_d.total_dirs,'cb'],
+    ['📄','Total Files',_d.total_files,'cb'],
+    ['💻','Source',_d.source_files,'cg'],
+    ['⚙️','Config',_d.config_files,'co'],
+    ['📚','Docs',_d.doc_files,'cb'],
+    ['🧪','Tests',_d.test_files,'ct'],
+    ['🏗️','Infra',_d.infra_files,'co'],
+    ['🤖','AI Files',_d.ai_files,'cr'],
+    ['🤖','Agents',_d.total_agents,'cr'],
+    ['☁️','Providers',_d.total_providers,'cb'],
+    ['🧠','Models',_d.total_models,'cp'],
+    ['💬','Prompts',_d.total_prompts,'co'],
+    ['🛠️','SDKs',_d.total_sdks,'cg'],
+    ['⚙️','Tools',_d.total_tools,'ct'],
+    ['🔑','API Keys',_d.total_api_keys,'cr'],
+    ['🏛️','Classes',_d.total_classes,'cb'],
+    ['⚡','Functions',_d.total_functions,'cg'],
+    ['🌐','Endpoints',_d.total_endpoints,'co'],
+  ];
+  document.getElementById('sg').innerHTML=cards.map(
+    ([icon,lbl,val,cls])=>
+    `<div class="sc ${cls}">
+       <div class="si">${icon}</div>
+       <div class="sv">${(val||0).toLocaleString()}</div>
+       <div class="sl">${lbl}</div>
+     </div>`
+  ).join('');
+}
+
+function rTree(){
+  document.getElementById('tree-box').textContent=_d.directory_tree||'No data.';
+}
+
+function rFiles(){
+  const files=_d.files||[];
+  document.getElementById('fc-bdg').textContent=files.length+' files';
+  const langs=[...new Set(files.map(f=>f.language).filter(Boolean))].sort();
+  const sel=document.getElementById('fl');
+  langs.forEach(l=>{
+    if(!sel.querySelector(`option[value="${l}"]`)){
+      const o=document.createElement('option');o.value=l;o.textContent=l;sel.appendChild(o);
+    }
+  });
+  document.getElementById('ftb').innerHTML=files.map(f=>`
+    <tr class="${f.is_ai_related?'air':''}"
+        data-cat="${e(f.category)}" data-ai="${f.is_ai_related}"
+        data-lang="${e(f.language)}">
+      <td>${f.serial}</td>
+      <td><span class="pth" title="${e(f.relative_path)}">${e(f.relative_path)}</span></td>
+      <td><strong>${e(f.file_name)}</strong></td>
+      <td><code class="mono">${e(f.extension)}</code></td>
+      <td><span class="pill pbl">${e(f.language)}</span></td>
+      <td><span class="pill ${cp(f.category)}">${e(f.category)}</span></td>
+      <td>${e(f.purpose)}</td>
+      <td>${(f.lines_of_code||0).toLocaleString()}</td>
+      <td>${fsz(f.size_bytes)}</td>
+      <td>${f.is_ai_related?'<span class="pill pai">AI</span>':''}</td>
+      <td><span class="pill ${f.is_used==='Yes'?'pgr':f.is_used==='Likely'?'por':'pgy'}">${e(f.is_used)}</span></td>
+    </tr>`).join('');
+}
+
+function rAgents(){
+  const agents=_d.agents||[];
+  document.getElementById('ag-bdg').textContent=agents.length+' detected';
+  const seen=new Set();
+  const rows=agents.filter(a=>{
+    const k=a.file+':'+a.name+':'+a.line_number;
+    if(seen.has(k))return false;seen.add(k);return true;
+  });
+  document.getElementById('atb').innerHTML=rows.length?rows.map((a,i)=>`
+    <tr>
+      <td>${i+1}</td>
+      <td><strong>${e(a.name)}</strong></td>
+      <td><span class="pth">${e(a.file)}</span></td>
+      <td><span class="pill ppu">${e(a.agent_type)}</span></td>
+      <td><span class="pill pbl">${e(a.provider)}</span></td>
+      <td>${e(a.sdk)}</td>
+      <td><code class="mono">${e(a.model)}</code></td>
+      <td>${(a.tools||[]).slice(0,3).map(t=>`<span class="pill pgr">${e(t)}</span>`).join(' ')}</td>
+      <td>${(a.workflows||[]).slice(0,2).map(w=>`<span class="pill pbl">${e(w)}</span>`).join(' ')}</td>
+      <td>${a.line_number}</td>
+    </tr>`).join('')
+    :'<tr><td colspan="10" class="empty">No AI agents detected.</td></tr>';
+}
+
+function rProviders(){
+  const provs=Object.values(_d.providers||{});
+  document.getElementById('pv-bdg').textContent=provs.length+' detected';
+  document.getElementById('pv-grid').innerHTML=provs.length?provs.map(p=>`
+    <div class="pc">
+      <div class="pn">${e(p.name)}</div>
+      <div class="pr"><span>SDK</span><span>${e(p.sdk)}</span></div>
+      <div class="pr"><span>Auth</span><span>${e(p.auth_method||'API Key')}</span></div>
+      <div class="pr"><span>Files</span><span>${(p.files||[]).length}</span></div>
+      <div class="evl">${(p.env_vars||[]).map(v=>`<span class="evt">${e(v)}</span>`).join('')||'<span style="font-size:10px;color:var(--muted)">None detected</span>'}</div>
+    </div>`).join('')
+    :'<div class="empty">No providers detected.</div>';
+}
+
+function rModels(){
+  const models=Object.values(_d.models||{}).sort((a,b)=>b.reference_count-a.reference_count);
+  document.getElementById('md-bdg').textContent=models.length+' detected';
+  document.getElementById('mtb').innerHTML=models.length?models.map((m,i)=>`
+    <tr>
+      <td>${i+1}</td>
+      <td><code class="mono">${e(m.name)}</code></td>
+      <td><span class="pill pbl">${e(m.provider)}</span></td>
+      <td>${(m.files||[]).length}</td>
+      <td><strong>${m.reference_count}</strong></td>
+    </tr>`).join('')
+    :'<tr><td colspan="5" class="empty">No models detected.</td></tr>';
+}
+
+function rSDKs(){
+  const sdks=Object.values(_d.sdks||{}).sort((a,b)=>b.import_count-a.import_count);
+  document.getElementById('sdk-bdg').textContent=sdks.length+' detected';
+  document.getElementById('sktb').innerHTML=sdks.length?sdks.map((s,i)=>`
+    <tr>
+      <td>${i+1}</td><td><strong>${e(s.name)}</strong></td>
+      <td>${(s.files||[]).length}</td><td>${s.import_count}</td>
+    </tr>`).join('')
+    :'<tr><td colspan="4" class="empty">No SDKs detected.</td></tr>';
+}
+
+function rPrompts(){
+  const prompts=_d.prompts||[];
+  document.getElementById('pr-bdg').textContent=prompts.length+' detected';
+  document.getElementById('prtb').innerHTML=prompts.length?prompts.slice(0,100).map((p,i)=>`
+    <tr>
+      <td>${i+1}</td>
+      <td><span class="pill por">${e(p.prompt_type)}</span></td>
+      <td><span class="pth">${e(p.location)}</span></td>
+      <td>${p.line_number}</td>
+      <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--muted)"
+          title="${e(p.content_preview)}">${e(p.content_preview||'')}</td>
+    </tr>`).join('')
+    :'<tr><td colspan="5" class="empty">No prompts detected.</td></tr>';
+}
+
+function rAPIKeys(){
+  const keys=Object.values(_d.api_keys||{});
+  document.getElementById('kv-bdg').textContent=keys.length+' detected';
+  document.getElementById('kvtb').innerHTML=keys.length?keys.map((k,i)=>`
+    <tr>
+      <td>${i+1}</td>
+      <td><code class="mono" style="color:var(--orange)">${e(k.variable_name)}</code></td>
+      <td><span class="pill pbl">${e(k.provider)}</span></td>
+      <td>${e(k.loaded_from)}</td>
+      <td>${(k.used_in||[]).length}</td>
+    </tr>`).join('')
+    :'<tr><td colspan="5" class="empty">No API keys detected.</td></tr>';
+}
+
+function rTools(){
+  const tools=Object.values(_d.tools||{});
+  document.getElementById('tl-grid').innerHTML=tools.length?tools.map(t=>`
+    <div class="ch">⚙️ ${e(t.name)}<small>${(t.files||[]).length} file(s)</small></div>`).join('')
+    :'<div class="empty">No tools detected.</div>';
+}
+
+function rWorkflows(){
+  const wfs=Object.values(_d.workflows||{});
+  document.getElementById('wf-grid').innerHTML=wfs.length?wfs.map(w=>`
+    <div class="ch">🔄 ${e(w.name)}<small>${(w.files||[]).length} file(s)</small></div>`).join('')
+    :'<div class="empty">No workflow patterns detected.</div>';
+}
+
+function rTokens(){
+  const rows=[];
+  (_d.agents||[]).forEach(a=>{
+    Object.entries(a.token_config||{}).forEach(([k,v])=>{
+      rows.push(`<tr>
+        <td>${e(a.name)}</td>
+        <td><span class="pth">${e(a.file)}</span></td>
+        <td><code class="mono">${e(a.model)}</code></td>
+        <td>${e(k)}</td><td><strong>${e(v)}</strong></td>
+        <td style="color:var(--muted);font-style:italic;font-size:10px">Not Available from Source Code</td>
+        <td style="color:var(--muted);font-style:italic;font-size:10px">Not Available from Source Code</td>
+      </tr>`);
+    });
+  });
+  document.getElementById('tktb').innerHTML=rows.length?rows.join('')
+    :'<tr><td colspan="7" class="empty">No static token configuration found.</td></tr>';
+}
+
+function rUnused(){
+  const unused=(_d.files||[]).filter(
+    f=>f.is_referenced==='No'&&f.is_used==='Unknown'&&
+       ['Source','AI'].includes(f.category)
+  );
+  document.getElementById('utb').innerHTML=unused.length?unused.slice(0,50).map((f,i)=>`
+    <tr>
+      <td>${i+1}</td>
+      <td><span class="pth">${e(f.relative_path)}</span></td>
+      <td>${e(f.language)}</td>
+      <td>${(f.lines_of_code||0).toLocaleString()}</td>
+      <td>${fsz(f.size_bytes)}</td>
+    </tr>`).join('')
+    :'<tr><td colspan="5" class="empty">No obviously unused files detected.</td></tr>';
+}
+
+function globalSearch(q){
+  q=q.toLowerCase();
+  document.querySelectorAll('#ftb tr').forEach(r=>{
+    r.classList.toggle('hid',q.length>0&&!r.textContent.toLowerCase().includes(q));
+  });
+}
+
+function applyFilters(){
+  const cat=document.getElementById('fc').value.toLowerCase();
+  const ai=document.getElementById('fa').value.toLowerCase();
+  const lang=document.getElementById('fl').value.toLowerCase();
+  document.querySelectorAll('#ftb tr').forEach(r=>{
+    const show=(!cat||(r.dataset.cat||'').toLowerCase()===cat)
+            &&(!ai||(r.dataset.ai||'').toLowerCase()===ai)
+            &&(!lang||(r.dataset.lang||'').toLowerCase()===lang);
+    r.classList.toggle('hid',!show);
+  });
+}
+
+function srt(tid,col){
+  const tbl=document.getElementById(tid);if(!tbl)return;
+  const tb=tbl.querySelector('tbody');
+  const rows=Array.from(tb.querySelectorAll('tr'));
+  const key=tid+'_'+col;const asc=!_ss[key];_ss[key]=asc;
   rows.sort((a,b)=>{
-    const x=a.cells[col]?.innerText.trim()||'', y=b.cells[col]?.innerText.trim()||'';
-    const nx=parseFloat(x.replace(/[^0-9.\-]/g,'')), ny=parseFloat(y.replace(/[^0-9.\-]/g,''));
-    const both = !isNaN(nx)&&!isNaN(ny)&&x.match(/\d/)&&y.match(/\d/);
-    const c = both ? nx-ny : x.localeCompare(y);
-    return dir=='asc'?c:-c;});
+    const av=a.cells[col]?.textContent.trim()||'';
+    const bv=b.cells[col]?.textContent.trim()||'';
+    const an=parseFloat(av.replace(/[^\d.-]/g,''));
+    const bn=parseFloat(bv.replace(/[^\d.-]/g,''));
+    if(!isNaN(an)&&!isNaN(bn))return asc?an-bn:bn-an;
+    return asc?av.localeCompare(bv):bv.localeCompare(av);
+  });
   rows.forEach(r=>tb.appendChild(r));
 }
 
-/* ---------- overview + stats ---------- */
-const R=DATA.repository, S=DATA.statistics;
-fillCards('ovCards',{ 'Directories':R.total_directories,'Files':R.total_files,
- 'Source Files':R.total_source_files,'Config Files':R.total_configuration_files,
- 'Docs':R.total_documentation_files,'Tests':R.total_test_files,
- 'Infra Files':R.total_infrastructure_files,'AI Files':R.total_ai_related_files,
- 'Total Size':R.total_size,'Total Lines':R.total_lines});
-fillCards('stCards',{'Classes':S.total_classes,'Functions':S.total_functions,
- 'APIs':S.total_apis,'Endpoints':S.total_endpoints,'Modules':S.total_modules,
- 'Packages':S.total_packages,'Docker':S.total_docker_files,'YAML':S.total_yaml_files,
- 'Terraform':S.total_terraform_files,'Kubernetes':S.total_kubernetes_files,
- 'Prompts':S.total_prompts,'Models':S.total_models,'Providers':S.total_providers,
- 'Agents':S.total_agents,'SDKs':S.total_sdks,'Env Vars':S.total_env_vars});
-
-/* ---------- charts ---------- */
-function barChart(title, entries){
-  entries = entries.slice(0,12);
-  const max = Math.max(1,...entries.map(e=>e[1]));
-  return `<div class="chart"><h4>${esc(title)}</h4>`+entries.map(([k,v])=>
-    `<div class="bar"><div class="nm" title="${esc(k)}">${esc(k)}</div>
-     <div class="tr"><div class="fl" style="width:${(v/max*100).toFixed(1)}%"></div></div>
-     <div class="ct">${v}</div></div>`).join('')+'</div>';
+function exportJSON(){
+  if(!_d)return;
+  dl(new Blob([JSON.stringify(_d,null,2)],{type:'application/json'}),'audit.json');
 }
-const providerCounts = DATA.ai_providers.map(p=>[p.provider,p.file_count]).sort((a,b)=>b[1]-a[1]);
-const modelCounts = DATA.ai_models.map(m=>[m.model,m.reference_count]).sort((a,b)=>b[1]-a[1]);
-const sdkCounts = DATA.ai_sdks.map(s=>[s.sdk,s.file_count]).sort((a,b)=>b[1]-a[1]);
-const locByLang = {};
-DATA.file_inventory.forEach(f=>{locByLang[f.language]=(locByLang[f.language]||0)+f.lines_code;});
-document.getElementById('chartArea').innerHTML =
-  barChart('Files by Language', Object.entries(S.languages))
-+ barChart('Files by Purpose', Object.entries(S.purposes))
-+ barChart('Files by Category', Object.entries(S.categories))
-+ barChart('Lines of Code by Language', Object.entries(locByLang).sort((a,b)=>b[1]-a[1]))
-+ barChart('AI Providers (files)', providerCounts)
-+ barChart('AI Models (references)', modelCounts)
-+ barChart('AI SDKs (files)', sdkCounts)
-+ barChart('Agents per File', Object.entries(DATA.ai_agents.agents.reduce((a,x)=>
-    (a[x.file]=(a[x.file]||0)+1,a),{})).sort((a,b)=>b[1]-a[1]));
 
-document.getElementById('tree_pre').textContent = DATA.directory_tree.join('\n');
-
-/* ---------- file table with search / filter ---------- */
-const FH = ['#','Path','Name','Ext','Language','Category','Purpose','Description','Size',
-            'LOC','Used','Referenced','AI','Dependencies'];
-function fileRow(f){return [f.serial, esc(f.rel_path), esc(f.name), esc(f.ext),
-  esc(f.language), esc(f.category), `<b>${esc(f.purpose)}</b>`, esc(f.description),
-  esc(f.size_human), f.lines_code, flag(f.is_used), flag(f.is_referenced),
-  flag(f.is_ai_related), tags((f.dependencies||[]).slice(0,6))];}
-function opts(id,label,vals){const s=document.getElementById(id);
-  s.innerHTML = `<option value="">${label}: All</option>`+
-  [...new Set(vals)].sort().map(v=>`<option>${esc(v)}</option>`).join('');
-  s.onchange = applyFilters;}
-opts('fCat','Category',DATA.file_inventory.map(f=>f.category));
-opts('fLang','Language',DATA.file_inventory.map(f=>f.language));
-opts('fPurpose','Purpose',DATA.file_inventory.map(f=>f.purpose));
-opts('fAI','AI',DATA.file_inventory.map(f=>f.is_ai_related));
-function applyFilters(){
-  const q=document.getElementById('q').value.toLowerCase();
-  const c=document.getElementById('fCat').value, l=document.getElementById('fLang').value;
-  const p=document.getElementById('fPurpose').value, a=document.getElementById('fAI').value;
-  const rows=DATA.file_inventory.filter(f=>
-    (!c||f.category===c)&&(!l||f.language===l)&&(!p||f.purpose===p)&&(!a||f.is_ai_related===a)&&
-    (!q||(f.rel_path+' '+f.purpose+' '+f.description+' '+f.language+' '+
-          (f.agents||[]).join(' ')+' '+(f.models||[]).join(' ')).toLowerCase().includes(q)));
-  renderTable('tFiles',FH,rows.map(fileRow),{descCols:[7]});
-  document.getElementById('cnt').textContent = rows.length+' / '+DATA.file_inventory.length+' files';
-}
-document.getElementById('q').oninput = applyFilters;
-function resetFilters(){['q','fCat','fLang','fPurpose','fAI'].forEach(i=>document.getElementById(i).value='');applyFilters();}
-applyFilters();
-
-/* ---------- AI sections ---------- */
-renderTable('tAgents',['Agent','Type','File','Purpose','Providers','Models','SDKs','Tools','Workflows','Prompts','AI Calls'],
-  DATA.ai_agents.agents.map(a=>[esc(a.name),esc(a.type),esc(a.file),esc(a.purpose),
-    tags(a.providers),tags(a.models),tags(a.sdks),tags(a.tools),tags(a.workflows),
-    tags(a.prompts),a.ai_call_sites]),{descCols:[3]});
-renderTable('tProv',['Provider','SDK','Endpoint','API Version','Authentication','Env Vars','Files'],
-  DATA.ai_providers.map(p=>[esc(p.provider),esc(p.sdk),tags(p.endpoint),tags(p.api_version),
-    tags(p.authentication_method),tags(p.environment_variables),tags(p.files)]));
-renderTable('tModels',['Model','Version','Provider','Files Using It','References'],
-  DATA.ai_models.map(m=>[esc(m.model),esc(m.version),esc(m.provider),tags(m.files),m.reference_count]));
-function renderPrompts(){
-  const q=document.getElementById('qp').value.toLowerCase();
-  const rows=DATA.prompts.filter(p=>!q||(p.name+' '+p.file+' '+p.preview+' '+p.type).toLowerCase().includes(q));
-  renderTable('tPrompts',['Prompt','Type','Location','Purpose','Agent','Est. Tokens','Preview'],
-    rows.map(p=>[esc(p.name),esc(p.type),esc(p.file)+':'+p.line,esc(p.purpose),esc(p.agent),
-      p.estimated_tokens,esc(p.preview)]),{descCols:[6]});
-}
-document.getElementById('qp').oninput = renderPrompts; renderPrompts();
-renderTable('tKeys',['Variable','Provider','AI Related','Used In','Loaded From'],
-  DATA.api_keys.map(k=>[esc(k.variable),esc(k.provider),flag(k.ai_related),tags(k.used_in),tags(k.loaded_from)]));
-renderTable('tTokens',['Agent','File','Model','Est. Input','Est. Output','Avg / Request',
-  'Max Tokens','Temperature','Top P','Context Window','Estimated Cost'],
-  DATA.token_usage.per_agent.map(t=>[esc(t.agent),esc(t.file),esc(t.model),
-    esc(t.estimated_input_tokens),flag(t.estimated_output_tokens),flag(t.average_request_tokens),
-    flag(t.max_tokens_configured),flag(t.temperature),flag(t.top_p),flag(t.context_window),
-    flag(t.estimated_cost)]));
-const RU = DATA.token_usage.runtime_usage;
-renderTable('tRuntime',['Metric','Value'],
-  [['Current Tokens Used',flag(RU.current_tokens_used)],['Today\'s Tokens Used',flag(RU.todays_tokens_used)],
-   ['Monthly Tokens Used',flag(RU.monthly_tokens_used)],['Remaining Tokens',flag(RU.remaining_tokens)],
-   ['Percentage Used',flag(RU.percentage_used)],['Instrumentation Found',tags(RU.instrumentation_found)],
-   ['Instrumented Files',tags(RU.instrumentation_files)]]);
-renderTable('tReq',['Metric','Value'],
-  Object.entries(DATA.request_usage).map(([k,v])=>[esc(k.replace(/_/g,' ').replace(/\b\w/g,c=>c.toUpperCase())),
-    Array.isArray(v)?tags(v):flag(v)]));
-renderTable('tSdks',['SDK / Framework','Files','Count'],
-  DATA.ai_sdks.map(s=>[esc(s.sdk),tags(s.files),s.file_count]));
-renderTable('tTools',['Tool','Files','Count'],
-  DATA.tools.map(t=>[esc(t.tool),tags(t.files),t.file_count]));
-renderTable('tWf',['Workflow Pattern','Files','Count'],
-  DATA.workflows.map(w=>[esc(w.pattern),tags(w.files),w.file_count]));
-renderTable('tDeps',['File','Depends On'],
-  Object.entries(DATA.dependencies.file_dependency_graph).map(([k,v])=>[esc(k),tags(v)]));
-renderTable('tADeps',['Agent','File','Providers','Models','SDKs','Tools'],
-  DATA.dependencies.agent_dependency_graph.map(a=>[esc(a.agent),esc(a.file),tags(a.providers),
-    tags(a.models),tags(a.sdks),tags(a.tools)]));
-renderTable('tOrph',['File'],DATA.dependencies.orphan_files.map(f=>[esc(f)]));
-renderTable('tDead',['Symbol','Defined In','Note'],
-  DATA.dependencies.dead_code_candidates.map(d=>[esc(d.symbol),esc(d.defined_in),esc(d.note)]));
-
-/* ---------- theme + export ---------- */
-function toggleTheme(){const h=document.documentElement;
-  const n=h.dataset.theme==='dark'?'light':'dark';h.dataset.theme=n;
-  try{localStorage.setItem('audit-theme',n)}catch(e){}}
-try{const s=localStorage.getItem('audit-theme'); if(s) document.documentElement.dataset.theme=s;}catch(e){}
-function download(name, text, mime){
-  const b=new Blob([text],{type:mime}); const u=URL.createObjectURL(b);
-  const a=document.createElement('a'); a.href=u; a.download=name; a.click(); URL.revokeObjectURL(u);}
-function exportJSON(){download('repository_summary.json', JSON.stringify(DATA,null,2),'application/json');}
 function exportCSV(){
-  const cols=['serial','rel_path','name','ext','language','category','purpose','description',
-    'size_human','lines_code','is_used','is_referenced','is_ai_related','dependencies'];
-  const esc2=v=>'"'+String(Array.isArray(v)?v.join('; '):v==null?'':v).replace(/"/g,'""')+'"';
-  const csv=[cols.join(',')].concat(DATA.file_inventory.map(f=>cols.map(c=>esc2(f[c])).join(','))).join('\n');
-  download('repository_summary.csv', csv, 'text/csv');}
+  if(!_d)return;
+  const hdr=['#','path','file','ext','language','category',
+             'purpose','lines','size','ai_related','used'];
+  const rows=(_d.files||[]).map(f=>
+    [f.serial,f.relative_path,f.file_name,f.extension,f.language,
+     f.category,f.purpose,f.lines_of_code,f.size_bytes,
+     f.is_ai_related,f.is_used].map(v=>'"'+String(v).replace(/"/g,'""')+'"')
+  );
+  dl(new Blob([[hdr,...rows].map(r=>r.join(',')).join('\n')],
+             {type:'text/csv'}),'audit.csv');
+}
+
+function dl(blob,name){
+  const a=document.createElement('a');a.href=URL.createObjectURL(blob);
+  a.download=name;a.click();URL.revokeObjectURL(a.href);
+}
+
+function e(s){
+  return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+function fsz(b){
+  b=b||0;
+  if(b<1024)return b+' B';
+  if(b<1048576)return (b/1024).toFixed(1)+' KB';
+  return (b/1048576).toFixed(1)+' MB';
+}
+function cp(cat){
+  return{AI:'pai',Source:'pgr',Test:'por',
+         Configuration:'ppu',Documentation:'pbl',Infrastructure:'por'}[cat]||'pgy';
+}
+
+loadReport();
 </script>
 </body>
 </html>
 """
 
 
-def write_html(report: Dict[str, Any], path: str) -> None:
-    payload = json.dumps(report, default=str)
-    payload = payload.replace("</", "<\\/")  # keep the inline <script> safe
-    html = (HTML_TEMPLATE
-            .replace("__REPO__", _html.escape(report["repository"]["repository_name"]))
-            .replace("__ROOT__", _html.escape(report["repository"]["repository_root"]))
-            .replace("__DATE__", _html.escape(report["repository"]["scan_date"]))
-            .replace("__AGENTS__", str(report["ai_agents"]["total_ai_agents"]))
-            .replace("__VERSION__", VERSION)
-            .replace("__NA__", NA)
-            .replace("__DATA__", payload))
-    with open(path, "w", encoding="utf-8") as fh:
-        fh.write(html)
+# ══════════════════════════════════════════════════════════════
+# SCANNER BLUEPRINT  —  /scanner/*
+# ══════════════════════════════════════════════════════════════
+
+scanner_bp = Blueprint("scanner", __name__, url_prefix="/scanner")
 
 
-# =====================================================================================
-# SECTION 10 -- CLI
-# =====================================================================================
+@scanner_bp.get("/")
+def scanner_dashboard() -> str:
+    """HTML dashboard — no external template file required."""
+    return render_template_string(_DASHBOARD_HTML)
 
 
-def main(argv: Optional[Sequence[str]] = None) -> int:
-    ap = argparse.ArgumentParser(
-        prog="ai_repo_audit.py",
-        description="Complete static AI audit of a repository "
-                    "(agents, providers, models, prompts, tokens, requests, structure).")
-    ap.add_argument("root", nargs="?", default=".", help="Repository root (default: .)")
-    ap.add_argument("-o", "--output", default=None,
-                    help="Output directory (default: <root>/ai_audit_report)")
-    ap.add_argument("--max-file-mb", type=float, default=3.0,
-                    help="Max bytes read per file, in MB (default: 3)")
-    ap.add_argument("--follow-symlinks", action="store_true", help="Follow symlinks")
-    ap.add_argument("--no-xlsx", action="store_true", help="Skip the Excel report")
-    ap.add_argument("--serve", nargs="?", const=8000, type=int, metavar="PORT",
-                    help="Serve the report folder over http://127.0.0.1:PORT "
-                         "(default 8000) instead of relying on file:// or another app")
-    ap.add_argument("--open", dest="open_browser", action="store_true",
-                    help="Open the dashboard in your default browser when done")
-    ap.add_argument("--quiet", action="store_true", help="Suppress progress output")
-    ap.add_argument("--version", action="version", version=f"AI Repository Auditor {VERSION}")
-    args = ap.parse_args(argv)
-
-    root = os.path.abspath(args.root)
-    if not os.path.isdir(root):
-        print(f"ERROR: not a directory: {root}", file=sys.stderr)
-        return 2
-    out_dir = os.path.abspath(args.output) if args.output \
-        else os.path.join(root, "ai_audit_report")
-    os.makedirs(out_dir, exist_ok=True)
-
-    auditor = RepositoryAuditor(root, max_file_mb=args.max_file_mb, quiet=args.quiet,
-                                follow_symlinks=args.follow_symlinks)
-    auditor.log(f"AI Repository Auditor v{VERSION}")
-    auditor.log(f"Scanning: {root}")
-    auditor.walk()
-    auditor.log(f"  files: {len(auditor.files)}  dirs: {len(auditor.dirs)}")
-    auditor.log("Analysing dependencies, agents and AI usage ...")
-    report = auditor.build_report()
-
-    md_p = os.path.join(out_dir, "repository_summary.md")
-    html_p = os.path.join(out_dir, "repository_summary.html")
-    json_p = os.path.join(out_dir, "repository_summary.json")
-    csv_p = os.path.join(out_dir, "repository_summary.csv")
-    xlsx_p = os.path.join(out_dir, "repository_summary.xlsx")
-
-    write_markdown(report, md_p)
-    write_json(report, json_p)
-    write_csv(report, csv_p)
-    write_html(report, html_p)
-    xlsx_written = None if args.no_xlsx else write_xlsx(report, xlsx_p)
-
-    S = report["statistics"]
-    auditor.log("")
-    auditor.log("=" * 72)
-    auditor.log(f"  Repository      : {report['repository']['repository_name']}")
-    auditor.log(f"  Directories     : {S['total_directories']}")
-    auditor.log(f"  Files           : {S['total_files']}  "
-                f"(source {S['total_source_files']}, config {S['total_configuration_files']}, "
-                f"docs {S['total_documentation_files']}, tests {S['total_test_files']}, "
-                f"infra {S['total_infrastructure_files']})")
-    auditor.log(f"  AI related files: {S['total_ai_related_files']}")
-    auditor.log(f"  AI agents       : {S['total_agents']}")
-    auditor.log(f"  Providers       : {S['total_providers']}  "
-                f"({', '.join(p['provider'] for p in report['ai_providers']) or 'none'})")
-    auditor.log(f"  Models          : {S['total_models']}")
-    auditor.log(f"  SDKs            : {S['total_sdks']}")
-    auditor.log(f"  Prompts         : {S['total_prompts']}")
-    auditor.log(f"  Unused/orphan   : {len(report['dependencies']['orphan_files'])}")
-    auditor.log("=" * 72)
-    auditor.log("Reports written to: " + out_dir)
-    for p in (md_p, html_p, json_p, csv_p):
-        auditor.log("  - " + os.path.basename(p))
-    if xlsx_written:
-        auditor.log("  - " + os.path.basename(xlsx_p))
-    elif not args.no_xlsx:
-        auditor.log("  - repository_summary.xlsx  SKIPPED (install openpyxl to enable)")
-
-    # The dashboard is a self-contained local file: it needs no web server and is NOT
-    # served by any application in the audited repository. Print the exact file:// URL
-    # so it is never mistaken for an app route (a wrong route yields "Not Found").
-    file_url = "file://" + html_p.replace(os.sep, "/")
-    auditor.log("")
-    auditor.log("Open the dashboard directly (no web server required):")
-    auditor.log("  " + file_url)
-
-    if args.open_browser and not args.serve:
-        try:
-            import webbrowser
-            webbrowser.open(file_url)
-        except Exception as exc:  # pragma: no cover - environment dependent
-            auditor.log(f"  (could not launch browser automatically: {exc})")
-
-    if args.serve:
-        _serve(out_dir, int(args.serve), auditor, args.open_browser)
-    return 0
+@scanner_bp.get("/api/health")
+def scanner_health() -> tuple[Response, int]:
+    return jsonify(
+        status=   "ok",
+        scanner=  "loaded",
+        has_data= _last_result is not None,
+        scanning= _scan_running,
+    ), 200
 
 
-def _serve(out_dir: str, port: int, auditor: "RepositoryAuditor",
-           open_browser: bool = False) -> None:
-    """Serve the report directory locally, with the dashboard as the index page.
+@scanner_bp.get("/api/status")
+def scanner_api_status() -> Response:
+    if _last_result is None:
+        return jsonify(
+            status=   "idle",
+            message=  "No scan yet. POST /scanner/api/scan to start.",
+            scanning= _scan_running,
+        )
+    r = _last_result
+    return jsonify(
+        status=          "ok",
+        scanning=        _scan_running,
+        scan_date=       r.scan_date,
+        repo_name=       r.repo_name,
+        root_path=       r.root_path,
+        total_files=     r.total_files,
+        total_dirs=      r.total_dirs,
+        total_agents=    r.total_agents,
+        total_providers= r.total_providers,
+        total_models=    r.total_models,
+        total_prompts=   r.total_prompts,
+        total_sdks=      r.total_sdks,
+        total_tools=     r.total_tools,
+        total_api_keys=  r.total_api_keys,
+        total_workflows= r.total_workflows,
+        total_classes=   r.total_classes,
+        total_functions= r.total_functions,
+        total_endpoints= r.total_endpoints,
+        ai_files=        r.ai_files,
+        errors=          r.errors,
+    )
 
-    This exists so the HTML can be viewed over http:// in environments where file://
-    is blocked. It serves ONLY the generated report folder and never the repository.
+
+@scanner_bp.get("/api/agents")
+def scanner_agents() -> Response:
+    if _last_result is None:
+        return jsonify(agents=[], message="No scan yet"), 200
+    return jsonify(agents=_last_result.agents, total=len(_last_result.agents))
+
+
+@scanner_bp.get("/api/providers")
+def scanner_providers() -> Response:
+    if _last_result is None:
+        return jsonify(providers={}, message="No scan yet"), 200
+    return jsonify(providers=_last_result.providers,
+                   total=len(_last_result.providers))
+
+
+@scanner_bp.get("/api/models")
+def scanner_models() -> Response:
+    if _last_result is None:
+        return jsonify(models={}, message="No scan yet"), 200
+    return jsonify(models=_last_result.models,
+                   total=len(_last_result.models))
+
+
+@scanner_bp.get("/api/metrics")
+def scanner_metrics() -> Response:
+    if _last_result is None:
+        return jsonify(message="No scan yet", scanning=_scan_running), 200
+    r = _last_result
+    return jsonify(
+        scanning=        _scan_running,
+        scan_date=       r.scan_date,
+        total_files=     r.total_files,
+        total_agents=    r.total_agents,
+        total_providers= r.total_providers,
+        total_models=    r.total_models,
+        total_prompts=   r.total_prompts,
+        total_sdks=      r.total_sdks,
+        total_api_keys=  r.total_api_keys,
+        ai_files=        r.ai_files,
+        total_classes=   r.total_classes,
+        total_functions= r.total_functions,
+        token_configs=   [
+            {"agent": a["name"], "file": a["file"],
+             "model": a["model"], "config": a["token_config"]}
+            for a in r.agents if a.get("token_config")
+        ],
+    )
+
+
+@scanner_bp.post("/api/scan")
+def scanner_trigger() -> tuple[Response, int]:
     """
-    import functools
-    import http.server
-    import socketserver
+    Trigger a background scan.
+    Body (JSON, optional): { "path": "/path/to/repo" }
+    Defaults to current working directory.
+    """
+    global _scan_running
+    if _scan_running:
+        return jsonify(message="Scan already in progress",
+                       scanning=True), 202
 
-    class Handler(http.server.SimpleHTTPRequestHandler):
-        def do_GET(self):  # noqa: N802 - stdlib naming
-            if self.path in ("/", "/index.html", ""):
-                self.path = "/repository_summary.html"
-            return super().do_GET()
+    body      = request.get_json(silent=True) or {}
+    scan_path = str(Path(body.get("path", ".")).resolve())
 
-        def log_message(self, fmt, *a):  # keep output clean
-            if not auditor.quiet:
-                print("  http: " + fmt % a, flush=True)
+    if not os.path.isdir(scan_path):
+        return jsonify(
+            error=f"Path does not exist or is not a directory: {scan_path}"
+        ), 400
 
-    handler = functools.partial(Handler, directory=out_dir)
-    socketserver.TCPServer.allow_reuse_address = True
-    for attempt in range(20):
-        try:
-            httpd = socketserver.TCPServer(("127.0.0.1", port + attempt), handler)
-            break
-        except OSError:
-            continue
-    else:
-        print(f"ERROR: no free port near {port}", file=sys.stderr)
-        return
-    bound = httpd.server_address[1]
-    url = f"http://127.0.0.1:{bound}/"
-    auditor.log("")
-    auditor.log(f"Serving reports at {url}  (Ctrl+C to stop)")
-    auditor.log(f"  dashboard : {url}")
-    auditor.log(f"  json      : {url}repository_summary.json")
-    auditor.log(f"  csv       : {url}repository_summary.csv")
-    if open_browser:
-        try:
-            import webbrowser
-            webbrowser.open(url)
-        except Exception:
-            pass
-    try:
-        httpd.serve_forever()
-    except KeyboardInterrupt:
-        auditor.log("\nStopped.")
-    finally:
-        httpd.server_close()
+    Thread(
+        target= _run_scan_background,
+        args=   (scan_path,),
+        daemon= True,
+        name=   "repo-scanner",
+    ).start()
+
+    return jsonify(message="Scan started", path=scan_path,
+                   scanning=True), 202
 
 
-if __name__ == "__main__":
-    raise SystemExit(main())
+@scanner_bp.get("/api/report")
+def scanner_report() -> tuple[Response, int]:
+    """Full last scan report — dashboard polls this after triggering scan."""
+    if _scan_running:
+        return jsonify(scanning=True, message="Scan in progress…"), 202
+
+    if _last_result is None:
+        return jsonify(
+            scanning=    False,
+            message=     "No scan yet. POST /scanner/api/scan to start.",
+            total_files= 0,
+        ), 200
+
+    r = _last_result
+    return jsonify(
+        scanning=        False,
+        scan_date=       r.scan_date,
+        root_path=       r.root_path,
+        repo_name=       r.repo_name,
+        total_dirs=      r.total_dirs,
+        total_files=     r.total_files,
+        source_files=    r.source_files,
+        config_files=    r.config_files,
+        doc_files=       r.doc_files,
+        test_files=      r.test_files,
+        infra_files=     r.infra_files,
+        ai_files=        r.ai_files,
+        total_agents=    r.total_agents,
+        total_providers= r.total_providers,
+        total_models=    r.total_models,
+        total_prompts=   r.total_prompts,
+        total_sdks=      r.total_sdks,
+        total_tools=     r.total_tools,
+        total_api_keys=  r.total_api_keys,
+        total_workflows= r.total_workflows,
+        total_classes=   r.total_classes,
+        total_functions= r.total_functions,
+        total_endpoints= r.total_endpoints,
+        directory_tree=  r.directory_tree,
+        files=           r.files,
+        agents=          r.agents,
+        providers=       r.providers,
+        models=          r.models,
+        prompts=         r.prompts,
+        api_keys=        r.api_keys,
+        sdks=            r.sdks,
+        tools=           r.tools,
+        workflows=       r.workflows,
+        errors=          r.errors,
+    ), 200
+
+
+# ══════════════════════════════════════════════════════════════
+# STARTUP  —  initialise metrics once after all objects defined
+# ══════════════════════════════════════════════════════════════
+
+_init_static_metrics()
+_update_dynamic_metrics()
