@@ -8,6 +8,10 @@ from prometheus_client import (
 )
 from werkzeug.middleware.dispatcher import DispatcherMiddleware
 
+# Add these 2 lines to your app.py:
+from agent_monitor import scanner_bp
+application.register_blueprint(scanner_bp)
+
 application = Flask(__name__)
 
 # ── Prometheus metrics ──────────────────────────────────────
