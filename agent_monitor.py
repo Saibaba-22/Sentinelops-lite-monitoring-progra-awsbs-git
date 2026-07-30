@@ -332,24 +332,100 @@ def extract_provider(text):
 
 
 def extract_model(text):
-    """Extract the specific AI model from the file."""
+    """Extract the specific AI model from the file with word-boundary matching."""
     text_lower = text.lower()
     for provider, info in AI_PROVIDERS_MODELS.items():
-        for model_name in info["models"]:
-            if model_name in text_lower:
-                return model_name
+        for model_name in sorted(info["models"].keys(), key=len, reverse=True):
+            idx = text_lower.find(model_name)
+            while idx != -1:
+                # Check if this is a whole-word match
+                before = text_lower[idx - 1] if idx > 0 else " "
+                after = text_lower[idx + len(model_name)] if idx + len(model_name) < len(text_lower) else " "
+                if not before.isalnum() and not before == "-" and not after.isalnum() and not after == "-":
+                    return model_name
+                idx = text_lower.find(model_name, idx + 1)
     return None
 
 
 def extract_models_list(text):
-    """Extract all detected models from the file."""
+    """Extract all detected models from the file with word-boundary matching."""
     text_lower = text.lower()
     found = []
     for provider, info in AI_PROVIDERS_MODELS.items():
-        for model_name in info["models"]:
-            if model_name in text_lower:
-                found.append(model_name)
+        for model_name in sorted(info["models"].keys(), key=len, reverse=True):
+            if model_name in found:
+                continue
+            idx = text_lower.find(model_name)
+            while idx != -1:
+                before = text_lower[idx - 1] if idx > 0 else " "
+                after = text_lower[idx + len(model_name)] if idx + len(model_name) < len(text_lower) else " "
+                if not before.isalnum() and not before == "-" and not after.isalnum() and not after == "-":
+                    found.append(model_name)
+                    break
+                idx = text_lower.find(model_name, idx + 1)
     return found
+
+
+def extract_model_with_fallback(text):
+    """Extract model with inference. Returns (model_name, is_inferred).
+    If specific model found in code -> return it, not inferred.
+    If not, infer from provider/detected patterns -> return best guess, inferred=True.
+    """
+    # First try exact model matching
+    exact = extract_model(text)
+    if exact:
+        return exact, False
+    
+    # No exact model found - infer from provider and context
+    provider = extract_provider(text)
+    if not provider:
+        return "Unknown", False
+    
+    # Map provider to its most common/likely default model
+    provider_defaults = {
+        "OpenAI": "gpt-4o",
+        "Anthropic": "claude-3.5-sonnet",
+        "Google": "gemini-1.5-pro",
+        "Mistral": "mistral-large",
+        "Meta": "llama-3.1",
+        "DeepSeek": "deepseek-chat",
+        "Cohere": "command-r",
+        "Groq": "mixtral",
+        "Together": "llama-3.1",
+        "Replicate": "llama-3.1",
+    }
+    inferred = provider_defaults.get(provider, "Unknown")
+    
+    # Look at code patterns for more specific clues
+    text_lower = text.lower()
+    
+    # Check for size indicators (small, large, etc.)
+    if "haiku" in text_lower or "flash" in text_lower or "mini" in text_lower or "small" in text_lower:
+        size_hints = {"haiku": "claude-3-haiku", "flash": "gemini-1.5-flash", "mini": "gpt-4o-mini", "small": "mistral-small"}
+        for keyword, model_hint in size_hints.items():
+            if keyword in text_lower:
+                inferred = model_hint
+                break
+    
+    # Check for reasoning/analysis patterns → use larger model
+    if any(w in text_lower for w in ["reason", "analyze", "complex", "research", "review"]):
+        if provider == "OpenAI" and "mini" not in text_lower:
+            inferred = "gpt-4o"
+        elif provider == "Anthropic" and "haiku" not in text_lower:
+            inferred = "claude-3.5-sonnet"
+    
+    # Check for temperature/TTL patterns
+    temps = re.findall(r'temperature\s*[=:]\s*(\d+\.?\d*)', text, re.IGNORECASE)
+    if temps:
+        try:
+            t = float(temps[0])
+            if t > 0.5:
+                # Creative tasks → might use different model
+                pass
+        except:
+            pass
+    
+    return inferred, True
 
 
 def get_context_window(model_name):
@@ -490,7 +566,7 @@ def scan_folder(root_path):
             if is_agent_flag:
                 # ── Agent-specific data ──
                 provider = extract_provider(text)
-                model = extract_model(text)
+                model, model_inferred = extract_model_with_fallback(text)
                 models_list = extract_models_list(text)
                 ctx = get_context_window(model) if model else 128000
                 tokens = estimate_tokens(text)
@@ -503,6 +579,7 @@ def scan_folder(root_path):
                 agent_info.update({
                     "provider": provider or "Unknown",
                     "model": model or "Unknown",
+                    "model_inferred": model_inferred,
                     "models_list": models_list,
                     "estimated_tokens": tokens,
                     "tokens_total_available": ctx,
@@ -520,8 +597,17 @@ def scan_folder(root_path):
                 # Store as non-agent file info for total count
                 all_files.append(agent_info)
 
-    logger.info(f"Total .py files: {total_py}  |  AI Agents detected: {len(agents)}")
-    return agents
+    logger.info(f"Total .py files: {total_py}  |  AI Agents: {len(agents)}  |  Other files: {len(all_files)}")
+    # Classify non-agent files by type
+    for nf in all_files:
+        chars = nf["characteristics_met"]
+        if chars <= 1:
+            nf["file_type"] = "Utility / Helper"
+        elif chars == 2:
+            nf["file_type"] = "Partial Agent-like"
+        else:
+            nf["file_type"] = "Miscellaneous"
+    return agents, all_files, total_py
 
 
 def create_sample_agents(target_dir):
@@ -844,7 +930,7 @@ logging:
 #  HTML DASHBOARD GENERATOR
 # ═══════════════════════════════════════════════════════════════
 
-def generate_dashboard_html(agents, root_path, total_py_files=0):
+def generate_dashboard_html(agents, non_agents, root_path, total_py_files=0):
     """Generate full colorful HTML dashboard from agent data."""
     ta = len(agents)
     tt = sum(a.get("estimated_tokens", 0) for a in agents)
@@ -868,6 +954,46 @@ def generate_dashboard_html(agents, root_path, total_py_files=0):
     aicons = {"code": "💻", "content": "📝", "data": "📊", "customer": "🤝",
               "research": "🔬", "finance": "💰", "healthcare": "🏥",
               "education": "📚", "automation": "⚙️", "multimedia": "🎨", "general": "🤖"}
+    
+    non_cards = ""
+    for idx, nf in enumerate(non_agents):
+        chars_met = nf.get("characteristics_met", 0)
+        missing = nf.get("characteristics_not_met_list", [])
+        missing_str = ", ".join(missing[:4])
+        if len(missing) > 4:
+            missing_str += "..."
+        file_type = nf.get("file_type", "Unknown")
+        type_colors = {"Utility / Helper": "#636e72", "Partial Agent-like": "#fdcb6e", "Miscellaneous": "#e17055"}
+        tc = type_colors.get(file_type, "#636e72")
+        icon = "📄"
+        non_cards += f'\n        <div class="non-agent-card">\
+            <div class="card-header" style="border-left:3px solid {tc}">\
+                <div style="font-size:2rem;opacity:0.5">{icon}</div>\
+                <div class="agent-title">\
+                    <h3>{nf.get("agent_name", "Unknown")}</h3>\
+                    <span class="agent-file">{nf.get("relative_path", "")}</span>\
+                </div>\
+                <div style="text-align:right">\
+                    <span class="quality-tag" style="background:{tc}22;color:{tc};border:1px solid {tc}55;padding:4px 10px;border-radius:8px;font-size:0.75rem">{file_type}</span>\
+                </div>\
+            </div>\
+            <div class="card-body">\
+                <div class="info-grid">\
+                    <div class="info-item"><span class="info-label">💻 Language</span><span class="info-value">Python</span></div>\
+                    <div class="info-item"><span class="info-label">📄 Size</span><span class="info-value">{nf.get("file_size_kb", 0)} KB | {nf.get("lines_of_code", 0)} lines</span></div>\
+                    <div class="info-item"><span class="info-label">🎯 Chars Met</span><span class="info-value">{chars_met}/7</span></div>\
+                    <div class="info-item"><span class="info-label">❌ Missing</span><span class="info-value">{missing_str if missing_str else "None"}</span></div>\
+                </div>\
+                <div class="description-box" style="border-left-color:{tc}">\
+                    <span class="desc-label">📋 What it does</span>\
+                    <p>{nf.get("description", "")}</p>\
+                </div>\
+                <div class="not-agent-reason">\
+                    <span class="reason-label">⛔ Why not an AI Agent?</span>\
+                    <p>Only {chars_met}/7 AI characteristics met (need ≥3). Missing: {missing_str if missing_str else "None - basic file."}</p>\
+                </div>\
+            </div>\
+        </div>'
     
     cards = ""
     for idx, a in enumerate(agents):
@@ -906,8 +1032,12 @@ def generate_dashboard_html(agents, root_path, total_py_files=0):
                         <span class="info-value"><span class="badge badge-provider">{a.get("provider", "Unknown")}</span></span>
                     </div>
                     <div class="info-item">
+                        <span class="info-label">🎯 Why Used</span>
+                        <span class="info-value" style="font-size:0.8rem;color:var(--text2)">{'Agent uses ' + a.get("model", "Unknown") + ' model via ' + a.get("provider", "Unknown") + ' for: ' + a.get("description", "")[:80]}</span>
+                    </div>
+                    <div class="info-item">
                         <span class="info-label">🧠 AI Model</span>
-                        <span class="info-value"><span class="badge badge-model">{a.get("model", "Unknown")}</span></span>
+                        <span class="info-value"><span class="badge badge-model">{a.get("model", "Unknown")}</span>{' <span class="badge badge-inferred" title="Model inferred from provider/patterns">🔮 inferred</span>' if a.get("model_inferred", False) else ''}</span>
                     </div>
                     <div class="info-item">
                         <span class="info-label">📄 File</span>
@@ -1012,7 +1142,7 @@ def generate_dashboard_html(agents, root_path, total_py_files=0):
     char_counts = Counter()
     for a in agents:
         for c in a.get("characteristics_met_list", []):
-
+            # Normalize labels
             # Normalize labels using dict lookup
             label_map = {
                 "Uses AI/LLM Model": "1. Uses AI Model",
@@ -1024,6 +1154,8 @@ def generate_dashboard_html(agents, root_path, total_py_files=0):
                 "Agent Orchestration Logic": "7. Orchestration Logic",
             }
             short = label_map.get(c, c)
+
+            char_counts[short] += 1
     
     char_dist_html = ""
     for char_name, count in char_counts.most_common():
@@ -1101,6 +1233,7 @@ html{{font-size:15px}}body{{font-family:'Inter',sans-serif;background:var(--bg);
 .badge{{display:inline-block;padding:2px 10px;border-radius:12px;font-size:0.75rem;font-weight:500;margin:2px}}
 .badge-provider{{background:rgba(108,92,231,0.25);color:#a29bfe;border:1px solid rgba(108,92,231,0.3)}}
 .badge-model{{background:rgba(0,212,170,0.2);color:#00d4aa;border:1px solid rgba(0,212,170,0.3)}}
+.badge-inferred{{display:inline-block;padding:2px 8px;border-radius:12px;font-size:0.7rem;font-weight:500;margin:2px;background:rgba(253,203,110,0.15);color:#fdcb6e;border:1px solid rgba(253,203,110,0.3);cursor:help}}
 .description-box{{background:var(--bg3);border-radius:10px;padding:12px 14px;margin-bottom:14px;border-left:3px solid var(--accent1)}}
 .desc-label{{font-size:0.8rem;color:var(--text2);display:block;margin-bottom:4px}}.description-box p{{font-size:0.88rem;line-height:1.5;color:var(--text)}}
 .chars-section{{margin-bottom:14px}}
@@ -1165,6 +1298,11 @@ html{{font-size:15px}}body{{font-family:'Inter',sans-serif;background:var(--bg);
 <h2><span>📋 AI Agent Inventory</span> <span style="font-size:0.9rem;color:var(--text2);font-weight:400">({ta} agents)</span></h2>
 <div class="agents-grid">{cards if cards else '<p style="color:var(--text2);text-align:center;padding:40px">No AI agents detected in the scanned path.</p>'}</div>
 </div>
+
+<div class="agents-section">
+<h2><span>📁 Other Python Files</span> <span style="font-size:0.9rem;color:var(--text2);font-weight:400">({len(non_agents)} non-agent files)</span></h2>
+<div class="non-agent-grid">{non_cards if non_cards else '<p style="color:var(--text2);text-align:center;padding:20px">All Python files are AI agents.</p>'}</div>
+</div>
 </main>
 <footer class="footer">
 <p>🤖 AI Agent Scanner · Detection based on 7 AI Agent Characteristics · Threshold: ≥3 = Agent</p>
@@ -1211,27 +1349,29 @@ def run_scan():
                 _cached_summary = {"error": f"Path not found: {scan_path}", "agents_found": 0}
                 return
         
-        agents = scan_folder(scan_path)
+        agents, non_agents, total_py_files = scan_folder(scan_path)
         if not agents and AUTO_CREATE:
             try:
                 # Count total Python files for reporting
                 total_py = sum(1 for _ in Path(scan_path).rglob("*.py") if _.stat().st_size <= 500_000)
                 create_sample_agents(scan_path)
-                agents = scan_folder(scan_path) or []
+                agents, non_agents, _ = scan_folder(scan_path)
             except Exception as e:
                 logger.warning(f"Sample creation failed: {e}")
                 try:
                     fallback = Path("/tmp") / "ai_agent_samples"
                     create_sample_agents(fallback)
-                    agents = scan_folder(fallback) or []
+                    agents, non_agents, _ = scan_folder(fallback)
                     SCAN_PATH = str(fallback)
                 except Exception:
                     pass
         
-        total_py_files = sum(1 for _ in Path(SCAN_PATH).rglob("*.py")
-                            if _.stat().st_size <= 500_000) if Path(SCAN_PATH).exists() else 0
+        if not agents:
+            agents = []
+        if not non_agents:
+            non_agents = []
         
-        _cached_html = generate_dashboard_html(agents or [], str(scan_path), total_py_files)
+        _cached_html = generate_dashboard_html(agents, non_agents, str(scan_path), total_py_files)
         
         _cached_summary = {
             "status": "ok",
@@ -1243,6 +1383,18 @@ def run_scan():
             "total_api_calls": sum(a.get("api_calls_detected", 0) for a in agents) if agents else 0,
             "total_lines": sum(a.get("lines_of_code", 0) for a in agents) if agents else 0,
             "average_characteristics": round(sum(a.get("characteristics_met", 0) for a in agents) / max(len(agents), 1), 1) if agents else 0,
+            "non_agents_found": len(non_agents),
+            "non_agents": [
+                {
+                    "name": n.get("agent_name", "?"),
+                    "file": n.get("relative_path", "?"),
+                    "file_type": n.get("file_type", "Unknown"),
+                    "language": "Python",
+                    "characteristics_met": n.get("characteristics_met", 0),
+                    "characteristics_missing": n.get("characteristics_not_met_list", []),
+                }
+                for n in non_agents
+            ] if non_agents else [],
             "agents": [
                 {
                     "name": a.get("agent_name", "?"),
