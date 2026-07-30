@@ -1,706 +1,614 @@
 #!/usr/bin/env python3
 """
-=========================================================================
-   agent_monitor.py — AI Agent Scanner Module for SentinelOps-Lite
-   
-   Drop this alongside your app.py, then add 4 lines to app.py
-   (shown at the bottom of this file) to mount the scanner routes.
-=========================================================================
+AI Agent Scanner & Dashboard for SentinelOps-Lite.
+
+Standalone file. Contains ALL Python + HTML + CSS + JS.
+
+In app.py add:
+    from agent_monitor import scanner_bp
+    application.register_blueprint(scanner_bp)
+
+Or run standalone:
+    python agent_monitor.py
+    → http://localhost:8787/scanner
 """
 
 import os
 import re
 import json
-import logging
+import time
+import hashlib
 import threading
 from datetime import datetime
-from pathlib import Path
-from collections import Counter
+from flask import Blueprint, Flask, jsonify, request, Response
 
-# ── Config (overridable via env vars) ──────────────────────────────────
-SCAN_PATH      = os.environ.get("SCAN_PATH", "/var/app/current")
-AUTO_CREATE    = os.environ.get("AUTO_CREATE_SAMPLES", "true").lower() == "true"
-REFRESH_SECS   = int(os.environ.get("SCAN_REFRESH_SECS", "300"))  # re-scan every 5 min
+scanner_bp = Blueprint("scanner", __name__)
+SCAN_ROOT = os.environ.get("SCAN_ROOT", os.path.dirname(os.path.abspath(__file__)))
+_cache = {"data": None, "lock": threading.Lock()}
+THIS_FILE = os.path.basename(__file__)
 
-logger = logging.getLogger("agent_monitor")
-
-# ── Model data (reference context windows) ────────────────────────────
-MODEL_CONTEXT_WINDOWS = {
-    "gpt-4o": 128000, "gpt-4o-mini": 128000, "gpt-4-turbo": 128000,
-    "gpt-4": 8192, "gpt-3.5-turbo": 16385,
-    "claude-3-opus": 200000, "claude-3-sonnet": 200000, "claude-3-haiku": 200000,
-    "claude-3.5-sonnet": 200000, "claude-3.5-haiku": 200000, "claude-4": 200000,
-    "gemini-1.5-pro": 1048576, "gemini-1.5-flash": 1048576, "gemini-2.0-flash": 1048576,
-    "gemini-pro": 32768, "mistral-large": 128000, "mistral-small": 32000,
-    "mistral-medium": 32000, "mixtral": 32000,
-    "llama-3": 8192, "llama-3.1": 128000, "llama-3.2": 128000, "llama-2": 4096,
-    "deepseek-chat": 128000, "deepseek-coder": 128000,
-    "command-r": 128000, "command-r-plus": 128000,
-    "phi-3": 128000, "phi-4": 16384, "qwen": 32768, "qwen2": 131072, "qwen2.5": 131072,
+AI_PROVIDERS = {
+    "OpenAI": {
+        "imports": [r"import\s+openai", r"from\s+openai\s+import", r"OpenAI\s*\(", r"openai\.api_key", r"AsyncOpenAI\s*\("],
+        "env_keys": ["OPENAI_API_KEY"],
+        "models": ["gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "gpt-4", "gpt-3.5-turbo", "dall-e-3", "whisper-1"],
+    },
+    "Anthropic": {
+        "imports": [r"import\s+anthropic", r"from\s+anthropic\s+import", r"Anthropic\s*\(", r"AsyncAnthropic\s*\("],
+        "env_keys": ["ANTHROPIC_API_KEY"],
+        "models": ["claude-3-5-sonnet", "claude-3-opus", "claude-3-sonnet", "claude-3-haiku"],
+    },
+    "Google Gemini": {
+        "imports": [r"import\s+google\.generativeai", r"from\s+google\.generativeai", r"genai\.GenerativeModel", r"import\s+vertexai", r"GenerativeModel\s*\("],
+        "env_keys": ["GOOGLE_API_KEY"],
+        "models": ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-pro", "gemini-1.5-flash", "gemini-pro"],
+    },
+    "Hugging Face": {
+        "imports": [r"from\s+transformers\s+import", r"import\s+transformers", r"from\s+huggingface_hub"],
+        "env_keys": ["HF_TOKEN"],
+        "models": ["bert", "t5", "mistral", "falcon"],
+    },
+    "Groq": {
+        "imports": [r"import\s+groq", r"from\s+groq", r"Groq\s*\("],
+        "env_keys": ["GROQ_API_KEY"],
+        "models": ["llama3", "mixtral"],
+    },
+    "Ollama": {
+        "imports": [r"import\s+ollama", r"from\s+ollama", r"ollama\.chat", r"ollama\.generate"],
+        "env_keys": [],
+        "models": ["llama2", "llama3", "codellama"],
+    },
+    "LangChain": {
+        "imports": [r"from\s+langchain\s+import", r"from\s+langchain\.\w+\s+import", r"AgentExecutor"],
+        "env_keys": [], "models": [],
+    },
+    "CrewAI": {
+        "imports": [r"from\s+crewai\s+import", r"Crew\s*\("],
+        "env_keys": [], "models": [],
+    },
+    "AutoGen": {
+        "imports": [r"from\s+autogen\s+import", r"AssistantAgent\s*\("],
+        "env_keys": [], "models": [],
+    },
 }
 
-PROVIDER_RATE_LIMITS = {
-    "OpenAI": {"rpm": 500, "tpm": 200000, "rpd": 10000},
-    "Anthropic": {"rpm": 400, "tpm": 100000, "rpd": 8000},
-    "Google": {"rpm": 360, "tpm": 120000, "rpd": 7200},
-    "Mistral": {"rpm": 300, "tpm": 80000, "rpd": 6000},
-    "Meta": {"rpm": 200, "tpm": 60000, "rpd": 4000},
-    "default": {"rpm": 200, "tpm": 50000, "rpd": 4000},
+AI_FRAMEWORKS = {
+    "LangChain Agent": [r"AgentExecutor\s*\(", r"create_react_agent\s*\("],
+    "CrewAI Agent": [r"from\s+crewai\s+import\s+Agent"],
+    "AutoGen Agent": [r"AssistantAgent\s*\("],
+    "Custom Agent": [r"class\s+\w*[Aa]gent\w*\s*[\(:]"],
+    "Prometheus Monitor": [r"from\s+prometheus_client", r"Counter\s*\(", r"Gauge\s*\("],
 }
 
-FILE_PATTERNS = {
-    ".py": [
-        r"(?:class|def)\s+\w*(?:Agent|agent|Tool|tool|Task|task)",
-        r"from\s+(?:langchain|crewai|autogen|openai|llama_index|haystack|pydantic_ai|smolagents)",
-        r"import\s+(?:langchain|crewai|autogen|openai|llama_index|haystack)",
-        r"(?:@tool|@agent|@task)",
-        r"(?:AgentExecutor|ConversableAgent|AssistantAgent|UserProxyAgent|ToolAgent)",
-        r"(?:Crew|Agent|Task|Process|Workflow)\s*[\(:]",
-        r"(?:ChatOpenAI|ChatAnthropic|ChatGoogle|ChatMistral)\s*\(",
-        r"llm\s*[=:]\s*\{", r"model\s*[=:]\s*[\"']",
-        r"(?:create_agent|initialize_agent|load_agent)",
-    ],
-    ".json": [r"\"(?:agent|model|provider|llm|tools)\"\s*:", r"\"(?:name|type|role|goal|backstory)\"\s*:"],
-    ".yaml": [r"(?:agent|model|provider|llm|tools)\s*:", r"(?:name|type|role|goal|backstory)\s*:"],
-    ".yml":  [r"(?:agent|model|provider|llm|tools)\s*:", r"(?:name|type|role|goal|backstory)\s*:"],
-    ".toml": [r"\[(?:agent|tool|llm|model|provider)\]"],
-    ".cfg":  [r"(?:agent|model|provider|llm)"],
-    ".env":  [r"(?:OPENAI|ANTHROPIC|GEMINI|MISTRAL|COHERE)_API_KEY"],
+AI_AREAS = {
+    "Chatbot": [r"\bchat\s*\(", r"\bconversation\b", r"\bchatbot\b"],
+    "Monitoring": [r"\bmonitor\b", r"\bmetric\b", r"\bprometheus\b", r"\bpsutil\b", r"\bcpu_percent\b"],
+    "Code Gen": [r"\bcode[-_]?gen", r"\bcode[-_]?review\b"],
+    "DevOps": [r"\bdeploy\b", r"\bdocker\b", r"\bci[-_]?cd\b", r"\bpre[-_]?deploy\b", r"\bpost[-_]?deploy\b"],
+    "API Service": [r"\bflask\b", r"\bjsonify\b", r"@\w+\.(get|post|route)\b"],
+    "Data Analysis": [r"\bpandas\b", r"\bdataframe\b", r"\bcsv\b"],
+    "NLP": [r"\bsummariz", r"\btranslat", r"\bsentiment\b"],
+    "RAG": [r"\bchromadb\b", r"\bpinecone\b", r"\bvector.?store\b"],
 }
 
-PROVIDER_MAP = {
-    "openai": "OpenAI", "gpt": "OpenAI", "chatopenai": "OpenAI",
-    "anthropic": "Anthropic", "claude": "Anthropic", "chatanthropic": "Anthropic",
-    "google": "Google", "gemini": "Google", "chatgoogle": "Google",
-    "mistral": "Mistral", "mixtral": "Mistral", "chatmistral": "Mistral",
-    "meta": "Meta", "llama": "Meta",
-    "langchain": "LangChain", "crewai": "CrewAI", "autogen": "AutoGen",
-    "haystack": "Haystack", "llama_index": "LlamaIndex",
-}
 
-AREA_KEYWORDS = {
-    "code": ["code", "programming", "software", "development", "coding", "debug", "review", "github", "git"],
-    "content": ["content", "writing", "blog", "article", "copy", "marketing", "seo"],
-    "data": ["data", "analytics", "database", "sql", "pandas", "csv", "analysis", "report"],
-    "customer": ["customer", "support", "chat", "conversation", "assistant", "helpdesk", "ticket"],
-    "research": ["research", "paper", "arxiv", "scientific", "academic", "study", "literature"],
-    "finance": ["finance", "trading", "stock", "crypto", "investment", "banking", "market"],
-    "healthcare": ["health", "medical", "clinical", "patient", "diagnosis"],
-    "education": ["education", "learning", "tutorial", "course", "teaching", "student"],
-    "automation": ["automation", "workflow", "pipeline", "orchestration", "scheduler"],
-    "multimedia": ["image", "video", "audio", "music", "media", "design", "creative"],
-}
-
-SKIP_DIRS = {"node_modules", ".git", "__pycache__", ".venv", "venv", ".tox", "dist", "build",
-             ".next", ".nuxt", ".cache", "site-packages", "lib", "lib64", "bin", "include",
-             ".eggs", "env", ".env", "target", "out"}
-
-# ── Cache ─────────────────────────────────────────────────────────────
-_cached_html = None
-_cached_json = "{}"
-_cached_time = None
-_lock = threading.Lock()
-
-# ======================================================================
-#  CORE SCANNER
-# ======================================================================
-
-def estimate_tokens(text): return max(1, len(text) // 4)
-
-def count_api_calls(text):
-    patterns = [
-        r"\.invoke\s*\(", r"\.run\s*\(", r"\.kickoff\s*\(",
-        r"chat\.completions\.create", r"generate_reply",
-        r"client\.\w+\.create", r"\.predict\s*\(", r"\.generate\s*\(",
-        r"\.send_message", r"\.reply\s*\(", r"completion\s*=", r"response\s*=",
-    ]
-    return sum(len(re.findall(p, text, re.IGNORECASE)) for p in patterns)
-
-def extract_rate_limits(text, providers):
-    extracted = {}
-    for key in ["rpm", "tpm", "rpd"]:
-        matches = re.findall(rf"{key}\s*[=:]\s*(\d+)", text, re.IGNORECASE)
-        if matches:
-            extracted[key] = max(int(m) for m in matches)
-    fallback = PROVIDER_RATE_LIMITS.get("default")
-    for prov in providers:
-        pl = PROVIDER_RATE_LIMITS.get(prov)
-        if pl: fallback = pl; break
-    for key in ["rpm", "tpm", "rpd"]:
-        if key not in extracted and fallback and fallback.get(key):
-            extracted[key] = fallback[key]
-    return extracted.get("rpm", 0), extracted.get("tpm", 0), extracted.get("rpd", 0)
-
-def get_context_window(models):
-    windows = [MODEL_CONTEXT_WINDOWS.get(m, 128000) for m in models]
-    return max(windows) if windows else 128000
-
-def analyze_error_handling(text):
-    findings = []
-    if not re.search(r'\btry\b', text):
-        findings.append("No try/except blocks")
-    if not re.search(r'\b(log|logging|logger)\b', text, re.IGNORECASE):
-        findings.append("No logging mechanism")
-    if not re.search(r'\bretry\b', text, re.IGNORECASE):
-        findings.append("No retry logic")
-    if not re.search(r':\s*(str|int|float|bool|list|dict|Optional|Union|Any)\b', text):
-        findings.append("No type hints")
-    if not re.search(r'\b(validate|sanitize|check)\b', text, re.IGNORECASE):
-        findings.append("No input validation")
-    return findings
-
-def detect_area(text, filename):
-    combined = (text + " " + filename + " " + Path(filename).stem).lower()
-    scores = {}
-    for area, keywords in AREA_KEYWORDS.items():
-        score = sum(combined.count(kw.lower()) for kw in keywords)
-        if score > 0: scores[area] = score
-    return max(scores, key=scores.get) if scores else "general"
-
-def extract_providers(text):
-    text_lower = text.lower()
-    found = set()
-    for alias, provider in PROVIDER_MAP.items():
-        if alias in text_lower: found.add(provider)
-    if re.search(r'(?:gpt|davinci|ada|babbage|curie)-\d', text, re.IGNORECASE): found.add("OpenAI")
-    if re.search(r'claude-\d', text, re.IGNORECASE): found.add("Anthropic")
-    if re.search(r'gemini-\d', text, re.IGNORECASE): found.add("Google")
-    if re.search(r'llama-\d', text, re.IGNORECASE): found.add("Meta")
-    return sorted(found) if found else ["Unknown"]
-
-def extract_models(text):
-    found = set()
-    for model in MODEL_CONTEXT_WINDOWS:
-        if model in text.lower(): found.add(model)
-    return sorted(found) if found else ["Unknown"]
-
-def extract_agent_name(filepath):
-    name = re.sub(r'[_\-.]+', ' ', Path(filepath).stem).strip()
-    return name.title()
-
-def extract_description(text, filepath):
-    for pat in [r'"""(.*?)"""', r"'''(.*?)'''"]:
-        for m in re.findall(pat, text, re.DOTALL):
-            cleaned = m.strip()
-            if len(cleaned) > 10:
-                lines = [l.strip() for l in cleaned.split('\n') if l.strip()]
-                return ' '.join(lines[:3])[:300]
-    for pat in [
-        r'role\s*[=:]\s*["\'](.+?)["\']', r'goal\s*[=:]\s*["\'](.+?)["\']',
-        r'backstory\s*[=:]\s*["\'](.+?)["\']', r'description\s*[=:]\s*["\'](.+?)["\']',
-    ]:
-        m = re.search(pat, text, re.DOTALL)
-        if m and len(m.group(1).strip()) > 10:
-            return m.group(1).strip()[:300]
-    return f"AI agent in {Path(filepath).name}"
-
-def is_agent_file(text, ext):
-    for pat in FILE_PATTERNS.get(ext, []):
-        if re.search(pat, text, re.IGNORECASE):
-            return True
-    return False
+def _find_env_models(content):
+    found = []
+    for m in re.findall(r'getenv\s*\(\s*["\']AI_MODEL["\']\s*,\s*["\']([\w.\-]+)["\']\s*\)', content):
+        if m not in found:
+            found.append(m)
+    return found
 
 
-def scan_folder(root_path):
-    """Scan folder → list of agent dicts with REAL extracted data."""
-    root = Path(root_path).expanduser().resolve()
-    if not root.exists():
-        logger.warning(f"Path not found: {root}")
-        return []
-    agents = []
-    total = scanned = 0
-    logger.info(f"Scanning: {root}")
-    for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS and not d.startswith('.')]
-        for fn in filenames:
-            fp = Path(dirpath) / fn
-            ext = fp.suffix.lower()
-            if ext not in FILE_PATTERNS: continue
+def _find_env_providers(content):
+    found = []
+    for m in re.findall(r'getenv\s*\(\s*["\']AI_PROVIDER["\']\s*,\s*["\'](\w+)["\']\s*\)', content):
+        if m not in found:
+            found.append(m)
+    return found
+
+
+class LogReader:
+    EXTS = {".log", ".txt", ".json", ".jsonl"}
+
+    def __init__(self, script_path):
+        self.dir = os.path.dirname(script_path)
+        self.name = os.path.splitext(os.path.basename(script_path))[0]
+
+    def parse(self):
+        logs = self._find()
+        r = {"log_files": [os.path.basename(f) for f in logs], "total": 0, "ok": 0, "fail": 0, "tokens": 0,
+             "failures": {}, "avg_rt": None, "last_t": None, "source": "no_logs" if not logs else "log_files"}
+        for f in logs:
+            self._read(f, r)
+        if (r["ok"] + r["fail"]) > r["total"]:
+            r["total"] = r["ok"] + r["fail"]
+        return r
+
+    def _find(self):
+        found = []
+        for d in [self.dir, os.path.join(self.dir, "logs"), os.path.join(self.dir, ".."), os.path.join(self.dir, "..", "logs")]:
+            if not os.path.isdir(d):
+                continue
             try:
-                if fp.stat().st_size > 500_000: continue
-            except OSError: continue
-            total += 1
-            try:
-                text = fp.read_text(encoding="utf-8", errors="replace")
-            except Exception: continue
-            if not is_agent_file(text, ext): continue
-            scanned += 1
-
-            name = extract_agent_name(fp)
-            providers = extract_providers(text)
-            models = extract_models(text)
-            area = detect_area(text, fp.name)
-            desc = extract_description(text, fp)
-            toks = estimate_tokens(text)
-            ctx = get_context_window(models)
-            api = count_api_calls(text)
-            if ext in (".yaml", ".yml", ".json", ".toml", ".cfg"):
-                n = len(re.findall(r'(?:name|agent)\s*[=:]\s*["\']?(\w+)', text))
-                if n > api: api = n
-            rpm, tpm, rpd = extract_rate_limits(text, providers)
-            errors = analyze_error_handling(text)
-            lines = text.count("\n") + 1
-            has_try = bool(re.search(r'\btry\b.*\bexcept\b', text, re.DOTALL))
-            has_log = bool(re.search(r'\b(log|logging|logger)\b', text, re.IGNORECASE))
-            has_ret = bool(re.search(r'\bretry\b', text, re.IGNORECASE))
-            has_typ = bool(re.search(r':\s*(str|int|float|bool|list|dict|Optional|Union|Any)\b', text))
-            q = min((30 if has_try else 0) + (20 if has_log else 0) + (15 if has_ret else 0) +
-                    (15 if has_typ else 0) + (10 if lines > 15 else 0) + (10 if api > 0 else 0), 100)
-            treq = max(1, api * 5)
-            fr = max(0.05, len(errors) * 0.08)
-            fc = int(treq * fr)
-            sc = treq - fc
-            agents.append({
-                "relative_path": str(fp.relative_to(root)),
-                "file_size_kb": round(fp.stat().st_size / 1024, 1),
-                "lines_of_code": lines,
-                "agent_name": name,
-                "providers": providers, "models": models, "area": area,
-                "description": desc,
-                "estimated_tokens": toks,
-                "tokens_total_available": ctx,
-                "tokens_used_pct": round((toks / ctx) * 100, 2) if ctx else 0,
-                "api_calls_detected": api,
-                "rate_rpm": rpm, "rate_tpm": tpm, "rate_rpd": rpd,
-                "error_handling_findings": errors, "num_error_issues": len(errors),
-                "quality_score": q,
-                "total_requests": treq, "success_count": sc, "fail_count": fc,
-                "success_rate": round((sc / treq) * 100, 1) if treq else 0,
-            })
-            logger.info(f"  [{scanned}] {name:28s} | {providers[0] if providers else '?':15s} | {area:12s} | {lines:>4} lines | {api} API calls")
-    logger.info(f"Files: {total}  Agents: {scanned}")
-    return agents
-
-
-def create_sample_agents(target_dir):
-    """Create demo agents if none found."""
-    d = Path(target_dir)
-    d.mkdir(parents=True, exist_ok=True)
-    logger.info("Creating sample agents...")
-    samples = [
-        ("code_review_agent.py", '''"""
-Code Review Agent — LangChain + OpenAI
-"""
-import logging
-from typing import Optional
-from langchain.agents import tool
-from langchain_openai import ChatOpenAI
-logger = logging.getLogger(__name__)
-class CodeReviewAgent:
-    role = "Senior Code Reviewer"
-    goal = "Ensure code quality and catch bugs before merge"
-    def __init__(self, model: str = "gpt-4o"):
-        self.llm = ChatOpenAI(model=model)
-        self.max_retries = 3
-    @tool
-    def analyze_code_diff(self, diff: str) -> str:
-        try:
-            result = self.llm.invoke(f"Review:\\\\n{diff}")
-            logger.info("Review completed")
-            return str(result)
-        except Exception as e:
-            logger.error(f"Review failed: {e}")
-            raise
-    def review_pull_request(self, changes: str) -> Optional[str]:
-        for a in range(self.max_retries):
-            try: return self.analyze_code_diff(changes)
-            except Exception as e:
-                if a == self.max_retries - 1:
-                    logger.critical(f"Exhausted: {e}"); return None
-'''),
-        ("customer_support_agent.py", '''"""
-Support Agent — CrewAI + Claude
-"""
-import logging
-from crewai import Agent, Task, Crew
-logger = logging.getLogger(__name__)
-class SupportAgent:
-    role = "Customer Support Specialist"
-    goal = "Resolve customer issues quickly"
-    def __init__(self):
-        self.llm_config = {"model": "claude-3.5-sonnet", "provider": "Anthropic"}
-        self.agent = Agent(role=self.role, goal=self.goal, llm=self.llm_config)
-    def handle_ticket(self, tid: str, desc: str) -> str:
-        try:
-            result = Crew(agents=[self.agent], tasks=[Task(description=f"#{tid}: {desc}", agent=self.agent)]).kickoff()
-            logger.info(f"Ticket {tid} resolved"); return str(result)
-        except Exception as e: logger.error(f"Failed: {e}"); return f"Error: {e}"
-'''),
-        ("data_analysis_agent.py", '''"""
-Data Agent — AutoGen + Gemini
-"""
-import logging
-from autogen import AssistantAgent
-logger = logging.getLogger(__name__)
-class DataAnalysisAgent:
-    role = "Data Analyst"
-    goal = "Extract insights from data"
-    def __init__(self):
-        self.llm_config = {"model": "gemini-1.5-pro", "provider": "Google"}
-        self.analyst = AssistantAgent(name="Analyst", llm_config=self.llm_config)
-    def analyze(self, path: str):
-        try:
-            r = self.analyst.generate_reply(messages=[{"role":"user","content":f"Analyze {path}"}])
-            logger.info("Analysis done"); return r
-        except Exception as e: logger.error(f"Failed: {e}"); return None
-'''),
-        ("content_writer_agent.py", '''"""
-Content Writer — LangChain + Claude Haiku
-"""
-import logging; from langchain_anthropic import ChatAnthropic
-logger = logging.getLogger(__name__)
-class ContentWriterAgent:
-    role = "Content Creator"; goal = "Produce engaging content"
-    def __init__(self):
-        self.llm = ChatAnthropic(model="claude-3-haiku", temperature=0.7)
-    def write(self, topic: str):
-        for a in range(2):
-            try:
-                r = self.llm.invoke(f"Write about {topic}")
-                logger.info(f"Written: {topic}"); return str(r)
-            except Exception as e: logger.warning(f"Attempt {a+1}: {e}")
-        return None
-'''),
-        ("research_agent.py", '''"""
-Research Agent — OpenAI
-"""
-import os, logging; from openai import OpenAI
-logger = logging.getLogger(__name__)
-class ResearchAgent:
-    role = "Research Assistant"; goal = "Find and summarize papers"
-    def __init__(self):
-        self.client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-        self.model = "gpt-4-turbo"
-    def search(self, query: str):
-        for a in range(3):
-            try:
-                r = self.client.chat.completions.create(model=self.model, messages=[{"role":"user","content":f"Papers on: {query}"}])
-                logger.info("Search done"); return [r.choices[0].message.content]
-            except Exception as e: logger.warning(f"Attempt {a+1}: {e}")
-        return None
-'''),
-        ("automation_agent.py", '''"""
-Automation — Haystack + Llama
-"""
-import logging; from haystack import Pipeline; from haystack.components.builders import PromptBuilder
-logger = logging.getLogger(__name__)
-class AutomationAgent:
-    role = "Automation Engineer"; goal = "Streamline tasks"
-    def __init__(self):
-        self.pipeline = Pipeline(); self.model = "llama-3.1"
-    def run(self, steps: list):
-        try:
-            for i, s in enumerate(steps): self.pipeline.add_component(f"s{i}", PromptBuilder(template=s))
-            return self.pipeline.run(data={"prompt": "Execute"})
-        except Exception as e: logger.error(f"Failed: {e}"); return {"error": str(e)}
-'''),
-    ]
-    for name, content in samples:
-        (d / name).write_text(content)
-        logger.info(f"  [+] {name}")
-    return d
-
-
-def generate_dashboard_html(agents, root_path):
-    """Generate the full colorful HTML dashboard from agent data."""
-    ta = len(agents)
-    tt = sum(a["estimated_tokens"] for a in agents)
-    tr = sum(a["total_requests"] for a in agents)
-    ts = sum(a["success_count"] for a in agents)
-    tf = sum(a["fail_count"] for a in agents)
-    avs = round((ts / tr * 100), 1) if tr else 0
-    tac = sum(a["api_calls_detected"] for a in agents)
-    tlines = sum(a["lines_of_code"] for a in agents)
-    terr = sum(a["num_error_issues"] for a in agents)
-    aq = round(sum(a["quality_score"] for a in agents) / max(ta, 1), 1)
-
-    ac = Counter(a["area"] for a in agents)
-    pc = Counter(p for a in agents for p in a["providers"])
-    mc = Counter(m for a in agents for m in a["models"])
-    hq = sum(1 for a in agents if a["quality_score"] >= 70)
-    mq = sum(1 for a in agents if 40 <= a["quality_score"] < 70)
-    lq = sum(1 for a in agents if a["quality_score"] < 40)
-
-    acol = {"code":"#00b894","content":"#fdcb6e","data":"#6c5ce7","customer":"#fd79a8","research":"#74b9ff","finance":"#f8a5c2","healthcare":"#e17055","education":"#81ecec","automation":"#ffeaa7","multimedia":"#a29bfe","general":"#dfe6e9"}
-    area_chart = "".join(f'<div class="area-row"><span class="area-name">{a.title()}</span><span class="area-bar"><span class="area-fill" style="width:{round(c/ta*100,1)}%;background:{acol.get(a,"#636e72")}"></span></span><span class="area-count">{c}</span></div>' for a,c in ac.most_common())
-    prov_html = "".join(f'<div class="prov-item"><span class="prov-dot" style="background:hsl({hash(p)%360},70%,60%)"></span><span class="prov-name">{p}</span><span class="prov-count">{c}</span></div>' for p,c in pc.most_common())
-    model_html = "".join(f'<div class="model-chip"><span class="model-name">{m}</span><span class="model-count">{c}</span></div>' for m,c in mc.most_common())
-
-    aicons = {"code":"💻","content":"📝","data":"📊","customer":"🤝","research":"🔬","finance":"💰","healthcare":"🏥","education":"📚","automation":"⚙️","multimedia":"🎨","general":"🤖"}
-    cards = ""
-    for idx, a in enumerate(agents):
-        ci = idx % 12
-        pb = "".join(f'<span class="badge badge-provider">{p}</span>' for p in a["providers"])
-        mb = "".join(f'<span class="badge badge-model">{m}</span>' for m in a["models"])
-        icon = aicons.get(a["area"], "🤖")
-        qs = a["quality_score"]
-        qc = "#00b894" if qs >= 70 else "#fdcb6e" if qs >= 40 else "#e17055"
-        sc = "#00b894" if a["success_rate"] > 85 else "#fdcb6e" if a["success_rate"] > 65 else "#e17055"
-        td = min(a["tokens_used_pct"] * 1.57, 157)
-        rd = min((a["api_calls_detected"] / 100) * 157, 157) if a["api_calls_detected"] else 0
-        rpd = min((a["rate_rpm"] / 600) * 157, 157) if a["rate_rpm"] else 0
-        sd = a["success_rate"] * 1.57
-        fail_s = ""
-        if a["error_handling_findings"]:
-            issues = "".join(f"<li>{f}</li>" for f in a["error_handling_findings"][:5])
-            fail_s = f'<div class="fail-section"><span class="fail-title">🔍 Quality Issues:</span><ul class="fail-list">{issues}</ul></div>'
-        cards += f'''
-        <div class="agent-card">
-            <div class="card-header">
-                <div class="agent-icon">{icon}</div>
-                <div class="agent-title"><h3>{a['agent_name']}</h3><span class="agent-file">{a['relative_path']}</span></div>
-                <div class="agent-shape shape-{ci % 6}"></div>
-            </div>
-            <div class="card-body">
-                <div class="info-grid">
-                    <div class="info-item"><span class="info-label">📦 Provider</span><div class="info-value">{pb}</div></div>
-                    <div class="info-item"><span class="info-label">🧠 Model</span><div class="info-value">{mb}</div></div>
-                    <div class="info-item"><span class="info-label">🎯 Area</span><span class="info-value"><span class="area-tag area-{a['area']}">{a['area'].title()}</span></span></div>
-                    <div class="info-item"><span class="info-label">📄 File</span><span class="info-value">{a['file_size_kb']} KB | {a['lines_of_code']} lines</span></div>
-                </div>
-                <div class="description-box"><span class="desc-label">📋 Description</span><p>{a['description']}</p></div>
-                <div class="quality-bar-container"><span class="quality-label">Quality</span><div class="quality-bar"><div class="quality-fill" style="width:{qs}%;background:{qc}"></div></div><span class="quality-text">{qs}/100</span></div>
-                <div class="metrics-container">
-                    <div class="metric-card"><div class="metric-ring"><svg viewBox="0 0 120 120"><path d="M 10 110 A 50 50 0 1 1 110 110" fill="none" stroke="#2a2a3e" stroke-width="12"/><path d="M 10 110 A 50 50 0 1 1 110 110" fill="none" stroke="#00d4aa" stroke-width="12" stroke-dasharray="{td} 157" stroke-linecap="round"/></svg><div class="metric-center"><span class="metric-num">{a['estimated_tokens']:,}</span><span class="metric-label">Tokens</span></div></div><div class="metric-detail"><span class="meter-bar"><span class="meter-fill" style="width:{min(a['tokens_used_pct'],100)}%;background:linear-gradient(90deg,#00d4aa,#00b894)"></span></span><span class="meter-text">{a['tokens_used_pct']}% of {a['tokens_total_available']:,}</span></div></div>
-                    <div class="metric-card"><div class="metric-ring"><svg viewBox="0 0 120 120"><path d="M 10 110 A 50 50 0 1 1 110 110" fill="none" stroke="#2a2a3e" stroke-width="12"/><path d="M 10 110 A 50 50 0 1 1 110 110" fill="none" stroke="#6c5ce7" stroke-width="12" stroke-dasharray="{rd} 157" stroke-linecap="round"/></svg><div class="metric-center"><span class="metric-num">{a['api_calls_detected']}</span><span class="metric-label">API Calls</span></div></div><div class="metric-detail"><span class="meter-text">RPM: {a['rate_rpm'] or 'N/A'} | TPM: {a['rate_tpm'] or 'N/A'} | RPD: {a['rate_rpd'] or 'N/A'}</span></div></div>
-                    <div class="metric-card"><div class="metric-ring"><svg viewBox="0 0 120 120"><path d="M 10 110 A 50 50 0 1 1 110 110" fill="none" stroke="#2a2a3e" stroke-width="12"/><path d="M 10 110 A 50 50 0 1 1 110 110" fill="none" stroke="#fd79a8" stroke-width="12" stroke-dasharray="{rpd} 157" stroke-linecap="round"/></svg><div class="metric-center"><span class="metric-num">{a['rate_rpm'] or '∞'}</span><span class="metric-label">RPM Limit</span></div></div><div class="metric-detail"><span class="meter-text">TPM: {a['rate_tpm'] or '∞'} | RPD: {a['rate_rpd'] or '∞'}</span></div></div>
-                    <div class="metric-card"><div class="metric-ring"><svg viewBox="0 0 120 120"><path d="M 10 110 A 50 50 0 1 1 110 110" fill="none" stroke="#2a2a3e" stroke-width="12"/><path d="M 10 110 A 50 50 0 1 1 110 110" fill="none" stroke="{sc}" stroke-width="12" stroke-dasharray="{sd} 157" stroke-linecap="round"/></svg><div class="metric-center"><span class="metric-num">{a['success_rate']}%</span><span class="metric-label">Success Est.</span></div></div><div class="metric-detail"><div class="request-bars"><span class="req-bar req-success" style="flex:{a['success_count']}">✅ {a['success_count']}</span><span class="req-bar req-fail" style="flex:{a['fail_count']}">❌ {a['fail_count']}</span></div><span class="meter-text">{a['total_requests']} total</span></div></div>
-                </div>
-                {fail_s}
-            </div>
-        </div>'''
-
-    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    return f'''<!DOCTYPE html>
-<html lang="en">
-<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>🤖 Agent Monitor Dashboard</title>
-<link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
-<style>
-*,*::before,*::after{{margin:0;padding:0;box-sizing:border-box}}:root{{--bg:#0a0a1a;--bg2:#12122a;--bg3:#1a1a3e;--card-bg:#16163a;--text:#e8e8f0;--text2:#a0a0c0;--border:#2a2a5e;--accent1:#00d4aa;--accent2:#6c5ce7;--accent3:#fd79a8;--accent4:#fdcb6e;--shadow:0 8px 32px rgba(0,0,0,0.4);--radius:16px}}
-html{{font-size:15px}}body{{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);min-height:100vh}}
-::-webkit-scrollbar{{width:6px}}::-webkit-scrollbar-track{{background:var(--bg)}}::-webkit-scrollbar-thumb{{background:var(--accent1);border-radius:3px}}
-.bg-particles{{position:fixed;top:0;left:0;width:100%;height:100%;overflow:hidden;pointer-events:none;z-index:0}}
-.bg-particles span{{position:absolute;display:block;border-radius:50%;animation:float 20s infinite;opacity:0.07}}
-.bg-particles span:nth-child(1){{width:300px;height:300px;top:-5%;left:-5%;background:radial-gradient(circle,#00d4aa,transparent);animation-delay:0s}}
-.bg-particles span:nth-child(2){{width:400px;height:400px;top:60%;right:-10%;background:radial-gradient(circle,#6c5ce7,transparent);animation-delay:-5s}}
-.bg-particles span:nth-child(3){{width:250px;height:250px;bottom:-5%;left:30%;background:radial-gradient(circle,#fd79a8,transparent);animation-delay:-10s}}
-.bg-particles span:nth-child(4){{width:350px;height:350px;top:20%;left:60%;background:radial-gradient(circle,#fdcb6e,transparent);animation-delay:-15s}}
-@keyframes float{{0%,100%{{transform:translate(0,0)scale(1)}}25%{{transform:translate(50px,-30px)scale(1.05)}}50%{{transform:translate(-20px,40px)scale(0.95)}}75%{{transform:translate(30px,20px)scale(1.02)}}}}
-.header{{position:relative;z-index:1;text-align:center;padding:40px 20px 30px;background:linear-gradient(135deg,var(--bg2),var(--bg3));border-bottom:1px solid var(--border)}}
-.header h1{{font-size:2.8rem;font-weight:800;background:linear-gradient(135deg,#00d4aa,#6c5ce7,#fd79a8,#fdcb6e);-webkit-background-clip:text;-webkit-text-fill-color:transparent;letter-spacing:-1px}}
-.header .subtitle{{color:var(--text2);font-size:1.1rem;margin-top:8px}}
-.header .scan-info{{display:flex;justify-content:center;gap:30px;margin-top:20px;flex-wrap:wrap}}
-.header .stat-bubble{{display:flex;align-items:center;gap:10px;background:var(--card-bg);border:1px solid var(--border);padding:12px 22px;border-radius:100px;font-size:0.95rem}}
-.header .stat-bubble .num{{font-weight:700;font-size:1.2rem}}
-.header .scan-path{{margin-top:12px;font-size:0.85rem;color:var(--text2);font-family:'JetBrains Mono',monospace;background:var(--bg);display:inline-block;padding:6px 16px;border-radius:8px;border:1px solid var(--border);max-width:90vw;overflow:hidden;text-overflow:ellipsis}}
-.dashboard{{position:relative;z-index:1;max-width:1440px;margin:0 auto;padding:30px 20px 60px}}
-.summary-row{{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:20px;margin-bottom:40px}}
-.summary-card{{background:var(--card-bg);border-radius:var(--radius);border:1px solid var(--border);padding:24px 16px;text-align:center;position:relative;overflow:hidden;transition:transform 0.3s,box-shadow 0.3s}}
-.summary-card:hover{{transform:translateY(-4px);box-shadow:var(--shadow)}}
-.summary-card .shape-bg{{position:absolute;top:-30px;right:-30px;width:100px;height:100px;opacity:0.06}}
-.summary-card .shape-bg svg{{width:100%;height:100%}}
-.summary-card .s-value{{font-size:2.5rem;font-weight:800}}
-.summary-card .s-label{{color:var(--text2);margin-top:4px;font-size:0.9rem}}
-.summary-card .s-icon{{font-size:2rem;margin-bottom:8px}}
-.sc-0 .s-value{{color:#00d4aa}}.sc-1 .s-value{{color:#6c5ce7}}.sc-2 .s-value{{color:#fd79a8}}.sc-3 .s-value{{color:#fdcb6e}}.sc-4 .s-value{{color:#74b9ff}}.sc-5 .s-value{{color:#e17055}}
-.charts-row{{display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-bottom:40px}}
-.chart-card{{background:var(--card-bg);border-radius:var(--radius);border:1px solid var(--border);padding:24px}}
-.chart-card h3{{font-size:1.1rem;margin-bottom:16px;color:var(--text2)}}
-.area-row{{display:flex;align-items:center;gap:12px;margin-bottom:10px}}
-.area-name{{width:100px;font-weight:500;font-size:0.9rem}}
-.area-bar{{flex:1;height:20px;background:var(--bg3);border-radius:10px;overflow:hidden}}
-.area-fill{{height:100%;border-radius:10px;transition:width 1s ease}}
-.area-count{{width:30px;text-align:right;font-weight:600}}
-.prov-list{{display:flex;flex-wrap:wrap;gap:12px}}
-.prov-item{{display:flex;align-items:center;gap:8px;background:var(--bg3);padding:8px 14px;border-radius:8px}}
-.prov-dot{{width:10px;height:10px;border-radius:50%;display:inline-block}}
-.prov-name{{font-size:0.9rem}}.prov-count{{font-weight:600;color:var(--text2)}}
-.model-cloud{{display:flex;flex-wrap:wrap;gap:10px}}
-.model-chip{{display:flex;align-items:center;gap:6px;background:linear-gradient(135deg,var(--bg3),var(--card-bg));border:1px solid var(--border);padding:6px 14px;border-radius:20px}}
-.model-name{{font-size:0.85rem}}.model-count{{font-size:0.75rem;background:var(--accent1);color:#000;padding:1px 8px;border-radius:10px;font-weight:600}}
-.agents-section h2{{font-size:1.5rem;margin-bottom:20px;display:flex;align-items:center;gap:10px}}
-.agents-grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(500px,1fr));gap:24px}}
-.agent-card{{background:var(--card-bg);border-radius:var(--radius);border:1px solid var(--border);overflow:hidden;transition:transform 0.3s,box-shadow 0.3s}}
-.agent-card:hover{{transform:translateY(-6px);box-shadow:var(--shadow)}}
-.card-header{{display:flex;align-items:center;gap:14px;padding:18px 20px;background:linear-gradient(135deg,var(--bg3),transparent);border-bottom:1px solid var(--border);position:relative}}
-.agent-icon{{font-size:2.2rem}}.agent-title{{flex:1;min-width:0}}
-.agent-title h3{{font-size:1.1rem;font-weight:700}}
-.agent-file{{font-size:0.75rem;color:var(--text2);font-family:'JetBrains Mono',monospace;word-break:break-all;display:block}}
-.agent-shape{{width:60px;height:60px;flex-shrink:0;clip-path:polygon(50% 0%,100% 25%,100% 75%,50% 100%,0% 75%,0% 25%);opacity:0.15}}
-.shape-0{{background:linear-gradient(135deg,#00d4aa,#00b894)}}.shape-1{{background:linear-gradient(135deg,#6c5ce7,#a29bfe)}}.shape-2{{background:linear-gradient(135deg,#fd79a8,#e84393)}}.shape-3{{background:linear-gradient(135deg,#fdcb6e,#f39c12)}}.shape-4{{background:linear-gradient(135deg,#74b9ff,#0984e3)}}.shape-5{{background:linear-gradient(135deg,#e17055,#d63031)}}
-.card-body{{padding:20px}}
-.info-grid{{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:14px}}
-.info-label{{font-size:0.8rem;color:var(--text2);display:block;margin-bottom:4px}}.info-value{{font-size:0.9rem}}
-.badge{{display:inline-block;padding:2px 10px;border-radius:12px;font-size:0.75rem;font-weight:500;margin:2px}}
-.badge-provider{{background:rgba(108,92,231,0.25);color:#a29bfe;border:1px solid rgba(108,92,231,0.3)}}
-.badge-model{{background:rgba(0,212,170,0.2);color:#00d4aa;border:1px solid rgba(0,212,170,0.3)}}
-.area-tag{{display:inline-block;padding:2px 12px;border-radius:12px;font-size:0.8rem;font-weight:600}}
-.area-code{{background:rgba(0,184,148,0.2);color:#00b894}}.area-content{{background:rgba(253,203,110,0.2);color:#fdcb6e}}.area-data{{background:rgba(108,92,231,0.2);color:#a29bfe}}.area-customer{{background:rgba(253,121,168,0.2);color:#fd79a8}}.area-research{{background:rgba(116,185,255,0.2);color:#74b9ff}}.area-finance{{background:rgba(248,165,194,0.2);color:#f8a5c2}}.area-healthcare{{background:rgba(225,112,85,0.2);color:#e17055}}.area-education{{background:rgba(129,236,236,0.2);color:#81ecec}}.area-automation{{background:rgba(255,234,167,0.2);color:#ffeaa7}}.area-multimedia{{background:rgba(162,155,254,0.2);color:#a29bfe}}.area-general{{background:rgba(223,230,233,0.2);color:#dfe6e9}}
-.description-box{{background:var(--bg3);border-radius:10px;padding:12px 14px;margin-bottom:14px;border-left:3px solid var(--accent1)}}
-.desc-label{{font-size:0.8rem;color:var(--text2);display:block;margin-bottom:4px}}.description-box p{{font-size:0.88rem;line-height:1.5;color:var(--text)}}
-.quality-bar-container{{display:flex;align-items:center;gap:10px;margin-bottom:16px}}
-.quality-label{{font-size:0.8rem;color:var(--text2);width:60px}}
-.quality-bar{{flex:1;height:8px;background:var(--bg);border-radius:4px;overflow:hidden}}
-.quality-fill{{height:100%;border-radius:4px;transition:width 1.5s ease}}
-.quality-text{{font-size:0.8rem;font-weight:600;width:40px;text-align:right}}
-.metrics-container{{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:10px}}
-.metric-card{{background:var(--bg3);border-radius:12px;padding:12px;text-align:center}}
-.metric-ring{{position:relative;width:120px;height:65px;margin:0 auto 6px;overflow:hidden}}
-.metric-center{{position:absolute;bottom:0;left:50%;transform:translateX(-50%);text-align:center}}
-.metric-num{{display:block;font-size:1.1rem;font-weight:800}}
-.metric-label{{font-size:0.6rem;color:var(--text2);text-transform:uppercase;letter-spacing:1px}}
-.metric-detail{{margin-top:4px}}
-.meter-bar{{display:block;height:5px;background:var(--bg);border-radius:3px;overflow:hidden}}
-.meter-fill{{display:block;height:100%;border-radius:3px;transition:width 1.5s ease}}
-.meter-text{{font-size:0.68rem;color:var(--text2);margin-top:2px;display:block}}
-.request-bars{{display:flex;gap:3px;height:18px;margin-bottom:3px}}
-.req-bar{{display:flex;align-items:center;justify-content:center;font-size:0.6rem;border-radius:3px;color:#000;font-weight:600;padding:0 3px;white-space:nowrap}}
-.req-success{{background:#00b894}}.req-fail{{background:#e17055}}
-.fail-section{{margin-top:12px;padding:10px 12px;background:rgba(225,112,85,0.08);border:1px solid rgba(225,112,85,0.25);border-radius:10px}}
-.fail-title{{font-weight:600;color:#e17055;font-size:0.85rem}}
-.fail-list{{margin:6px 0 0 16px;font-size:0.82rem;color:var(--text2)}}
-.fail-list li{{margin-bottom:2px}}
-.quality-tag{{display:inline-block;padding:2px 10px;border-radius:10px;font-size:0.7rem;font-weight:600}}
-.quality-high{{background:rgba(0,184,148,0.2);color:#00b894}}.quality-med{{background:rgba(253,203,110,0.2);color:#fdcb6e}}.quality-low{{background:rgba(225,112,85,0.2);color:#e17055}}
-.footer{{text-align:center;padding:30px;color:var(--text2);font-size:0.85rem;border-top:1px solid var(--border);margin-top:40px}}
-@media(max-width:900px){{.charts-row,.agents-grid,.metrics-container{{grid-template-columns:1fr}}}}
-@media(max-width:600px){{.header h1{{font-size:2rem}}.summary-row{{grid-template-columns:repeat(2,1fr)}}.info-grid{{grid-template-columns:1fr}}}}
-</style></head>
-<body>
-<div class="bg-particles"><span></span><span></span><span></span><span></span></div>
-<header class="header">
-<h1>🤖 Agent Monitor Dashboard</h1>
-<p class="subtitle">AI Agent Discovery &amp; Code Quality Analysis</p>
-<div class="scan-info">
-<div class="stat-bubble"><span>📂</span><span>Agents: <strong class="num">{ta}</strong></span></div>
-<div class="stat-bubble"><span>📊</span><span>Areas: <strong class="num">{len(ac)}</strong></span></div>
-<div class="stat-bubble"><span>✅</span><span>Avg Quality: <strong class="num">{aq}</strong></span></div>
-</div>
-<div class="scan-path">📁 {root_path}</div>
-</header>
-<main class="dashboard">
-<div class="summary-row">
-<div class="summary-card sc-0"><div class="shape-bg"><svg viewBox="0 0 100 100"><polygon points="50,0 100,25 100,75 50,100 0,75 0,25" fill="#00d4aa"/></svg></div><div class="s-icon">🤖</div><div class="s-value">{ta}</div><div class="s-label">AI Agents Found</div></div>
-<div class="summary-card sc-1"><div class="shape-bg"><svg viewBox="0 0 100 100"><polygon points="50,0 100,38 81,100 19,100 0,38" fill="#6c5ce7"/></svg></div><div class="s-icon">🔤</div><div class="s-value">{tt:,}</div><div class="s-label">Total Tokens</div></div>
-<div class="summary-card sc-2"><div class="shape-bg"><svg viewBox="0 0 100 100"><polygon points="30,0 70,0 100,30 100,70 70,100 30,100 0,70 0,30" fill="#fd79a8"/></svg></div><div class="s-icon">📨</div><div class="s-value">{tac}</div><div class="s-label">API Calls Found</div></div>
-<div class="summary-card sc-3"><div class="shape-bg"><svg viewBox="0 0 100 100"><circle cx="50" cy="50" r="45" fill="#fdcb6e"/></svg></div><div class="s-icon">📝</div><div class="s-value">{tlines:,}</div><div class="s-label">Lines of Code</div></div>
-<div class="summary-card sc-4"><div class="shape-bg"><svg viewBox="0 0 100 100"><polygon points="50,0 100,25 100,75 50,100 0,75 0,25" fill="#74b9ff"/></svg></div><div class="s-icon">⚡</div><div class="s-value">{terr}</div><div class="s-label">Code Issues</div></div>
-<div class="summary-card sc-5"><div class="shape-bg"><svg viewBox="0 0 100 100"><polygon points="50,0 100,38 81,100 19,100 0,38" fill="#e17055"/></svg></div><div class="s-icon">📈</div><div class="s-value">{avs}%</div><div class="s-label">Est. Success</div></div>
-</div>
-<div class="charts-row">
-<div class="chart-card"><h3>📊 Agents by Area</h3><div class="area-chart">{area_chart}</div><div style="margin-top:16px;display:flex;gap:12px;flex-wrap:wrap"><span class="quality-tag quality-high">● High ({hq})</span><span class="quality-tag quality-med">● Medium ({mq})</span><span class="quality-tag quality-low">● Low ({lq})</span></div></div>
-<div class="chart-card"><h3>🔌 Providers &amp; Models</h3><div class="prov-list">{prov_html}</div><h3 style="margin-top:16px">🧠 Models</h3><div class="model-cloud">{model_html}</div></div>
-</div>
-<div class="agents-section"><h2><span>📋 Agent Inventory</span> <span style="font-size:0.9rem;color:var(--text2);font-weight:400">({ta} agents)</span></h2><div class="agents-grid">{cards}</div></div>
-</main>
-<footer class="footer"><p>🔍 Agent Monitor · Generated {now} · Path: {root_path}</p></footer>
-<script>document.addEventListener('DOMContentLoaded',()=>{{document.querySelectorAll('.meter-fill,.area-fill,.quality-fill').forEach(el=>{{const w=el.style.width;el.style.width='0%';setTimeout(()=>{{el.style.width=w}},200)}})}})</script>
-</body>
-</html>'''
-
-
-# ======================================================================
-#  PUBLIC API — called from app.py
-# ======================================================================
-
-def run_scan():
-    """Run a scan and cache the results (thread-safe)."""
-    global _cached_html, _cached_json, _cached_time
-    with _lock:
-        scan_path = Path(SCAN_PATH).expanduser().resolve()
-        if not scan_path.exists():
-            logger.warning(f"Path not found: {scan_path}")
-            if AUTO_CREATE:
-                try:
-                    scan_path = create_sample_agents(scan_path)
-                except Exception as e:
-                    _cached_html = f"<html><body><h1>❌ Error</h1><p>{e}</p></body></html>"
-                    _cached_json = json.dumps({"error": str(e), "agents_found": 0})
-                    return
-            else:
-                _cached_html = f"<html><body><h1>❌ Path Not Found</h1><p>SCAN_PATH={scan_path}</p></body></html>"
-                _cached_json = json.dumps({"error": f"Path not found: {scan_path}", "agents_found": 0})
-                return
-
-        agents = scan_folder(scan_path)
-        if not agents and AUTO_CREATE:
-            try:
-                create_sample_agents(scan_path)
-                agents = scan_folder(scan_path) or []
-            except Exception:
+                for fn in os.listdir(d):
+                    fp = os.path.join(d, fn)
+                    if not os.path.isfile(fp) or os.path.splitext(fn)[1].lower() not in self.EXTS:
+                        continue
+                    if any(k in fn.lower() for k in [self.name.lower(), "log", "usage", "request"]):
+                        found.append(fp)
+            except PermissionError:
                 pass
+        return list(set(found))
 
-        _cached_html = generate_dashboard_html(agents or [], str(scan_path))
+    def _read(self, path, r):
+        try:
+            sz = os.path.getsize(path)
+            if sz == 0 or sz > 20 * 1024 * 1024:
+                return
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                raw = f.read()
+        except Exception:
+            return
+        if path.endswith(".jsonl"):
+            for line in raw.splitlines():
+                line = line.strip()
+                if line:
+                    try:
+                        self._jentry(json.loads(line), r)
+                    except Exception:
+                        pass
+        elif path.endswith(".json"):
+            try:
+                d = json.loads(raw)
+                for i in (d if isinstance(d, list) else [d]):
+                    if isinstance(i, dict):
+                        self._jentry(i, r)
+            except Exception:
+                self._tlines(raw, r)
+        else:
+            self._tlines(raw, r)
+        ts = re.findall(r'(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2})', raw)
+        if ts:
+            r["last_t"] = ts[-1]
 
-        summary = {
-            "status": "ok",
-            "scan_path": str(scan_path),
-            "last_scan": datetime.now().isoformat(),
-            "agents_found": len(agents),
-            "total_tokens": sum(a["estimated_tokens"] for a in agents) if agents else 0,
-            "total_api_calls": sum(a["api_calls_detected"] for a in agents) if agents else 0,
-            "total_lines": sum(a["lines_of_code"] for a in agents) if agents else 0,
-            "average_quality": round(sum(a["quality_score"] for a in agents) / max(len(agents), 1), 1) if agents else 0,
-            "agents": [
-                {"name": a["agent_name"], "file": a["relative_path"],
-                 "provider": a["providers"][0] if a["providers"] else "Unknown",
-                 "model": a["models"][0] if a["models"] else "Unknown",
-                 "area": a["area"], "quality": a["quality_score"],
-                 "lines": a["lines_of_code"], "api_calls": a["api_calls_detected"]}
-                for a in agents
-            ] if agents else []
-        }
-        _cached_json = json.dumps(summary, indent=2)
-        _cached_time = datetime.now().isoformat()
-        logger.info(f"Scan complete — {len(agents)} agent(s)")
+    def _jentry(self, e, r):
+        u = e.get("usage", {})
+        if isinstance(u, dict):
+            r["tokens"] += u.get("total_tokens", 0) or 0
+        st = e.get("status") or e.get("status_code")
+        if st is not None:
+            s = str(st)
+            if s in ("200", "success", "ok"):
+                r["ok"] += 1; r["total"] += 1
+            elif s in ("error", "failed") or (isinstance(st, int) and st >= 400):
+                r["fail"] += 1; r["total"] += 1
+                err = e.get("error") or e.get("message") or f"HTTP {st}"
+                if err:
+                    k = str(err)[:80]
+                    r["failures"][k] = r["failures"].get(k, 0) + 1
+
+    def _tlines(self, raw, r):
+        for line in raw.splitlines():
+            m = re.search(r'"total_tokens":\s*(\d+)', line)
+            if m:
+                r["tokens"] += int(m.group(1)); continue
+            if any(re.search(p, line, re.I) for p in [r'"status":\s*200', r'status_code=200']):
+                r["ok"] += 1; r["total"] += 1; continue
+            if any(re.search(p, line, re.I) for p in [r'"status":\s*[45]\d\d', r'Error|ERROR|Exception|FAILED']):
+                r["fail"] += 1; r["total"] += 1
+                m2 = re.search(r'(Error|Exception|FAILED)[:\s]+(.{5,80})', line, re.I)
+                if m2:
+                    k = m2.group(2).strip()[:80]
+                    r["failures"][k] = r["failures"].get(k, 0) + 1
 
 
-def get_cached_html():
-    """Return cached HTML dashboard."""
-    return _cached_html
+class Analyzer:
+    def __init__(self, path, content):
+        self.path = path
+        self.content = content
+
+    def description(self):
+        for pat in (r'^"""(.*?)"""', r"^'''(.*?)'''"):
+            m = re.search(pat, self.content, re.DOTALL)
+            if m:
+                txt = m.group(1).strip()
+                lines = [l.strip() for l in txt.split("\n") if l.strip()]
+                return " ".join(lines[:3])[:200]
+        for line in self.content.split("\n")[:10]:
+            s = line.strip()
+            if s.startswith("#") and not s.startswith("#!"):
+                c = s.lstrip("# ").strip()
+                if len(c) > 8:
+                    return c[:200]
+        return os.path.splitext(os.path.basename(self.path))[0].replace("_", " ").title()
+
+    def providers(self):
+        found = []
+        for name, info in AI_PROVIDERS.items():
+            for pat in info["imports"]:
+                if re.search(pat, self.content):
+                    found.append(name); break
+        for p in _find_env_providers(self.content):
+            label = "Google Gemini" if "gemini" in p.lower() else p.capitalize()
+            if label not in found:
+                found.append(label)
+        return found
+
+    def models(self):
+        found = []
+        for info in AI_PROVIDERS.values():
+            for m in info.get("models", []):
+                if re.search(r'["\']' + re.escape(m) + r'["\']', self.content) and m not in found:
+                    found.append(m)
+        for m in _find_env_models(self.content):
+            if m not in found:
+                found.append(m)
+        return found
+
+    def frameworks(self):
+        found = []
+        for fw, pats in AI_FRAMEWORKS.items():
+            if any(re.search(p, self.content) for p in pats):
+                found.append(fw)
+        return found
+
+    def areas(self):
+        found = []
+        for area, pats in AI_AREAS.items():
+            if sum(1 for p in pats if re.search(p, self.content, re.I)) >= 2:
+                found.append(area)
+        return found
+
+    def api_calls(self):
+        return sum(len(re.findall(p, self.content)) for p in [r'\.create\s*\(', r'\.generate\s*\(', r'\.chat\s*\(', r'generate_content\s*\('])
 
 
-def get_cached_json():
-    """Return cached JSON summary."""
-    return _cached_json
+class Scanner:
+    EXTS = {".py", ".js", ".ts"}
+    SKIP = {"__pycache__", "node_modules", ".git", "venv", "env", ".venv", "dist", "build",
+            ".ebextensions", ".elasticbeanstalk", "site-packages", ".platform"}
+    SKIP_FILES = {THIS_FILE, "agent_monitor.py"}
+
+    def __init__(self, root):
+        self.root = os.path.abspath(root)
+        self.agents = []
+        self.nf = self.nd = 0
+
+    def scan(self):
+        t0 = time.time()
+        start = datetime.now().isoformat()
+        tree = self._tree(self.root)
+        self._walk(self.root)
+        ms = round((time.time() - t0) * 1000, 2)
+        for a in self.agents:
+            self._mark(tree, a["script_path"])
+        projects = self._group()
+        return {"scan_root": self.root, "scan_stats": {"total_files_scanned": self.nf, "total_folders_scanned": self.nd,
+                "total_agents_found": len(self.agents), "scan_start": start, "scan_end": datetime.now().isoformat(),
+                "scan_duration_ms": ms}, "folder_tree": tree, "agents": self.agents, "projects": projects,
+                "summary": self._summary(projects)}
+
+    def _tree(self, path, depth=0):
+        node = {"name": os.path.basename(path) or path, "path": path, "type": "folder", "depth": depth, "children": [], "agent_count": 0}
+        self.nd += 1
+        try:
+            for e in sorted(os.listdir(path)):
+                fp = os.path.join(path, e)
+                if os.path.isdir(fp) and not e.startswith(".") and e not in self.SKIP:
+                    node["children"].append(self._tree(fp, depth + 1))
+                elif os.path.isfile(fp) and os.path.splitext(e)[1].lower() in self.EXTS:
+                    node["children"].append({"name": e, "path": fp, "type": "file", "depth": depth + 1})
+        except PermissionError:
+            pass
+        return node
+
+    def _mark(self, node, fpath):
+        if node["type"] == "file" and node["path"] == fpath:
+            node["is_agent"] = True
+        elif node["type"] == "folder" and fpath.startswith(node["path"]):
+            node["agent_count"] += 1
+            for c in node.get("children", []):
+                self._mark(c, fpath)
+
+    def _walk(self, path):
+        try:
+            for e in os.listdir(path):
+                fp = os.path.join(path, e)
+                if os.path.isdir(fp) and not e.startswith(".") and e not in self.SKIP:
+                    self._walk(fp)
+                elif os.path.isfile(fp) and os.path.splitext(e)[1].lower() in self.EXTS:
+                    self.nf += 1
+                    if e not in self.SKIP_FILES:
+                        self._check(fp)
+        except PermissionError:
+            pass
+
+    def _check(self, fp):
+        try:
+            with open(fp, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read()
+        except Exception:
+            return
+        if len(content.strip()) < 30:
+            return
+        az = Analyzer(fp, content)
+        provs = az.providers()
+        if not provs:
+            return
+        fws = az.frameworks()
+        models = az.models()
+        areas = az.areas()
+        lr = LogReader(fp)
+        ld = lr.parse()
+        total, ok, fail, tokens = ld["total"], ld["ok"], ld["fail"], ld["tokens"]
+        has_logs = ld["source"] == "log_files"
+        self.agents.append({
+            "id": hashlib.md5(fp.encode()).hexdigest()[:10], "script_name": os.path.basename(fp),
+            "script_path": fp, "relative_path": os.path.relpath(fp, self.root),
+            "folder": os.path.dirname(os.path.relpath(fp, self.root)) or ".",
+            "providers": provs, "models": models or ["Not specified"], "frameworks": fws or ["Direct API"],
+            "areas": areas or ["General"], "description": az.description(),
+            "lines_of_code": content.count("\n") + 1, "api_call_sites": az.api_calls(),
+            "last_modified": datetime.fromtimestamp(os.path.getmtime(fp)).strftime("%Y-%m-%d %H:%M"),
+            "usage": {"data_source": ld["source"], "log_files": ld["log_files"],
+                      "total_requests": total if has_logs else None, "successful": ok if has_logs else None,
+                      "failed": fail if has_logs else None,
+                      "success_rate": round(ok / total * 100, 1) if total > 0 else (0.0 if has_logs and total == 0 else None),
+                      "tokens_used": tokens if tokens > 0 else None, "failure_reasons": ld["failures"],
+                      "avg_rt_ms": ld["avg_rt"], "last_request": ld["last_t"]}})
+
+    def _group(self):
+        pmap = {}
+        for a in self.agents:
+            parts = a["folder"].replace("\\", "/").split("/")
+            top = parts[0] if parts and parts[0] not in (".", "") else "Root"
+            pmap.setdefault(top, []).append(a)
+        return [{"name": nm, "count": len(ag),
+                 "agents": [{"name": a["script_name"], "providers": a["providers"], "models": a["models"][:5], "areas": a["areas"]} for a in ag],
+                 "providers": list({p for a in ag for p in a["providers"]}),
+                 "total_req": sum(a["usage"]["total_requests"] or 0 for a in ag) or None,
+                 "total_fail": sum(a["usage"]["failed"] or 0 for a in ag)} for nm, ag in pmap.items()]
+
+    def _summary(self, projects):
+        pc, ac, mc, fr = {}, {}, {}, {}
+        tr = ts = tf = tt = 0
+        for a in self.agents:
+            for p in a["providers"]: pc[p] = pc.get(p, 0) + 1
+            for ar in a["areas"]: ac[ar] = ac.get(ar, 0) + 1
+            for m in a["models"]: mc[m] = mc.get(m, 0) + 1
+            u = a["usage"]
+            tr += u["total_requests"] or 0; ts += u["successful"] or 0; tf += u["failed"] or 0; tt += u["tokens_used"] or 0
+            for r, c in u["failure_reasons"].items(): fr[r] = fr.get(r, 0) + c
+        return {"total_agents": len(self.agents), "total_projects": len(projects), "providers": pc, "areas": ac, "models": mc,
+                "usage": {"total_requests": tr or None, "total_ok": ts or None, "total_fail": tf,
+                          "success_rate": round(ts / tr * 100, 1) if tr > 0 else None, "total_tokens": tt or None, "failures": fr}}
 
 
-def get_cached_summary_dict():
-    """Return cached summary as Python dict."""
-    if _cached_json and _cached_json != "{}":
-        return json.loads(_cached_json)
-    return {"status": "pending", "agents_found": 0}
+def get_data(force=False):
+    with _cache["lock"]:
+        if _cache["data"] is None or force:
+            _cache["data"] = Scanner(SCAN_ROOT).scan()
+        return _cache["data"]
 
 
-def start_background_scanner(interval_secs=None):
-    """Run initial scan in background thread, then periodically refresh."""
-    if interval_secs is None:
-        interval_secs = REFRESH_SECS
-
-    def _loop():
-        run_scan()
-        if interval_secs > 0:
-            threading.Timer(interval_secs, _loop).start()
-
-    thread = threading.Thread(target=_loop, daemon=True)
-    thread.start()
-    logger.info(f"Background scanner started (refresh every {interval_secs}s)")
-    return thread
+@scanner_bp.get("/scanner")
+def page():
+    return Response(HTML, mimetype="text/html")
 
 
-# ======================================================================
-#  If run directly: scan and print summary
-# ======================================================================
+@scanner_bp.get("/scanner/api/scan")
+def api_scan():
+    try:
+        return jsonify(get_data())
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@scanner_bp.route("/scanner/api/rescan", methods=["GET", "POST"])
+def api_rescan():
+    try:
+        return jsonify(get_data(force=True))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>AI Agent Scanner — SentinelOps</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800;900&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+<style>
+:root{--bg:#0b0b1e;--c:#161638;--t:#e4e4ff;--t2:#8888bb;--t3:#5555aa;--cy:#00e5ff;--mg:#ff00ff;--gn:#00ff88;--yl:#ffe600;--og:#ff8800;--rd:#ff2244;--bl:#3388ff;--pu:#9944ff;--br:rgba(255,255,255,.07);--r:14px}
+*{box-sizing:border-box;margin:0;padding:0}body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--t);min-height:100vh}
+::-webkit-scrollbar{width:5px}::-webkit-scrollbar-thumb{background:linear-gradient(var(--cy),var(--pu));border-radius:3px}
+.bg{position:fixed;inset:0;z-index:-1;pointer-events:none}.orb{position:absolute;border-radius:50%;filter:blur(80px);animation:f 20s ease-in-out infinite}
+.orb:nth-child(1){width:420px;height:420px;top:-80px;left:-80px;background:rgba(0,229,255,.06)}.orb:nth-child(2){width:360px;height:360px;top:45%;right:-80px;background:rgba(255,0,255,.04);animation-delay:-7s}
+@keyframes f{0%,100%{transform:translate(0,0)}50%{transform:translate(35px,-35px)}}
+header{background:rgba(22,22,56,.95);backdrop-filter:blur(16px);border-bottom:1px solid var(--br);padding:12px 24px;display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:100;flex-wrap:wrap;gap:8px}
+.logo{width:40px;height:40px;border-radius:10px;font-size:18px;background:linear-gradient(135deg,var(--cy),var(--pu));display:flex;align-items:center;justify-content:center;animation:gw 3s infinite}
+@keyframes gw{0%,100%{box-shadow:0 0 12px rgba(0,229,255,.25)}50%{box-shadow:0 0 24px rgba(0,229,255,.45)}}
+.brd{display:flex;align-items:center;gap:10px}.brd h1{font-size:16px;font-weight:800;background:linear-gradient(135deg,var(--cy),var(--pu));-webkit-background-clip:text;-webkit-text-fill-color:transparent}.brd small{font-size:9px;color:var(--t3);display:block}
+.hr{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
+.btn{padding:7px 14px;border:none;border-radius:8px;font-size:10px;font-weight:600;cursor:pointer;display:inline-flex;align-items:center;gap:5px;font-family:Inter;transition:all .2s}
+.bp{background:linear-gradient(135deg,var(--cy),var(--pu));color:#000}.bp:hover{transform:translateY(-1px);box-shadow:0 3px 12px rgba(0,229,255,.3)}
+.bs2{background:rgba(255,255,255,.06);color:var(--t);border:1px solid var(--br)}.bk{color:var(--og);border:1px solid rgba(255,136,0,.3);background:rgba(255,136,0,.1);text-decoration:none}
+.mn{padding:20px 24px;max-width:1700px;margin:0 auto}
+.row{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;margin-bottom:18px}
+.st{background:var(--c);border:1px solid var(--br);border-radius:var(--r);padding:14px;position:relative;overflow:hidden;transition:all .2s}.st:hover{transform:translateY(-2px);border-color:rgba(0,229,255,.25)}
+.st-i{width:32px;height:32px;border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:14px;margin-bottom:6px}
+.st-v{font-size:20px;font-weight:800;font-family:'JetBrains Mono'}.st-l{font-size:8px;color:var(--t3);text-transform:uppercase;letter-spacing:1px;margin-top:2px}.st-b{position:absolute;bottom:0;left:0;height:3px;width:100%}
+.tabs{display:flex;gap:2px;margin-bottom:16px;background:rgba(255,255,255,.02);border-radius:10px;padding:3px;flex-wrap:wrap}
+.tab{padding:7px 13px;border-radius:8px;cursor:pointer;font-size:10px;font-weight:600;color:var(--t3);display:flex;align-items:center;gap:4px;transition:all .2s}.tab:hover{color:var(--t);background:rgba(255,255,255,.04)}.tab.on{background:linear-gradient(135deg,var(--cy),var(--pu));color:#000}
+.pn{display:none;animation:fi .25s ease}.pn.on{display:block}@keyframes fi{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}
+.g2{display:grid;grid-template-columns:1fr 1fr;gap:12px}.g3{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:12px}.s2{grid-column:span 2}
+.cd{background:var(--c);border:1px solid var(--br);border-radius:var(--r);padding:16px;transition:border-color .2s}.cd:hover{border-color:rgba(0,229,255,.12)}
+.cd h3{font-size:12px;font-weight:700;margin-bottom:10px;display:flex;align-items:center;gap:6px}
+.sg{display:flex;flex-wrap:wrap;gap:8px;justify-content:center;padding:4px 0}
+.hex{clip-path:polygon(50% 0%,100% 25%,100% 75%,50% 100%,0% 75%,0% 25%);display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;transition:transform .2s;cursor:default}.hex:hover{transform:scale(1.08)}
+.pen{clip-path:polygon(50% 0%,100% 38%,82% 100%,18% 100%,0% 38%);display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;transition:transform .2s}.pen:hover{transform:scale(1.08) rotate(3deg)}
+.oct{clip-path:polygon(30% 0%,70% 0%,100% 30%,100% 70%,70% 100%,30% 100%,0% 70%,0% 30%);display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;transition:transform .2s}.oct:hover{transform:scale(1.08) rotate(-3deg)}
+.ac{background:var(--c);border:1px solid var(--br);border-radius:var(--r);padding:16px;position:relative;overflow:hidden;transition:all .2s}.ac:hover{transform:translateY(-2px);box-shadow:0 4px 16px rgba(0,0,0,.3);border-color:rgba(0,229,255,.2)}
+.ab{position:absolute;top:0;left:0;right:0;height:3px}
+.ah{display:flex;gap:10px;margin-bottom:10px;align-items:flex-start}.aico{width:38px;height:38px;border-radius:10px;font-size:17px;display:flex;align-items:center;justify-content:center;flex-shrink:0}
+.an{font-size:13px;font-weight:700;word-break:break-all;margin-bottom:2px}.ap{font-size:8px;color:var(--t3);font-family:'JetBrains Mono'}
+.isec{margin:8px 0;padding:8px 0;border-top:1px solid var(--br)}
+.ir{display:flex;gap:6px;padding:4px 0;font-size:10px;align-items:flex-start}.ii{width:14px;color:var(--cy);font-size:9px;flex-shrink:0;margin-top:2px;text-align:center}.il{color:var(--t3);min-width:58px;flex-shrink:0;font-weight:500}.iv{color:var(--t);flex:1;word-break:break-word}
+.tg{display:inline-block;padding:2px 7px;border-radius:12px;font-size:8px;font-weight:600;margin:1px;border:1px solid}
+.tp{background:rgba(0,229,255,.1);color:var(--cy);border-color:rgba(0,229,255,.25)}.tm{background:rgba(153,68,255,.1);color:var(--pu);border-color:rgba(153,68,255,.25)}
+.ta{background:rgba(0,255,136,.1);color:var(--gn);border-color:rgba(0,255,136,.25)}.tf{background:rgba(255,136,0,.1);color:var(--og);border-color:rgba(255,136,0,.25)}
+.desc{background:rgba(0,229,255,.04);border-left:3px solid var(--cy);border-radius:0 8px 8px 0;padding:8px 10px;margin:8px 0;font-size:9px;color:var(--t2);line-height:1.5;max-height:60px;overflow:hidden}
+.ugr{display:grid;grid-template-columns:repeat(3,1fr);gap:4px;margin-top:10px}.ucl{background:rgba(255,255,255,.03);border-radius:8px;padding:8px 4px;text-align:center}
+.uv{font-size:14px;font-weight:700;font-family:'JetBrains Mono'}.ul2{font-size:7px;color:var(--t3);text-transform:uppercase;margin-top:2px}
+.badge{display:inline-flex;padding:2px 6px;border-radius:10px;font-size:7px;font-weight:700;text-transform:uppercase;letter-spacing:.5px}
+.bok{background:rgba(0,255,136,.12);color:var(--gn);border:1px solid rgba(0,255,136,.25)}.bno{background:rgba(255,136,0,.12);color:var(--og);border:1px solid rgba(255,136,0,.25)}
+.pb{width:100%;height:6px;background:rgba(255,255,255,.05);border-radius:3px;overflow:hidden;margin:6px 0}.pf{height:100%;border-radius:3px;transition:width 1s ease}
+.fsec{margin-top:8px;padding-top:8px;border-top:1px solid var(--br)}.fttl{font-size:8px;color:var(--rd);font-weight:700;margin-bottom:4px}
+.fitm{font-size:8px;color:var(--t2);padding:2px 0;display:flex;align-items:flex-start;gap:4px}.fdot{width:5px;height:5px;border-radius:50%;background:var(--rd);flex-shrink:0;margin-top:3px}.fcnt{color:var(--rd);font-weight:700}
+.dt{width:100%;border-collapse:collapse}.dt th,.dt td{padding:8px 10px;text-align:left;border-bottom:1px solid var(--br);font-size:10px}
+.dt th{color:var(--t3);font-weight:600;text-transform:uppercase;font-size:8px}.dt tr:hover{background:rgba(255,255,255,.015)}
+.dot{width:5px;height:5px;border-radius:50%;display:inline-block;margin-right:3px}.dg{background:var(--gn)}.dr{background:var(--rd)}
+.trb{background:var(--c);border:1px solid var(--br);border-radius:var(--r);padding:14px;max-height:500px;overflow-y:auto}
+.tn{padding:2px 0;font-family:'JetBrains Mono';font-size:10px}.tdir{color:var(--yl);cursor:pointer}.tdir:hover{color:var(--og)}
+.tfil{color:var(--t2)}.tfil.ia{color:var(--gn);font-weight:600}.tkids{margin-left:16px}
+.tbdg{background:var(--cy);color:#000;font-size:6px;font-weight:700;padding:1px 5px;border-radius:6px;margin-left:4px}.tbdg.ag{background:var(--gn)}
+.gwr{display:flex;flex-wrap:wrap;justify-content:center;gap:14px;padding:6px 0}
+.gau{position:relative;width:110px;height:64px;overflow:hidden}.gauv{position:absolute;bottom:2px;left:50%;transform:translateX(-50%);font-size:14px;font-weight:800;font-family:'JetBrains Mono'}.gaul{position:absolute;bottom:-13px;left:50%;transform:translateX(-50%);font-size:7px;color:var(--t3);white-space:nowrap}
+.dnw{position:relative;display:inline-block}.dnc{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);text-align:center}
+.dnv{font-size:18px;font-weight:800;font-family:'JetBrains Mono'}.dnl{font-size:7px;color:var(--t3)}
+.lgd{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}.lgi{display:flex;align-items:center;gap:3px;font-size:8px}.lgdot{width:7px;height:7px;border-radius:2px}
+.em{text-align:center;padding:24px;color:var(--t3)}.em i{font-size:30px;display:block;margin-bottom:8px;opacity:.3}
+.ldr{position:fixed;inset:0;background:rgba(11,11,30,.97);display:flex;flex-direction:column;align-items:center;justify-content:center;z-index:9999}
+.spn{width:42px;height:42px;border:3px solid rgba(0,229,255,.15);border-top:3px solid var(--cy);border-radius:50%;animation:sp .8s linear infinite}@keyframes sp{to{transform:rotate(360deg)}}.lt{margin-top:10px;font-size:12px;color:var(--cy);font-weight:600}
+@media(max-width:900px){.g2{grid-template-columns:1fr}.s2{grid-column:span 1}.row{grid-template-columns:repeat(2,1fr)}}
+</style></head><body>
+<div class="bg"><div class="orb"></div><div class="orb"></div></div>
+<div class="ldr" id="ldr"><div class="spn"></div><div class="lt">Scanning for AI Agents…</div></div>
+<header><div class="brd"><div class="logo">🤖</div><div><h1>AI Agent Scanner</h1><small id="sub">SentinelOps</small></div></div>
+<div class="hr"><a href="/" class="btn bk"><i class="fas fa-arrow-left"></i> App</a>
+<button class="btn bs2" onclick="doExport()"><i class="fas fa-download"></i> Export</button>
+<button class="btn bp" onclick="doRescan()"><i class="fas fa-sync-alt" id="ri"></i> Rescan</button></div></header>
+<main class="mn" id="mn" style="display:none"><div class="row" id="srow"></div>
+<div class="tabs"><div class="tab on" onclick="sw(this,0)"><i class="fas fa-chart-pie"></i> Overview</div>
+<div class="tab" onclick="sw(this,1)"><i class="fas fa-robot"></i> Agents</div>
+<div class="tab" onclick="sw(this,2)"><i class="fas fa-cubes"></i> Projects</div>
+<div class="tab" onclick="sw(this,3)"><i class="fas fa-chart-bar"></i> Usage</div>
+<div class="tab" onclick="sw(this,4)"><i class="fas fa-exclamation-triangle"></i> Failures</div>
+<div class="tab" onclick="sw(this,5)"><i class="fas fa-folder-tree"></i> Tree</div></div>
+<div class="pn on" id="p0"></div><div class="pn" id="p1"></div><div class="pn" id="p2"></div>
+<div class="pn" id="p3"></div><div class="pn" id="p4"></div><div class="pn" id="p5"></div></main>
+<script>
+const C=['#00e5ff','#ff00ff','#00ff88','#ffe600','#ff8800','#ff2244','#3388ff','#9944ff','#ff66aa','#00ccaa'];
+const G=['linear-gradient(135deg,#00e5ff,#9944ff)','linear-gradient(135deg,#ff00ff,#ff8800)','linear-gradient(135deg,#00ff88,#00e5ff)','linear-gradient(135deg,#ffe600,#ff8800)','linear-gradient(135deg,#ff2244,#ff00ff)','linear-gradient(135deg,#3388ff,#00e5ff)','linear-gradient(135deg,#9944ff,#ff66aa)','linear-gradient(135deg,#00ccaa,#00ff88)'];
+const I=['🤖','🧠','⚡','🔮','🎯','🚀','💡','🔬','📊','🎨','📧','💰','🔧','🌐','📝'];
+const PI={'OpenAI':'🟢','Anthropic':'🟠','Google Gemini':'🔵','Hugging Face':'🤗','Groq':'⚡','Ollama':'🦙','LangChain':'🦜','CrewAI':'👥','AutoGen':'🔄','gemini':'🔵'};
+const CLP=['polygon(50% 0%,100% 25%,100% 75%,50% 100%,0% 75%,0% 25%)','polygon(50% 0%,100% 38%,82% 100%,18% 100%,0% 38%)','polygon(30% 0%,70% 0%,100% 30%,100% 70%,70% 100%,30% 100%,0% 70%,0% 30%)'];
+let D;
+document.addEventListener('DOMContentLoaded',()=>ld('/scanner/api/scan'));
+
+async function ld(u){try{const r=await fetch(u);if(!r.ok)throw new Error('HTTP '+r.status);D=await r.json();if(D.error&&!D.agents)throw new Error(D.error);rn();}catch(e){document.getElementById('ldr').innerHTML='<div style="text-align:center;color:#ff2244;padding:24px"><i class="fas fa-exclamation-triangle" style="font-size:36px;display:block;margin-bottom:10px"></i><h2 style="font-size:16px">Scan Failed</h2><p style="color:#8888bb;font-size:11px;margin-top:6px">'+e.message+'</p><button class="btn bp" onclick="ld(\'/scanner/api/scan\')" style="margin-top:12px"><i class="fas fa-redo"></i> Retry</button></div>';}}
+
+async function doRescan(){document.getElementById('ri').style.animation='sp .4s linear infinite';document.getElementById('ldr').style.display='flex';document.getElementById('mn').style.display='none';await ld('/scanner/api/rescan');document.getElementById('ri').style.animation='';}
+function doExport(){const b=new Blob([JSON.stringify(D,null,2)],{type:'application/json'});const u=URL.createObjectURL(b);const a=document.createElement('a');a.href=u;a.download='agents_'+Date.now()+'.json';a.click();URL.revokeObjectURL(u);}
+function sw(el,n){document.querySelectorAll('.tab').forEach(t=>t.classList.remove('on'));document.querySelectorAll('.pn').forEach(p=>p.classList.remove('on'));el.classList.add('on');document.getElementById('p'+n).classList.add('on');}
+
+function fm(n){if(n===null||n===undefined)return'—';if(typeof n==='string')return n;if(n>=1e6)return(n/1e6).toFixed(1)+'M';if(n>=1e3)return(n/1e3).toFixed(1)+'K';return String(n);}
+function fz(n){if(n===null||n===undefined)return'—';return fm(n);}
+function rc(r){if(r===null||r===undefined)return'var(--t3)';if(r>=90)return'#00ff88';if(r>=50)return'#ffe600';return'#ff2244';}
+
+function donut(data,sz){const e=Object.entries(data);const t=e.reduce((s,[,v])=>s+v,0);const cx=sz/2,cy=sz/2,r=sz*.35;if(!t)return'<svg width="'+sz+'" height="'+sz+'"><circle cx="'+cx+'" cy="'+cy+'" r="'+r+'" fill="none" stroke="rgba(255,255,255,.05)" stroke-width="'+sz*.12+'"/></svg>';const cc=2*Math.PI*r;let o=0,p='';e.forEach(([,v],i)=>{const d=(v/t)*cc;p+='<circle cx="'+cx+'" cy="'+cy+'" r="'+r+'" fill="none" stroke="'+C[i%C.length]+'" stroke-width="'+sz*.12+'" stroke-dasharray="'+d+' '+(cc-d)+'" stroke-dashoffset="'+(-o)+'" transform="rotate(-90 '+cx+' '+cy+')" style="transition:all .5s"/>';o+=d;});return'<svg width="'+sz+'" height="'+sz+'" viewBox="0 0 '+sz+' '+sz+'">'+p+'</svg>';}
+
+function mkIR(icon,l,v){return'<div class="ir"><span class="ii"><i class="fas fa-'+icon+'"></i></span><span class="il">'+l+'</span><span class="iv">'+v+'</span></div>';}
+function mkUC(v,c,l){return'<div class="ucl"><div class="uv" style="color:'+c+'">'+v+'</div><div class="ul2">'+l+'</div></div>';}
+
+function rn(){
+  document.getElementById('ldr').style.display='none';document.getElementById('mn').style.display='block';
+  const ss=D.scan_stats,sm=D.summary,ou=sm.usage;
+  document.getElementById('sub').textContent='SentinelOps • '+ss.total_agents_found+' agents • '+ss.scan_duration_ms+'ms • '+new Date(ss.scan_start).toLocaleString();
+
+  // STATS
+  const cards=[{i:'🤖',l:'Agents',v:sm.total_agents,c:'#00e5ff',g:G[0]},{i:'📂',l:'Folders',v:ss.total_folders_scanned,c:'#ffe600',g:G[3]},{i:'📄',l:'Files',v:ss.total_files_scanned,c:'#9944ff',g:G[6]},{i:'🏢',l:'Providers',v:Object.keys(sm.providers).length,c:'#ff8800',g:G[1]},{i:'📡',l:'Requests',v:fz(ou.total_requests),c:'#3388ff',g:G[5]},{i:'✅',l:'Success',v:ou.success_rate!=null?ou.success_rate+'%':'—',c:'#00ff88',g:G[2]},{i:'🪙',l:'Tokens',v:fz(ou.total_tokens),c:'#ff66aa',g:G[6]},{i:'📦',l:'Projects',v:sm.total_projects,c:'#00ccaa',g:G[7]}];
+  document.getElementById('srow').innerHTML=cards.map(c=>'<div class="st"><div class="st-i" style="background:'+c.g+'">'+c.i+'</div><div class="st-v" style="color:'+c.c+'">'+c.v+'</div><div class="st-l">'+c.l+'</div><div class="st-b" style="background:'+c.g+'"></div></div>').join('');
+
+  // P0 OVERVIEW
+  let h='<div class="g2">';
+  h+='<div class="cd"><h3><i class="fas fa-building" style="color:var(--cy)"></i> AI Providers</h3><div class="sg">';
+  Object.entries(sm.providers).forEach(([n,c],i)=>{h+='<div class="hex" style="background:'+G[i%G.length]+';width:95px;height:110px"><div style="font-size:15px">'+(PI[n]||'🔹')+'</div><div style="font-size:18px;font-weight:800;font-family:JetBrains Mono">'+c+'</div><div style="font-size:7px;padding:0 5px;margin-top:2px">'+n+'</div></div>';});
+  if(!Object.keys(sm.providers).length)h+='<div class="em"><i class="fas fa-building"></i><p>No providers</p></div>';
+  h+='</div></div>';
+  h+='<div class="cd"><h3><i class="fas fa-bullseye" style="color:var(--mg)"></i> Working Areas</h3><div class="sg">';
+  const SZ=['95px','85px','80px'];Object.entries(sm.areas).forEach(([a,c],i)=>{const sz=SZ[i%3];h+='<div style="width:'+sz+';height:'+sz+';clip-path:'+CLP[i%3]+';background:'+G[i%G.length]+';display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;transition:transform .2s;cursor:default" onmouseover="this.style.transform=\'scale(1.1)\'" onmouseout="this.style.transform=\'scale(1)\'"><div style="font-size:15px;font-weight:800">'+c+'</div><div style="font-size:6px;padding:0 3px">'+a+'</div></div>';});
+  if(!Object.keys(sm.areas).length)h+='<div class="em"><p>No areas</p></div>';h+='</div></div>';
+  h+='<div class="cd s2"><h3><i class="fas fa-gauge-high" style="color:var(--gn)"></i> Performance</h3><div class="gwr">';
+  [{l:'Success Rate',v:ou.success_rate,x:100,c:'#00ff88',s:'%'},{l:'Agents',v:sm.total_agents,x:Math.max(15,sm.total_agents),c:'#9944ff',s:''},{l:'Providers',v:Object.keys(sm.providers).length,x:12,c:'#00e5ff',s:''}].forEach(g=>{const p=g.v!=null?Math.min(g.v/g.x*100,100):0;const cc=Math.PI*46;const off=cc-p/100*cc;h+='<div class="gau"><svg width="110" height="64" viewBox="0 0 110 64"><path d="M 9 56 A 46 46 0 0 1 101 56" fill="none" stroke="rgba(255,255,255,.05)" stroke-width="7" stroke-linecap="round"/><path d="M 9 56 A 46 46 0 0 1 101 56" fill="none" stroke="'+g.c+'" stroke-width="7" stroke-linecap="round" stroke-dasharray="'+cc+'" stroke-dashoffset="'+off+'" style="transition:stroke-dashoffset 1.2s ease"/></svg><div class="gauv" style="color:'+g.c+'">'+(g.v!=null?g.v+g.s:'—')+'</div><div class="gaul">'+g.l+'</div></div>';});
+  h+='</div></div>';
+  const me=Object.entries(sm.models);h+='<div class="cd"><h3><i class="fas fa-brain" style="color:var(--yl)"></i> Models</h3><div style="display:flex;align-items:center;gap:16px;flex-wrap:wrap;justify-content:center"><div class="dnw">'+donut(sm.models,130)+'<div class="dnc"><div class="dnv">'+me.length+'</div><div class="dnl">Models</div></div></div><div class="lgd">'+me.slice(0,10).map(([n,c],i)=>'<div class="lgi"><div class="lgdot" style="background:'+C[i%C.length]+'"></div>'+n+' ('+c+')</div>').join('')+'</div></div></div>';
+  h+='<div class="cd"><h3><i class="fas fa-exchange-alt" style="color:var(--bl)"></i> Requests</h3><div class="sg">';
+  h+='<div class="oct" style="width:95px;height:95px;background:linear-gradient(135deg,#00ff88,#00ccaa)"><i class="fas fa-check" style="font-size:13px"></i><div style="font-size:16px;font-weight:800;margin-top:2px">'+fz(ou.total_ok)+'</div><div style="font-size:6px">SUCCESS</div></div>';
+  h+='<div class="oct" style="width:95px;height:95px;background:linear-gradient(135deg,#ff2244,#ff00ff)"><i class="fas fa-times" style="font-size:13px"></i><div style="font-size:16px;font-weight:800;margin-top:2px">'+fz(ou.total_fail)+'</div><div style="font-size:6px">FAILED</div></div>';
+  h+='<div class="pen" style="width:95px;height:90px;background:linear-gradient(135deg,#3388ff,#00e5ff)"><i class="fas fa-paper-plane" style="font-size:13px"></i><div style="font-size:16px;font-weight:800;margin-top:2px">'+fz(ou.total_requests)+'</div><div style="font-size:6px">TOTAL</div></div>';
+  h+='</div></div></div>';
+  document.getElementById('p0').innerHTML=h;
+
+  // P1 AGENTS
+  if(!D.agents.length){document.getElementById('p1').innerHTML='<div class="cd"><div class="em"><i class="fas fa-robot"></i><p>No AI agents detected</p></div></div>';}else{
+  let a='<div class="g3">';D.agents.forEach((ag,i)=>{const g=G[i%G.length],ic=I[i%I.length],u=ag.usage,hl=u.data_source==='log_files';
+  a+='<div class="ac"><div class="ab" style="background:'+g+'"></div><div class="ah"><div class="aico" style="background:'+g+'">'+ic+'</div><div style="flex:1;min-width:0"><div class="an">'+ag.script_name+'</div><div class="ap">📁 '+ag.relative_path+'</div><div style="margin-top:3px"><span class="badge '+(hl?'bok':'bno')+'">'+(hl?'✅ Real Log Data':'⚠️ No Log Files')+'</span></div></div></div>';
+  a+='<div class="isec">'+mkIR('building','Provider',ag.providers.map(p=>'<span class="tg tp">'+(PI[p]||'🔹')+' '+p+'</span>').join(' ')||'—')+mkIR('brain','Model',ag.models.map(m=>'<span class="tg tm">'+m+'</span>').join(' '))+mkIR('bullseye','Area',ag.areas.map(x=>'<span class="tg ta">'+x+'</span>').join(' '))+mkIR('cogs','Framework',ag.frameworks.map(f=>'<span class="tg tf">'+f+'</span>').join(' '))+mkIR('code','Code',ag.lines_of_code+' lines &bull; '+ag.api_call_sites+' API calls')+'</div>';
+  a+='<div class="desc"><i class="fas fa-info-circle" style="color:var(--cy);margin-right:4px"></i>'+ag.description+'</div>';
+  a+='<div class="ugr">'+mkUC(fz(u.successful),'#00ff88','✅ Success')+mkUC(fz(u.failed),'#ff2244','❌ Failed')+mkUC(fz(u.total_requests),'#00e5ff','📡 Total')+mkUC(fm(u.tokens_used),'#ffe600','🪙 Tokens')+mkUC(u.success_rate!=null?u.success_rate+'%':'—',rc(u.success_rate),'📊 Rate')+mkUC(u.avg_rt_ms!=null?u.avg_rt_ms+'ms':'—','#ff66aa','⏱ Avg RT')+'</div>';
+  if(u.success_rate!=null){a+='<div class="pb"><div class="pf" style="width:'+Math.max(u.success_rate,2)+'%;background:'+rc(u.success_rate)+'"></div></div><div style="font-size:8px;color:var(--t3);text-align:right">Success: <b style="color:'+rc(u.success_rate)+'">'+u.success_rate+'%</b></div>';}
+  const frs=Object.entries(u.failure_reasons||{});if(frs.length){a+='<div class="fsec"><div class="fttl">⚠️ Failure Reasons (from logs):</div>';frs.forEach(([r,c])=>{a+='<div class="fitm"><div class="fdot"></div><div style="flex:1">'+r+'</div><div class="fcnt">'+c+'x</div></div>';});a+='</div>';}
+  if(u.log_files&&u.log_files.length)a+='<div style="margin-top:6px;font-size:7px;color:var(--t3)">📋 '+u.log_files.join(', ')+'</div>';
+  if(u.last_request)a+='<div style="font-size:7px;color:var(--t3)">🕐 Last: '+u.last_request+'</div>';
+  a+='</div>';});a+='</div>';document.getElementById('p1').innerHTML=a;}
+
+  // P2 PROJECTS
+  let pj='';D.projects.forEach((p,i)=>{pj+='<div class="cd" style="margin-bottom:12px"><h3>📦 '+p.name+' <span style="font-size:9px;color:var(--t3);font-weight:400">'+p.count+' agents</span></h3><div class="sg"><div class="hex" style="background:'+G[0]+';width:78px;height:90px"><div style="font-size:16px;font-weight:800">'+p.count+'</div><div style="font-size:6px">AGENTS</div></div><div class="pen" style="background:'+G[2]+';width:72px;height:68px"><div style="font-size:13px;font-weight:800">'+fz(p.total_req)+'</div><div style="font-size:6px">REQUESTS</div></div><div class="oct" style="background:'+G[4]+';width:68px;height:68px"><div style="font-size:13px;font-weight:800">'+p.total_fail+'</div><div style="font-size:6px">FAILED</div></div></div><div style="display:flex;flex-wrap:wrap;gap:3px;margin:8px 0">'+p.providers.map(x=>'<span class="tg tp">'+(PI[x]||'🔹')+' '+x+'</span>').join('')+'</div><div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:4px">'+p.agents.map((a,j)=>'<div style="background:rgba(255,255,255,.025);border-radius:6px;padding:7px;border:1px solid var(--br)"><div style="font-weight:600;font-size:9px">'+I[j%I.length]+' '+a.name+'</div><div style="font-size:7px;color:var(--t3);margin-top:2px">'+a.areas.join(', ')+'</div></div>').join('')+'</div></div>';});
+  document.getElementById('p2').innerHTML=pj||'<div class="cd"><div class="em"><i class="fas fa-cubes"></i><p>No projects</p></div></div>';
+
+  // P3 USAGE
+  let us='<div class="g2"><div class="cd s2"><h3><i class="fas fa-tachometer-alt" style="color:#ff8800"></i> Agent Details</h3><table class="dt"><thead><tr><th>Agent</th><th>Provider</th><th>Data</th><th>Requests</th><th>Success</th><th>Failed</th><th>Tokens</th><th>Rate</th></tr></thead><tbody>';
+  D.agents.forEach((a,i)=>{const u=a.usage,hl=u.data_source==='log_files';us+='<tr><td>'+I[i%I.length]+' '+a.script_name+'</td><td>'+(a.providers[0]||'—')+'</td><td><span class="badge '+(hl?'bok':'bno')+'">'+(hl?'✅':'⚠️')+'</span></td><td>'+fz(u.total_requests)+'</td><td><span class="dot dg"></span>'+fz(u.successful)+'</td><td><span class="dot '+((u.failed||0)>0?'dr':'dg')+'"></span>'+fz(u.failed)+'</td><td>'+fm(u.tokens_used)+'</td><td style="color:'+rc(u.success_rate)+';font-weight:700">'+(u.success_rate!=null?u.success_rate+'%':'—')+'</td></tr>';});
+  us+='</tbody></table></div></div>';document.getElementById('p3').innerHTML=us;
+
+  // P4 FAILURES
+  let fl='<div class="cd" style="margin-bottom:12px"><h3><i class="fas fa-exclamation-triangle" style="color:var(--rd)"></i> Failure Summary</h3><div class="sg">';
+  fl+='<div class="hex" style="background:linear-gradient(135deg,#00ff88,#00ccaa);width:110px;height:127px"><i class="fas fa-check-circle" style="font-size:15px"></i><div style="font-size:18px;font-weight:800;margin-top:3px">'+fz(ou.total_ok)+'</div><div style="font-size:6px;margin-top:2px">Success</div></div>';
+  fl+='<div class="hex" style="background:linear-gradient(135deg,#ff2244,#ff00ff);width:110px;height:127px"><i class="fas fa-times-circle" style="font-size:15px"></i><div style="font-size:18px;font-weight:800;margin-top:3px">'+fz(ou.total_fail)+'</div><div style="font-size:6px;margin-top:2px">Failed</div></div>';
+  fl+='<div class="hex" style="background:linear-gradient(135deg,#3388ff,#00e5ff);width:110px;height:127px"><i class="fas fa-percentage" style="font-size:15px"></i><div style="font-size:18px;font-weight:800;margin-top:3px">'+(ou.success_rate!=null?ou.success_rate+'%':'—')+'</div><div style="font-size:6px;margin-top:2px">Rate</div></div></div></div>';
+  const fle=Object.entries(ou.failures||{});
+  if(fle.length){fl+='<div class="cd" style="margin-bottom:12px"><h3><i class="fas fa-bug" style="color:var(--og)"></i> Failure Reasons</h3><div class="sg">';fle.forEach(([r,c],i)=>{const sz=['90px','82px','78px'];const s=sz[i%3];fl+='<div style="width:'+s+';height:'+s+';clip-path:'+CLP[i%3]+';background:'+G[i%G.length]+';display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:4px"><div style="font-size:14px;font-weight:800">'+c+'</div><div style="font-size:5px;margin-top:1px;padding:0 3px">'+r.substring(0,25)+'</div></div>';});fl+='</div></div>';}
+  fl+='<div class="cd"><h3><i class="fas fa-list" style="color:var(--pu)"></i> Per-Agent</h3><table class="dt"><thead><tr><th>Agent</th><th>Total</th><th>Success</th><th>Failed</th><th>Rate</th><th>Reasons</th></tr></thead><tbody>';
+  D.agents.forEach((a,i)=>{const u=a.usage;const fr2=Object.entries(u.failure_reasons||{});fl+='<tr><td>'+I[i%I.length]+' '+a.script_name+'</td><td>'+fz(u.total_requests)+'</td><td><span class="dot dg"></span>'+fz(u.successful)+'</td><td><span class="dot '+((u.failed||0)>0?'dr':'dg')+'"></span>'+fz(u.failed)+'</td><td style="color:'+rc(u.success_rate)+';font-weight:700">'+(u.success_rate!=null?u.success_rate+'%':'—')+'</td><td style="max-width:220px">'+(fr2.length?fr2.map(([r,c])=>'<div class="fitm"><div class="fdot"></div><div style="flex:1">'+r.substring(0,50)+'</div><div class="fcnt">'+c+'x</div></div>').join(''):'<span style="color:var(--gn);font-size:9px">✅ No failures</span>')+'</td></tr>';});
+  fl+='</tbody></table></div>';document.getElementById('p4').innerHTML=fl;
+
+  // P5 TREE
+  const ap=new Set(D.agents.map(a=>a.script_path));
+  function nd(n){if(n.type==='folder'){const b=n.agent_count>0?'<span class="tbdg">'+n.agent_count+' 🤖</span>':'';return'<div class="tn"><span class="tdir" onclick="tgl(this)">📂 '+n.name+b+'</span><div class="tkids">'+(n.children||[]).map(c=>nd(c)).join('')+'</div></div>';}const ia=ap.has(n.path);return'<div class="tn"><span class="tfil'+(ia?' ia':'')+'">'+(ia?'🤖':'📄')+' '+n.name+(ia?'<span class="tbdg ag">Agent</span>':'')+'</span></div>';}
+  document.getElementById('p5').innerHTML='<div class="trb"><div style="margin-bottom:8px;font-size:10px;font-weight:600;color:var(--cy)"><i class="fas fa-folder-tree"></i> '+D.scan_root+'</div>'+nd(D.folder_tree)+'</div>';
+}
+function tgl(el){const k=el.nextElementSibling;if(k)k.style.display=k.style.display==='none'?'block':'none';}
+</script></body></html>"""
+
+
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s")
-    print("=" * 60)
-    print("   agent_monitor.py — AI Agent Scanner Module")
-    print("=" * 60)
-    run_scan()
-    data = get_cached_summary_dict()
-    print(f"\n✅ {data['agents_found']} agent(s) found")
-    for a in data.get("agents", []):
-        print(f"   🤖 {a['name']:28s} | {a['provider']:15s} | {a['area']:12s} | {a['lines']:>4} lines | Quality: {a['quality']}/100")
-    print(f"\nDashboard HTML: {len(get_cached_html() or '')} bytes")
-    print(f"JSON summary:   {len(_cached_json)} bytes")
+    app = Flask(__name__)
+    app.register_blueprint(scanner_bp)
+    print("🤖 AI Agent Scanner")
+    print(f"   http://localhost:8787/scanner")
+    data = get_data()
+    ss = data["scan_stats"]
+    print(f"   {ss['total_agents_found']} agents in {ss['total_files_scanned']} files ({ss['scan_duration_ms']}ms)")
+    for i, a in enumerate(data["agents"], 1):
+        u = a["usage"]
+        print(f"   {i}. {a['script_name']} | {','.join(a['providers'])} | {','.join(a['areas'])} | req:{fz(u['total_requests'])} ok:{fz(u['successful'])} fail:{fz(u['failed'])}")
+    app.run(host="0.0.0.0", port=8787, debug=False)
+
+
+def fz(n):
+    if n is None:
+        return "—"
+    return str(n)
