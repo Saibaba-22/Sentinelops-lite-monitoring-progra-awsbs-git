@@ -8,11 +8,16 @@ from prometheus_client import (
 )
 from werkzeug.middleware.dispatcher import DispatcherMiddleware
 
-# Add these 2 lines to your app.py:
-from agent_monitor import scanner_bp
-application.register_blueprint(scanner_bp)
-
+# ── Flask app MUST be created first ─────────────────────────
 application = Flask(__name__)
+
+# ── Scanner blueprint (safe import) ─────────────────────────
+try:
+    from agent_monitor import scanner_bp
+    application.register_blueprint(scanner_bp)
+    print("✅ AI Scanner loaded → /scanner")
+except Exception as _e:
+    print(f"⚠️  Scanner skipped: {_e}")
 
 # ── Prometheus metrics ──────────────────────────────────────
 REQUEST_COUNT = Counter(
