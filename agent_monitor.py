@@ -281,13 +281,19 @@ def extract_description(text, filepath):
 def is_agent_file(text, ext):
     """Score a file for agent content. Returns True if score >= AGENT_MIN_SCORE."""
     patterns = AGENT_PATTERNS_SCORED.get(ext, [])
-    total_score = sum(score for pat, score in patterns if re.search(pat, text, re.IGNORECASE))
+    total_score = sum(
+        score * len(re.findall(pat, text, re.IGNORECASE))
+        for pat, score in patterns
+    )
     return total_score >= AGENT_MIN_SCORE
 
 def get_agent_score(text, ext):
     """Return agent detection score for logging."""
     patterns = AGENT_PATTERNS_SCORED.get(ext, [])
-    return sum(score for pat, score in patterns if re.search(pat, text, re.IGNORECASE))
+    return sum(
+        score * len(re.findall(pat, text, re.IGNORECASE))
+        for pat, score in patterns
+    )
 
 
 def scan_folder(root_path):
@@ -316,7 +322,14 @@ def scan_folder(root_path):
                 text = fp.read_text(encoding="utf-8", errors="replace")
             except Exception:
                 continue
-            if not is_agent_file(text, ext):
+            
+            # ── Detection diagnostic ──
+            score = get_agent_score(text, ext)
+            is_agent = score >= AGENT_MIN_SCORE
+            status_icon = "✅" if is_agent else "⏭️"
+            logger.info(f"  {status_icon} [score {score:>3}/{AGENT_MIN_SCORE}] {fn}")
+            
+            if not is_agent:
                 continue
             scanned += 1
 
