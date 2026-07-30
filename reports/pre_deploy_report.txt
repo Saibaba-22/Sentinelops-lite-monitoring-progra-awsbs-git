@@ -1,8 +1,48 @@
 FILE: .env.example
 LINE: N/A
-PRESENT_ERROR: Vars missing: KEY, API_KEY
+PRESENT_ERROR: Vars missing: API_KEY, PORT, FLASK_DEBUG, COLLECT_PUBLIC_IP, KEY
 EXPECTED_VALUE: .env.example lists all required vars
 WHY: CI / new devs will miss required env vars
-SOLUTION: Add KEY, API_KEY to .env.example
+SOLUTION: Add API_KEY, PORT, FLASK_DEBUG, COLLECT_PUBLIC_IP, KEY, RUN_AI_REVIEW to .env.example
+
+---
+FILE: FAILED
+LINE: N/A
+PRESENT_ERROR: Test failure: FAILED test_app.py::test_health - AssertionError: assert False
+EXPECTED_VALUE: All tests should PASS
+WHY: Unit tests failing
+SOLUTION: Fix failing test
+
+---
+FILE: FAILED
+LINE: N/A
+PRESENT_ERROR: Test failure: FAILED test_app.py::test_metrics_endpoint - assert 404 == 200
+EXPECTED_VALUE: All tests should PASS
+WHY: Unit tests failing
+SOLUTION: Fix failing test
+
+---
+FILE: FAILED
+LINE: N/A
+PRESENT_ERROR: Test failure: FAILED test_app.py::test_api_status - assert 404 == 200
+EXPECTED_VALUE: All tests should PASS
+WHY: Unit tests failing
+SOLUTION: Fix failing test
+
+---
+FILE: FAILED
+LINE: N/A
+PRESENT_ERROR: Test failure: FAILED test_app.py::test_agent_status - assert 404 == 200
+EXPECTED_VALUE: All tests should PASS
+WHY: Unit tests failing
+SOLUTION: Fix failing test
+
+---
+FILE: FAILED
+LINE: N/A
+PRESENT_ERROR: Test failure: FAILED test_app.py::test_monitor_status_receiver - assert 404 == 200
+EXPECTED_VALUE: All tests should PASS
+WHY: Unit tests failing
+SOLUTION: Fix failing test
 
 ---
