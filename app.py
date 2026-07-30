@@ -1,12 +1,18 @@
 """Public Flask entry point for SentinelOps-Lite."""
 import os
-from flask import jsonify, render_template
-from agent_monitor import application
+from flask import Flask, jsonify, render_template
+
+application = Flask(__name__)
 
 @application.get("/")
 def home():
     """Render the main application page."""
     return render_template("index.html")
+
+@application.get("/health")
+def health():
+    """Health check endpoint."""
+    return jsonify(status="ok"), 200
 
 @application.get("/api")
 def api():
