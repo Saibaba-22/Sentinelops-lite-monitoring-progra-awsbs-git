@@ -326,6 +326,8 @@ jobs:
           CNAME: ${{ steps.aws-host.outputs.cname }}
           MONITOR_TOKEN: ${{ secrets.MONITOR_TOKEN_AWS }}
           GRAFANA_ADMIN_PASSWORD: ${{ secrets.GRAFANA_ADMIN_PASSWORD }}
+          DOCKERHUB_USERNAME: ${{ env.DOCKERHUB_USERNAME }}
+          DOCKERHUB_REPOSITORY: ${{ env.DOCKERHUB_REPOSITORY }}
         run: |
           test -f Dockerrun.aws.json || { echo "Missing Dockerrun.aws.json"; exit 1; }
           touch .ebignore
