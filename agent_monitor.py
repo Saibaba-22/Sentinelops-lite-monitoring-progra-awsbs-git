@@ -1,1503 +1,1258 @@
 #!/usr/bin/env python3
 """
-=========================================================================
-   AI AGENT SCANNER & ANALYZER v3.0
-   Recursively scans folders → detects AI agents → extracts real metrics
-   → generates a colorful HTML dashboard with NO hardcoded mock data
-=========================================================================
+AI Agent Scanner & Dashboard - SINGLE FILE
+Scans folders recursively, detects AI agents, serves colorful dashboard.
+Works on: Local Python, AWS Beanstalk, Docker, any WSGI server.
+
+Usage:
+    python app.py                          # Scan current directory
+    SCAN_ROOT=/path/to/project python app.py   # Scan specific path
+    gunicorn app:application               # Production WSGI
 """
 
 import os
 import re
-import sys
 import json
+import time
 import hashlib
+import threading
 from datetime import datetime
-from pathlib import Path
-from collections import defaultdict, Counter
+from io import BytesIO
 
-# ================================================================
-#  Known context-window sizes per model (tokens)
-#  Source: official docs — used ONLY to compute "available" caps
-# ================================================================
-MODEL_CONTEXT_WINDOWS = {
-    # OpenAI
-    "gpt-4o": 128000, "gpt-4o-mini": 128000, "gpt-4-turbo": 128000,
-    "gpt-4": 8192, "gpt-3.5-turbo": 16385,
-    # Anthropic
-    "claude-3-opus": 200000, "claude-3-sonnet": 200000, "claude-3-haiku": 200000,
-    "claude-3.5-sonnet": 200000, "claude-3.5-haiku": 200000, "claude-4": 200000,
-    # Google
-    "gemini-1.5-pro": 1048576, "gemini-1.5-flash": 1048576, "gemini-2.0-flash": 1048576,
-    "gemini-pro": 32768,
-    # Mistral
-    "mistral-large": 128000, "mistral-small": 32000, "mistral-medium": 32000,
-    "mixtral": 32000,
-    # Meta
-    "llama-3": 8192, "llama-3.1": 128000, "llama-3.2": 128000, "llama-2": 4096,
-    # Others
-    "deepseek-chat": 128000, "deepseek-coder": 128000,
-    "command-r": 128000, "command-r-plus": 128000,
-    "phi-3": 128000, "phi-4": 16384,
-    "qwen": 32768, "qwen2": 131072, "qwen2.5": 131072,
+# ============================================================
+# Try Flask first, fallback to built-in server
+# ============================================================
+try:
+    from flask import Flask, jsonify, request, Response
+    USE_FLASK = True
+except ImportError:
+    USE_FLASK = False
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+SCAN_ROOT = os.environ.get("SCAN_ROOT", ".")
+SERVER_PORT = int(os.environ.get("PORT", 8787))
+
+# ============================================================
+# AI DETECTION PATTERNS
+# ============================================================
+AI_PATTERNS = {
+    "providers": {
+        "OpenAI": {
+            "imports": [
+                r"import\s+openai", r"from\s+openai",
+                r"OpenAI\s*\(", r"openai\.ChatCompletion",
+                r"openai\.api_key", r"OPENAI_API_KEY",
+                r"AsyncOpenAI\s*\(",
+            ],
+            "env_keys": ["OPENAI_API_KEY"],
+            "models": [
+                "gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "gpt-4",
+                "gpt-3.5-turbo", "gpt-3.5", "o1-preview", "o1-mini",
+                "o3-mini", "dall-e-3", "dall-e-2", "whisper-1",
+                "tts-1", "tts-1-hd", "text-embedding-ada",
+                "text-embedding-3-small", "text-embedding-3-large",
+            ],
+        },
+        "Anthropic": {
+            "imports": [
+                r"import\s+anthropic", r"from\s+anthropic",
+                r"Anthropic\s*\(", r"ANTHROPIC_API_KEY",
+                r"AsyncAnthropic\s*\(",
+            ],
+            "env_keys": ["ANTHROPIC_API_KEY"],
+            "models": [
+                "claude-3-5-sonnet", "claude-3-5-haiku",
+                "claude-3-opus", "claude-3-sonnet", "claude-3-haiku",
+                "claude-2.1", "claude-2", "claude-instant",
+            ],
+        },
+        "Google AI": {
+            "imports": [
+                r"import\s+google\.generativeai",
+                r"from\s+google\.generativeai",
+                r"genai\.GenerativeModel", r"GOOGLE_API_KEY",
+                r"import\s+vertexai", r"from\s+vertexai",
+                r"GenerativeModel\s*\(",
+            ],
+            "env_keys": ["GOOGLE_API_KEY", "GOOGLE_APPLICATION_CREDENTIALS"],
+            "models": [
+                "gemini-2.0-flash", "gemini-1.5-pro",
+                "gemini-1.5-flash", "gemini-pro", "gemini-ultra",
+                "palm-2", "text-bison",
+            ],
+        },
+        "Hugging Face": {
+            "imports": [
+                r"from\s+transformers", r"import\s+transformers",
+                r"pipeline\s*\(", r"AutoModel",
+                r"from\s+huggingface_hub", r"HfApi",
+                r"HUGGINGFACE_TOKEN", r"HF_TOKEN",
+            ],
+            "env_keys": ["HUGGINGFACE_TOKEN", "HF_TOKEN"],
+            "models": [
+                "bert", "roberta", "distilbert", "t5",
+                "falcon", "mistral", "mixtral", "phi",
+                "stable-diffusion", "starcoder", "gpt2",
+            ],
+        },
+        "Cohere": {
+            "imports": [
+                r"import\s+cohere", r"from\s+cohere",
+                r"cohere\.Client", r"COHERE_API_KEY",
+            ],
+            "env_keys": ["COHERE_API_KEY"],
+            "models": [
+                "command-r-plus", "command-r", "command",
+                "command-light", "embed-english",
+            ],
+        },
+        "Mistral AI": {
+            "imports": [
+                r"from\s+mistralai", r"import\s+mistralai",
+                r"MistralClient", r"MISTRAL_API_KEY",
+                r"Mistral\s*\(",
+            ],
+            "env_keys": ["MISTRAL_API_KEY"],
+            "models": [
+                "mistral-large", "mistral-medium",
+                "mistral-small", "mistral-tiny",
+                "open-mistral", "codestral",
+            ],
+        },
+        "Groq": {
+            "imports": [
+                r"import\s+groq", r"from\s+groq",
+                r"Groq\s*\(", r"GROQ_API_KEY",
+            ],
+            "env_keys": ["GROQ_API_KEY"],
+            "models": ["llama", "mixtral", "gemma", "whisper"],
+        },
+        "Ollama": {
+            "imports": [
+                r"import\s+ollama", r"from\s+ollama",
+                r"ollama\.chat", r"ollama\.generate",
+                r"localhost:11434",
+            ],
+            "env_keys": [],
+            "models": [
+                "llama2", "llama3", "mistral",
+                "codellama", "phi", "gemma", "qwen",
+            ],
+        },
+        "LangChain": {
+            "imports": [
+                r"from\s+langchain", r"import\s+langchain",
+                r"LLMChain", r"AgentExecutor",
+                r"create_react_agent", r"ChatOpenAI",
+                r"ChatAnthropic", r"ConversationChain",
+            ],
+            "env_keys": [],
+            "models": [],
+        },
+        "CrewAI": {
+            "imports": [
+                r"from\s+crewai", r"import\s+crewai",
+                r"Agent\s*\(.*role\s*=", r"Crew\s*\(",
+                r"Task\s*\(.*description",
+            ],
+            "env_keys": [],
+            "models": [],
+        },
+        "AutoGen": {
+            "imports": [
+                r"from\s+autogen", r"import\s+autogen",
+                r"AssistantAgent", r"UserProxyAgent",
+                r"GroupChat",
+            ],
+            "env_keys": [],
+            "models": [],
+        },
+        "AWS Bedrock": {
+            "imports": [
+                r"bedrock-runtime", r"invoke_model",
+                r"BedrockRuntime",
+            ],
+            "env_keys": ["AWS_ACCESS_KEY_ID"],
+            "models": [
+                "amazon.titan", "anthropic.claude",
+                "ai21.j2", "cohere.command",
+            ],
+        },
+        "Azure OpenAI": {
+            "imports": [
+                r"AzureOpenAI\s*\(", r"azure_endpoint",
+                r"AZURE_OPENAI",
+            ],
+            "env_keys": ["AZURE_OPENAI_API_KEY", "AZURE_OPENAI_ENDPOINT"],
+            "models": ["gpt-4", "gpt-35-turbo"],
+        },
+        "Replicate": {
+            "imports": [
+                r"import\s+replicate", r"from\s+replicate",
+                r"replicate\.run", r"REPLICATE_API_TOKEN",
+            ],
+            "env_keys": ["REPLICATE_API_TOKEN"],
+            "models": [],
+        },
+    },
+    "agent_frameworks": {
+        "LangChain Agent": [
+            r"AgentExecutor", r"create_react_agent",
+            r"initialize_agent", r"AgentType",
+            r"create_openai_functions_agent",
+        ],
+        "CrewAI Agent": [
+            r"from\s+crewai\s+import\s+Agent",
+            r"Agent\s*\(.*role\s*=",
+        ],
+        "AutoGen Agent": [
+            r"AssistantAgent\s*\(",
+            r"UserProxyAgent\s*\(",
+        ],
+        "Custom Agent": [
+            r"class\s+\w*[Aa]gent\w*\s*[\(:]",
+            r"def\s+agent_",
+            r"async\s+def\s+agent_",
+        ],
+    },
+    "agent_areas": {
+        "Chatbot / Conversational": [
+            r"\bchat\b", r"\bconversation\b",
+            r"\bchatbot\b", r"\bassistant\b", r"\bdialogue\b",
+        ],
+        "Code Generation": [
+            r"\bcode[-_]?gen", r"\bcoding\b",
+            r"\bcode[-_]?review\b", r"\brefactor\b", r"\bprogrammer\b",
+        ],
+        "Data Analysis": [
+            r"\bpandas\b", r"\bdataframe\b",
+            r"\bcsv\b", r"\banalyz", r"\breport\b",
+        ],
+        "Web Scraping": [
+            r"\bscrape\b", r"\bcrawl\b",
+            r"\bbeautifulsoup\b", r"\bselenium\b",
+        ],
+        "Image Generation": [
+            r"\bdall[-_]?e\b", r"\bstable[-_]?diffusion\b",
+            r"\bimage[-_]?gen", r"\bmidjourney\b",
+        ],
+        "Text Processing / NLP": [
+            r"\bsummariz", r"\btranslat",
+            r"\bsentiment\b", r"\bnlp\b", r"\bembed",
+        ],
+        "Email / Communication": [
+            r"\bemail\b", r"\bsmtp\b",
+            r"\bsendgrid\b", r"\bslack\b", r"\bnotification\b",
+        ],
+        "RAG / Knowledge Base": [
+            r"\bvector[-_]?store\b", r"\bchromadb\b",
+            r"\bpinecone\b", r"\bfaiss\b", r"\brag\b", r"\bretrieval\b",
+        ],
+        "DevOps / Automation": [
+            r"\bdeploy\b", r"\bdocker\b",
+            r"\bkubernetes\b", r"\bci[-_]?cd\b", r"\bautomat",
+        ],
+        "Research / Search": [
+            r"\bsearch\b", r"\bresearch\b",
+            r"\bwikipedia\b", r"\bserp\b",
+        ],
+        "Finance / Trading": [
+            r"\btrading\b", r"\bstock\b",
+            r"\bcrypto\b", r"\bfinance\b", r"\bportfolio\b",
+        ],
+        "Healthcare": [
+            r"\bmedical\b", r"\bhealth\b",
+            r"\bdiagnosis\b", r"\bpatient\b", r"\bclinical\b",
+        ],
+    },
 }
 
-# Known default RPM/TPM/RPD rate limits per provider
-PROVIDER_RATE_LIMITS = {
-    "OpenAI": {"rpm": 500, "tpm": 200000, "rpd": 10000},
-    "Anthropic": {"rpm": 400, "tpm": 100000, "rpd": 8000},
-    "Google": {"rpm": 360, "tpm": 120000, "rpd": 7200},
-    "Mistral": {"rpm": 300, "tpm": 80000, "rpd": 6000},
-    "Meta": {"rpm": 200, "tpm": 60000, "rpd": 4000},
-    "Cohere": {"rpm": 300, "tpm": 80000, "rpd": 5000},
-    "DeepSeek": {"rpm": 300, "tpm": 100000, "rpd": 6000},
-    "Groq": {"rpm": 600, "tpm": 150000, "rpd": 10000},
-    "Together": {"rpm": 400, "tpm": 120000, "rpd": 8000},
-    "Ollama": {"rpm": None, "tpm": None, "rpd": None},  # local
-    "default": {"rpm": 200, "tpm": 50000, "rpd": 4000},
-}
-
-# ================================================================
-#  Patterns to detect AI agents in source files
-# ================================================================
-FILE_PATTERNS = {
-    ".py": [
-        r"(?:class|def)\s+\w*(?:Agent|agent|Tool|tool|Task|task)",
-        r"from\s+(?:langchain|crewai|autogen|openai|llama_index|haystack|pydantic_ai|smolagents)",
-        r"import\s+(?:langchain|crewai|autogen|openai|llama_index|haystack)",
-        r"(?:@tool|@agent|@task)",
-        r"(?:AgentExecutor|ConversableAgent|AssistantAgent|UserProxyAgent|ToolAgent)",
-        r"(?:Crew|Agent|Task|Process|Workflow)\s*[\(:]",
-        r"(?:OpenAI|Anthropic|Gemini|Mistral|Claude|GPT|Llama|Qwen|DeepSeek)",
-        r"(?:ChatOpenAI|ChatAnthropic|ChatGoogle|ChatMistral)\s*\(",
-        r"llm\s*[=:]\s*\{",
-        r"model\s*[=:]\s*[\"']",
-        r"(?:create_agent|initialize_agent|load_agent)",
+LOG_PATTERNS = {
+    "request_success": [
+        r'HTTP/\d\.\d"\s+200', r'"status":\s*200',
+        r'"status":\s*"success"', r'status_code=200',
     ],
-    ".json": [
-        r"\"(?:agent|model|provider|llm|tools)\"\s*:",
-        r"\"(?:name|type|role|goal|backstory)\"\s*:",
-    ],
-    ".yaml": [
-        r"(?:agent|model|provider|llm|tools)\s*:",
-        r"(?:name|type|role|goal|backstory)\s*:",
-    ],
-    ".yml": [
-        r"(?:agent|model|provider|llm|tools)\s*:",
-        r"(?:name|type|role|goal|backstory)\s*:",
-    ],
-    ".toml": [
-        r"\[(?:agent|tool|llm|model|provider)\]",
-    ],
-    ".cfg": [
-        r"(?:agent|model|provider|llm)",
-    ],
-    ".env": [
-        r"(?:OPENAI|ANTHROPIC|GEMINI|MISTRAL|COHERE)_API_KEY",
+    "request_failure": [
+        r'HTTP/\d\.\d"\s+[45]\d\d', r'"status":\s*[45]\d\d',
+        r'Error|ERROR|Exception|FAILED',
+        r'RateLimitError|APIError|AuthenticationError',
     ],
 }
 
-PROVIDER_MAP = {
-    "openai": "OpenAI", "gpt": "OpenAI", "chatopenai": "OpenAI",
-    "anthropic": "Anthropic", "claude": "Anthropic", "chatanthropic": "Anthropic",
-    "google": "Google", "gemini": "Google", "chatgoogle": "Google",
-    "mistral": "Mistral", "mixtral": "Mistral", "chatmistral": "Mistral",
-    "meta": "Meta", "llama": "Meta",
-    "cohere": "Cohere", "command-r": "Cohere",
-    "huggingface": "HuggingFace",
-    "groq": "Groq",
-    "together": "Together",
-    "deepseek": "DeepSeek",
-    "perplexity": "Perplexity",
-    "replicate": "Replicate",
-    "fireworks": "Fireworks",
-    "azure": "Azure",
-    "ollama": "Ollama",
-    "langchain": "LangChain",
-    "crewai": "CrewAI",
-    "autogen": "AutoGen",
-    "haystack": "Haystack",
-    "llama_index": "LlamaIndex",
-    "pydantic_ai": "PydanticAI",
-    "smolagents": "SmolAgents",
-}
 
-AREA_KEYWORDS = {
-    "code": ["code", "programming", "software", "development", "coding", "debug",
-             "pull request", "review", "github", "git", "refactor", "compiler"],
-    "content": ["content", "writing", "blog", "article", "copy", "marketing",
-                 "social media", "seo", "newsletter"],
-    "data": ["data", "analytics", "database", "sql", "pandas", "csv", "analysis",
-              "report", "visualization", "etl", "pipeline"],
-    "customer": ["customer", "support", "chat", "conversation", "assistant",
-                  "helpdesk", "ticket", "faq"],
-    "research": ["research", "paper", "arxiv", "scientific", "academic", "study",
-                  "literature", "review", "summarize"],
-    "finance": ["finance", "trading", "stock", "crypto", "investment", "banking",
-                 "market", "portfolio"],
-    "healthcare": ["health", "medical", "clinical", "patient", "diagnosis", "symptom"],
-    "education": ["education", "learning", "tutorial", "course", "teaching", "student",
-                   "quiz", "lesson"],
-    "automation": ["automation", "workflow", "pipeline", "orchestration", "scheduler",
-                    "cicd", "deploy"],
-    "multimedia": ["image", "video", "audio", "music", "media", "design", "creative",
-                    "generate", "vision"],
-}
+# ============================================================
+# LOG FILE READER
+# ============================================================
+class LogFileReader:
+    LOG_EXTENSIONS = {".log", ".txt", ".json", ".jsonl", ".csv", ".out"}
 
-SKIP_DIRS = {"node_modules", ".git", "__pycache__", ".venv", "venv", ".tox",
-             "dist", "build", ".next", ".nuxt", ".cache", ".mypy_cache",
-             ".pytest_cache", ".ruff_cache", ".svelte-kit", ".turbo",
-             "site-packages", "lib", "lib64", "bin", "include"}
+    def __init__(self, agent_script_path):
+        self.agent_dir = os.path.dirname(agent_script_path)
+        self.agent_name = os.path.splitext(os.path.basename(agent_script_path))[0]
 
-
-# ================================================================
-#  Tokenizer
-# ================================================================
-def estimate_tokens(text):
-    """Estimate tokens using a rough character-based approximation.
-    ~4 chars per token for English text."""
-    return max(1, len(text) // 4)
-
-
-def count_api_calls(text):
-    """Count real API invocation patterns in the code."""
-    patterns = [
-        r"\.invoke\s*\(", r"\.run\s*\(", r"\.kickoff\s*\(",
-        r"chat\.completions\.create", r"generate_reply",
-        r"client\.\w+\.create", r"\.predict\s*\(",
-        r"\.generate\s*\(", r"\.complete\s*\(",
-        r"\.send_message", r"\.reply\s*\(",
-        r"agent\.\w+\s*\(", r"llm\.\w+\s*\(",
-        r"completion\s*=", r"response\s*=",
-    ]
-    count = 0
-    for pat in patterns:
-        count += len(re.findall(pat, text, re.IGNORECASE))
-    return count
-
-
-def extract_rate_limits(text, providers):
-    """Extract real RPM/TPM/RPD values from config or use provider defaults."""
-    extracted = {}
-    for key in ["rpm", "tpm", "rpd"]:
-        matches = re.findall(rf"{key}\s*[=:]\s*(\d+)", text, re.IGNORECASE)
-        if matches:
-            extracted[key] = max(int(m) for m in matches)
-
-    # Fall back to provider defaults for any missing
-    fallback = PROVIDER_RATE_LIMITS.get("default")
-    for prov in providers:
-        p_limits = PROVIDER_RATE_LIMITS.get(prov)
-        if p_limits:
-            fallback = p_limits
-            break
-
-    for key in ["rpm", "tpm", "rpd"]:
-        if key not in extracted and fallback and fallback.get(key):
-            extracted[key] = fallback[key]
-
-    return extracted.get("rpm", 0), extracted.get("tpm", 0), extracted.get("rpd", 0)
-
-
-def get_context_window(models):
-    """Get the maximum context window for detected models."""
-    windows = [MODEL_CONTEXT_WINDOWS.get(m, 128000) for m in models]
-    return max(windows)
-
-
-def analyze_error_handling(text):
-    """Analyze real error handling patterns in code."""
-    findings = []
-
-    has_try = bool(re.search(r'\btry\b', text))
-    has_except = bool(re.search(r'\bexcept\b', text))
-    has_finally = bool(re.search(r'\bfinally\b', text))
-    has_logging = bool(re.search(r'\b(log|logging|logger)\b', text, re.IGNORECASE))
-    has_retry = bool(re.search(r'\bretry\b', text, re.IGNORECASE))
-    has_validate = bool(re.search(r'\b(validate|sanitize|check)\b', text, re.IGNORECASE))
-    has_type_hints = bool(re.search(r':\s*(str|int|float|bool|list|dict|Optional|Union|Any)\b', text))
-
-    if not has_try:
-        findings.append("No try/except blocks — missing error handling")
-    if not has_logging:
-        findings.append("No logging mechanism detected")
-    if not has_retry:
-        findings.append("No retry logic for transient failures")
-    if not has_validate:
-        findings.append("No input validation detected")
-    if not has_type_hints:
-        findings.append("No type hints — potential runtime type errors")
-
-    return findings
-
-
-def detect_area(text, filename):
-    """Detect agent area from text and filename."""
-    combined = (text + " " + filename + " " + Path(filename).stem).lower()
-    scores = {}
-    for area, keywords in AREA_KEYWORDS.items():
-        score = sum(combined.count(kw.lower()) for kw in keywords)
-        if score > 0:
-            scores[area] = score
-    if scores:
-        return max(scores, key=scores.get)
-    return "general"
-
-
-def extract_providers(text):
-    """Extract all real provider mentions from code."""
-    text_lower = text.lower()
-    found = set()
-    for alias, provider in PROVIDER_MAP.items():
-        if alias in text_lower:
-            found.add(provider)
-    # Also catch OpenAI via GPT mentions
-    if re.search(r'(?:gpt|davinci|ada|babbage|curie)-\d', text, re.IGNORECASE):
-        found.add("OpenAI")
-    if re.search(r'claude-\d', text, re.IGNORECASE):
-        found.add("Anthropic")
-    if re.search(r'gemini-\d', text, re.IGNORECASE):
-        found.add("Google")
-    if re.search(r'llama-\d', text, re.IGNORECASE):
-        found.add("Meta")
-    return sorted(found) if found else ["Unknown"]
-
-
-def extract_models(text):
-    """Extract all real model names from code."""
-    found = set()
-    for model in MODEL_CONTEXT_WINDOWS:
-        if model in text.lower():
-            found.add(model)
-    return sorted(found) if found else ["Unknown"]
-
-
-def extract_agent_name(filepath):
-    """Extract a clean agent name from filename."""
-    name = Path(filepath).stem
-    # Clean up separators
-    name = re.sub(r'[_\-.]+', ' ', name)
-    # Remove file extensions if any
-    name = name.strip()
-    # Title case
-    return name.title()
-
-
-def extract_description(text, filepath):
-    """Extract the real description/docstring from the file."""
-    # Multi-line docstrings first
-    for pat in [
-        r'"""(.*?)"""',
-        r"'''(.*?)'''",
-    ]:
-        matches = re.findall(pat, text, re.DOTALL)
-        for m in matches:
-            cleaned = m.strip()
-            if len(cleaned) > 10:
-                # Take first meaningful paragraph
-                lines = [l.strip() for l in cleaned.split('\n') if l.strip()]
-                return ' '.join(lines[:3])[:300]
-
-    # Single-line docstrings
-    for pat in [
-        r'#\s*(?:Agent|Purpose|Description|Goal|Role|About)[:\s]*(.+?)(?:\n|$)',
-        r'role\s*[=:]\s*["\'](.+?)["\']',
-        r'goal\s*[=:]\s*["\'](.+?)["\']',
-        r'backstory\s*[=:]\s*["\'](.+?)["\']',
-        r'description\s*[=:]\s*["\'](.+?)["\']',
-        r'"""(.+?)"""',
-    ]:
-        m = re.search(pat, text, re.DOTALL)
-        if m:
-            desc = m.group(1).strip()[:300]
-            if len(desc) > 10:
-                return desc
-
-    # Fallback: use filename as description
-    name = Path(filepath).stem.replace('_', ' ').replace('-', ' ').title()
-    return f"AI agent configured/defined in {Path(filepath).name}"
-
-
-def extract_imports(text):
-    """Extract all import statements to understand dependencies."""
-    imports = set()
-    for m in re.finditer(r'(?:from|import)\s+([\w.]+)', text):
-        imports.add(m.group(1).split('.')[0])
-    return sorted(imports)
-
-
-def is_agent_file(text, ext):
-    """Check if a file truly contains agent-related code."""
-    patterns = FILE_PATTERNS.get(ext, [])
-    for pat in patterns:
-        if re.search(pat, text, re.IGNORECASE):
-            return True
-    return False
-
-
-# ================================================================
-#  SCANNER
-# ================================================================
-
-def scan_folder(root_path):
-    """Recursively scan a folder and return real agent data."""
-    root = Path(root_path).expanduser().resolve()
-    if not root.exists():
-        print(f"[!] Path not found: {root}")
-        return []
-
-    agents = []
-    total_files = 0
-    scanned_files = 0
-
-    print(f"[*] Scanning: {root}")
-    print(f"[*] Walking directory tree...")
-
-    for dirpath, dirnames, filenames in os.walk(root):
-        # Skip unwanted dirs
-        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS and not d.startswith('.')]
-
-        for filename in filenames:
-            filepath = Path(dirpath) / filename
-            ext = filepath.suffix.lower()
-
-            if ext not in FILE_PATTERNS:
+    def find_log_files(self):
+        log_files = []
+        search_dirs = [
+            self.agent_dir,
+            os.path.join(self.agent_dir, "logs"),
+            os.path.join(self.agent_dir, "log"),
+            os.path.join(self.agent_dir, ".."),
+            os.path.join(self.agent_dir, "..", "logs"),
+        ]
+        for d in search_dirs:
+            if not os.path.isdir(d):
                 continue
-            if filepath.stat().st_size > 500_000:
-                continue
-
-            total_files += 1
-
-            # Read the file
             try:
-                text = filepath.read_text(encoding="utf-8", errors="replace")
-            except Exception:
+                for fname in os.listdir(d):
+                    fpath = os.path.join(d, fname)
+                    if not os.path.isfile(fpath):
+                        continue
+                    ext = os.path.splitext(fname)[1].lower()
+                    if ext not in self.LOG_EXTENSIONS:
+                        continue
+                    nl = fname.lower()
+                    if any(k in nl for k in [self.agent_name.lower(), "log", "usage", "request", "api"]):
+                        log_files.append(fpath)
+            except PermissionError:
+                pass
+        return list(set(log_files))
+
+    def parse_logs(self):
+        log_files = self.find_log_files()
+        result = {
+            "log_files_found": [os.path.basename(f) for f in log_files],
+            "total_requests": 0, "successful_requests": 0,
+            "failed_requests": 0, "tokens_used": 0,
+            "prompt_tokens": 0, "completion_tokens": 0,
+            "failure_reasons": {}, "response_times_ms": [],
+            "avg_response_time_ms": None, "last_request_time": None,
+            "data_source": "no_logs_found" if not log_files else "log_files",
+        }
+        for lf in log_files:
+            self._parse_file(lf, result)
+
+        if result["response_times_ms"]:
+            result["avg_response_time_ms"] = round(
+                sum(result["response_times_ms"]) / len(result["response_times_ms"]), 2
+            )
+        t = result["successful_requests"] + result["failed_requests"]
+        if t > result["total_requests"]:
+            result["total_requests"] = t
+        return result
+
+    def _parse_file(self, path, result):
+        try:
+            sz = os.path.getsize(path)
+            if sz > 50 * 1024 * 1024 or sz == 0:
+                return
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read()
+            if path.endswith(".jsonl"):
+                for line in content.splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        self._extract_json(json.loads(line), result)
+                    except json.JSONDecodeError:
+                        pass
+            elif path.endswith(".json"):
+                try:
+                    data = json.loads(content)
+                    if isinstance(data, list):
+                        for e in data:
+                            if isinstance(e, dict):
+                                self._extract_json(e, result)
+                    elif isinstance(data, dict):
+                        self._extract_json(data, result)
+                        for k in ["requests", "events", "logs", "entries"]:
+                            if k in data and isinstance(data[k], list):
+                                for e in data[k]:
+                                    if isinstance(e, dict):
+                                        self._extract_json(e, result)
+                except json.JSONDecodeError:
+                    self._parse_text(content, result)
+            else:
+                self._parse_text(content, result)
+
+            ts = re.findall(r'(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2})', content)
+            if ts:
+                result["last_request_time"] = ts[-1]
+        except Exception:
+            pass
+
+    def _extract_json(self, entry, result):
+        usage = entry.get("usage", {})
+        if isinstance(usage, dict):
+            pt = usage.get("prompt_tokens", 0) or 0
+            ct = usage.get("completion_tokens", 0) or 0
+            tt = usage.get("total_tokens", 0) or 0
+            result["prompt_tokens"] += pt
+            result["completion_tokens"] += ct
+            result["tokens_used"] += tt or (pt + ct)
+
+        status = entry.get("status") or entry.get("status_code")
+        if status is not None:
+            s = str(status)
+            if s in ("200", "success", "ok", "OK", "Success"):
+                result["successful_requests"] += 1
+                result["total_requests"] += 1
+            elif s in ("error", "failed") or (isinstance(status, int) and status >= 400):
+                result["failed_requests"] += 1
+                result["total_requests"] += 1
+                err = entry.get("error") or entry.get("message") or f"HTTP {status}"
+                if err:
+                    result["failure_reasons"][str(err)] = result["failure_reasons"].get(str(err), 0) + 1
+
+        for rk in ["response_time", "duration", "elapsed", "latency"]:
+            v = entry.get(rk)
+            if isinstance(v, (int, float)) and v > 0:
+                result["response_times_ms"].append(round(v * 1000 if v < 100 else v, 2))
+                break
+
+    def _parse_text(self, content, result):
+        for line in content.splitlines():
+            m = re.search(r'"total_tokens":\s*(\d+)', line)
+            if m:
+                result["tokens_used"] += int(m.group(1))
+                continue
+            pt = re.search(r'prompt_tokens["\s:=]+(\d+)', line)
+            ct = re.search(r'completion_tokens["\s:=]+(\d+)', line)
+            if pt:
+                result["prompt_tokens"] += int(pt.group(1))
+            if ct:
+                result["completion_tokens"] += int(ct.group(1))
+            if pt or ct:
+                result["tokens_used"] += (int(pt.group(1)) if pt else 0) + (int(ct.group(1)) if ct else 0)
                 continue
 
-            if not is_agent_file(text, ext):
+            if any(re.search(p, line, re.IGNORECASE) for p in LOG_PATTERNS["request_success"]):
+                result["successful_requests"] += 1
+                result["total_requests"] += 1
                 continue
 
-            scanned_files += 1
+            if any(re.search(p, line, re.IGNORECASE) for p in LOG_PATTERNS["request_failure"]):
+                result["failed_requests"] += 1
+                result["total_requests"] += 1
+                rm = re.search(r'(Error|Exception|FAILED)[:\s]+([^\n]{5,80})', line, re.IGNORECASE)
+                if rm:
+                    result["failure_reasons"][rm.group(2).strip()] = result["failure_reasons"].get(rm.group(2).strip(), 0) + 1
 
-            # --- Extract REAL metrics ---
-            agent_name = extract_agent_name(filepath)
-            providers = extract_providers(text)
-            models = extract_models(text)
-            area = detect_area(text, filepath.name)
-            description = extract_description(text, filepath)
-            imports = extract_imports(text)
-
-            # Real token count
-            estimated_tokens = estimate_tokens(text)
-            context_window = get_context_window(models) if models else 128000
-            total_available_tokens = context_window
-
-            # Real API calls
-            api_calls = count_api_calls(text)
-            total_api_calls_found = api_calls
-
-            # Real rate limits
-            rpm, tpm, rpd = extract_rate_limits(text, providers)
-
-            # Real error handling analysis
-            error_findings = analyze_error_handling(text)
-
-            # File stats
-            file_size_kb = round(filepath.stat().st_size / 1024, 1)
-            lines = text.count("\n") + 1
-
-            # Detect if there's actual YAML/JSON agent configuration
-            is_config_file = ext in (".yaml", ".yml", ".json", ".toml", ".cfg")
-            if is_config_file:
-                # For config files, count how many agents are defined
-                config_agents = len(re.findall(r'(?:name|agent)\s*[=:]\s*["\']?(\w+)', text))
-                total_api_calls_found = config_agents
-
-            agent_info = {
-                "file_path": str(filepath),
-                "relative_path": str(filepath.relative_to(root)),
-                "file_size_kb": file_size_kb,
-                "lines_of_code": lines,
-                "agent_name": agent_name,
-                "providers": providers,
-                "models": models,
-                "area": area,
-                "description": description,
-                "imports": imports,
-                "is_config_file": is_config_file,
-                # --- Token metrics (REAL) ---
-                "estimated_tokens": estimated_tokens,
-                "tokens_total_available": total_available_tokens,
-                "tokens_used_pct": round((estimated_tokens / total_available_tokens) * 100, 2) if total_available_tokens else 0,
-                # --- Request metrics (REAL) ---
-                "api_calls_detected": total_api_calls_found,
-                "rate_rpm": rpm,
-                "rate_tpm": tpm,
-                "rate_rpd": rpd,
-                # --- Error handling (REAL) ---
-                "has_try_except": bool(re.search(r'\btry\b.*\bexcept\b', text, re.DOTALL)),
-                "has_logging": bool(re.search(r'\b(log|logging|logger)\b', text, re.IGNORECASE)),
-                "has_retry": bool(re.search(r'\bretry\b', text, re.IGNORECASE)),
-                "has_type_hints": bool(re.search(r':\s*(str|int|float|bool|list|dict|Optional|Union|Any)\b', text)),
-                "error_handling_findings": error_findings,
-                "num_error_issues": len(error_findings),
-            }
-
-            # Count success/fail based on real code quality
-            quality_score = 0
-            quality_factors = []
-            if agent_info["has_try_except"]:
-                quality_score += 30
-                quality_factors.append("Has try/except")
-            if agent_info["has_logging"]:
-                quality_score += 20
-                quality_factors.append("Has logging")
-            if agent_info["has_retry"]:
-                quality_score += 15
-                quality_factors.append("Has retry logic")
-            if agent_info["has_type_hints"]:
-                quality_score += 15
-                quality_factors.append("Has type hints")
-            if agent_info["lines_of_code"] > 15:
-                quality_score += 10
-                quality_factors.append("Substantial implementation")
-            if agent_info["api_calls_detected"] > 0:
-                quality_score += 10
-                quality_factors.append("Has API invocations")
-
-            # Real success/fail based on how many issues found
-            agent_info["quality_score"] = min(quality_score, 100)
-            agent_info["quality_factors"] = quality_factors
-
-            # Derive request stats from real code analysis
-            total_requests = max(1, agent_info["api_calls_detected"] * 5)
-            failure_rate = max(0.05, agent_info["num_error_issues"] * 0.08)
-            fail_count = int(total_requests * failure_rate)
-            success_count = total_requests - fail_count
-            agent_info["total_requests"] = total_requests
-            agent_info["success_count"] = success_count
-            agent_info["fail_count"] = fail_count
-            agent_info["success_rate"] = round((success_count / total_requests) * 100, 1)
-
-            agents.append(agent_info)
-
-            prov_display = providers[0] if providers else "Unknown"
-            print(f"  [{scanned_files:>3}] {agent_name:28s} | {prov_display:15s} | {area:15s} | {lines:>4} lines | {api_calls} API calls")
-
-    print(f"\n[*] Files checked: {total_files}    Agents detected: {scanned_files}")
-    return agents
+            rt = re.search(r'(?:response.time|elapsed|duration|latency)[:\s=]+(\d+\.?\d*)\s*(ms|s)?', line, re.IGNORECASE)
+            if rt:
+                v = float(rt.group(1))
+                ms = v * 1000 if (rt.group(2) or "ms").lower() == "s" else v
+                result["response_times_ms"].append(round(ms, 2))
 
 
-# ================================================================
-#  HTML DASHBOARD GENERATOR
-# ================================================================
+# ============================================================
+# ENV CONFIG READER
+# ============================================================
+class EnvConfigReader:
+    def __init__(self, script_path, providers):
+        self.script_dir = os.path.dirname(script_path)
+        self.providers = providers
 
-def generate_dashboard(agents, root_path):
-    """Generate a colorful HTML dashboard from REAL agent data — no mock values."""
-    total_agents = len(agents)
-    total_tokens = sum(a["estimated_tokens"] for a in agents)
-    total_requests = sum(a["total_requests"] for a in agents)
-    total_success = sum(a["success_count"] for a in agents)
-    total_fail = sum(a["fail_count"] for a in agents)
-    avg_success = round((total_success / total_requests * 100), 1) if total_requests else 0
-    total_api_calls = sum(a["api_calls_detected"] for a in agents)
-    total_lines = sum(a["lines_of_code"] for a in agents)
-    total_error_issues = sum(a["num_error_issues"] for a in agents)
+    def read_api_keys_present(self):
+        env_vars = self._load_env()
+        found = {}
+        for prov in self.providers:
+            info = AI_PATTERNS["providers"].get(prov, {})
+            for key in info.get("env_keys", []):
+                v = env_vars.get(key, "")
+                found[key] = bool(v and v not in ("your_key_here", "YOUR_KEY", "sk-xxx", ""))
+        return found
 
-    # Area distribution
-    area_counts = Counter(a["area"] for a in agents)
-    # Provider distribution
-    provider_counts = Counter()
-    for a in agents:
-        for p in a["providers"]:
-            provider_counts[p] += 1
-    # Model distribution
-    model_counts = Counter()
-    for a in agents:
-        for m in a["models"]:
-            model_counts[m] += 1
-    # Quality distribution
-    high_quality = sum(1 for a in agents if a["quality_score"] >= 70)
-    med_quality = sum(1 for a in agents if 40 <= a["quality_score"] < 70)
-    low_quality = sum(1 for a in agents if a["quality_score"] < 40)
+    def read_config(self):
+        config = {}
+        for d in [self.script_dir, os.path.join(self.script_dir, "..")]:
+            for fname in ["config.json", "settings.json", "agent_config.json"]:
+                fpath = os.path.join(d, fname)
+                if os.path.isfile(fpath):
+                    try:
+                        with open(fpath) as f:
+                            config.update(json.load(f))
+                    except Exception:
+                        pass
+        return config
 
-    # --- Area chart HTML ---
-    area_chart_html = ""
-    area_colors = {
-        "code": "#00b894", "content": "#fdcb6e", "data": "#6c5ce7",
-        "customer": "#fd79a8", "research": "#74b9ff", "finance": "#f8a5c2",
-        "healthcare": "#e17055", "education": "#81ecec", "automation": "#ffeaa7",
-        "multimedia": "#a29bfe", "general": "#dfe6e9"
+    def _load_env(self):
+        env = dict(os.environ)
+        for d in [self.script_dir, os.path.join(self.script_dir, ".."), os.path.join(self.script_dir, "..", "..")]:
+            for fname in [".env", ".env.local", "config.env"]:
+                p = os.path.join(d, fname)
+                if os.path.isfile(p):
+                    try:
+                        with open(p, "r", errors="ignore") as f:
+                            for line in f:
+                                line = line.strip()
+                                if line and not line.startswith("#") and "=" in line:
+                                    k, _, v = line.partition("=")
+                                    env[k.strip()] = v.strip().strip('"').strip("'")
+                    except Exception:
+                        pass
+        return env
+
+
+# ============================================================
+# SOURCE CODE ANALYZER
+# ============================================================
+class SourceCodeAnalyzer:
+    def __init__(self, filepath, content):
+        self.filepath = filepath
+        self.content = content
+
+    def extract_description(self):
+        for pat in [r'^"""(.*?)"""', r"^'''(.*?)'''"]:
+            m = re.search(pat, self.content, re.DOTALL)
+            if m:
+                desc = m.group(1).strip()
+                lines = [l.strip() for l in desc.split("\n") if l.strip()]
+                return " ".join(lines[:3])[:250]
+        lines = self.content.split("\n")[:15]
+        comments = []
+        for line in lines:
+            s = line.strip()
+            if s.startswith(("//", "#")) and not s.startswith("#!"):
+                c = re.sub(r'^[/#\s]+', '', s).strip()
+                if len(c) > 8:
+                    comments.append(c)
+        if comments:
+            return " | ".join(comments[:2])[:250]
+        name = os.path.splitext(os.path.basename(self.filepath))[0]
+        return name.replace("_", " ").replace("-", " ").title()
+
+    def detect_providers(self):
+        found = []
+        for prov, info in AI_PATTERNS["providers"].items():
+            for pat in info["imports"]:
+                if re.search(pat, self.content, re.IGNORECASE):
+                    found.append(prov)
+                    break
+        return found
+
+    def detect_models(self):
+        found = []
+        for prov, info in AI_PATTERNS["providers"].items():
+            for model in info.get("models", []):
+                if re.search(re.escape(model), self.content, re.IGNORECASE):
+                    if model not in found:
+                        found.append(model)
+        mq = re.findall(r'''(?:model\s*=\s*|"model"\s*:\s*)['"]([\w.:\-/]+)['"]''', self.content)
+        for m in mq:
+            if len(m) > 3 and m not in found:
+                found.append(m)
+        return found
+
+    def detect_frameworks(self):
+        found = []
+        for fw, patterns in AI_PATTERNS["agent_frameworks"].items():
+            for pat in patterns:
+                if re.search(pat, self.content, re.IGNORECASE):
+                    found.append(fw)
+                    break
+        return found
+
+    def detect_areas(self):
+        found = []
+        for area, patterns in AI_PATTERNS["agent_areas"].items():
+            matches = sum(1 for p in patterns if re.search(p, self.content, re.IGNORECASE))
+            if matches >= 2:
+                found.append(area)
+        return found
+
+    def count_api_calls(self):
+        pats = [
+            r'\.create\s*\(', r'\.generate\s*\(',
+            r'\.chat\s*\(', r'\.complete\s*\(',
+            r'\.messages\.create\s*\(', r'\.run\s*\(',
+        ]
+        return sum(len(re.findall(p, self.content)) for p in pats)
+
+
+# ============================================================
+# MAIN SCANNER
+# ============================================================
+class AIAgentScanner:
+    SUPPORTED_EXT = {".py", ".js", ".ts", ".jsx", ".tsx", ".mjs"}
+    SKIP_DIRS = {
+        "__pycache__", "node_modules", ".git", "venv", "env",
+        ".venv", ".env", "dist", "build", ".next", ".nuxt",
+        ".ebextensions", ".elasticbeanstalk", "site-packages",
     }
-    for area, count in area_counts.most_common():
-        pct = round(count / total_agents * 100, 1)
-        color = area_colors.get(area, "#636e72")
-        area_chart_html += f"""
-        <div class="area-row">
-            <span class="area-name">{area.title()}</span>
-            <span class="area-bar">
-                <span class="area-fill" style="width:{pct}%;background:{color}"></span>
-            </span>
-            <span class="area-count">{count}</span>
-        </div>"""
 
-    # --- Provider HTML ---
-    provider_html = ""
-    for prov, count in provider_counts.most_common():
-        hue = (hash(prov) % 360)
-        provider_html += f"""
-        <div class="prov-item">
-            <span class="prov-dot" style="background:hsl({hue},70%,60%)"></span>
-            <span class="prov-name">{prov}</span>
-            <span class="prov-count">{count}</span>
-        </div>"""
+    def __init__(self, root_path):
+        self.root_path = os.path.abspath(root_path)
+        self.agents = []
+        self.folder_tree = {}
+        self.scan_stats = {
+            "total_files_scanned": 0, "total_folders_scanned": 0,
+            "total_agents_found": 0, "scan_start": None,
+            "scan_end": None, "scan_duration_ms": 0,
+        }
 
-    # --- Model HTML ---
-    model_html = ""
-    for model, count in model_counts.most_common():
-        model_html += f"""
-        <div class="model-chip">
-            <span class="model-name">{model}</span>
-            <span class="model-count">{count}</span>
-        </div>"""
+    def scan(self):
+        self.scan_stats["scan_start"] = datetime.now().isoformat()
+        t0 = time.time()
+        self.folder_tree = self._build_tree(self.root_path)
+        self._scan_dir(self.root_path)
+        elapsed = (time.time() - t0) * 1000
+        self.scan_stats["scan_end"] = datetime.now().isoformat()
+        self.scan_stats["scan_duration_ms"] = round(elapsed, 2)
+        self.scan_stats["total_agents_found"] = len(self.agents)
+        projects = self._group_projects()
+        return {
+            "scan_root": self.root_path,
+            "scan_stats": self.scan_stats,
+            "folder_tree": self.folder_tree,
+            "agents": self.agents,
+            "projects": projects,
+            "summary": self._build_summary(projects),
+        }
 
-    # --- Agent cards ---
-    agent_cards_html = ""
-    for idx, agent in enumerate(agents):
-        color_idx = idx % 12
-        providers_badges = "".join(
-            f'<span class="badge badge-provider">{p}</span>' for p in agent["providers"]
-        )
-        models_badges = "".join(
-            f'<span class="badge badge-model">{m}</span>' for m in agent["models"]
-        )
+    def _build_tree(self, path, depth=0):
+        node = {"name": os.path.basename(path) or path, "path": path, "type": "folder", "depth": depth, "children": [], "agent_count": 0}
+        self.scan_stats["total_folders_scanned"] += 1
+        try:
+            entries = sorted(os.listdir(path))
+        except PermissionError:
+            return node
+        for entry in entries:
+            full = os.path.join(path, entry)
+            if os.path.isdir(full):
+                if entry.startswith(".") or entry in self.SKIP_DIRS:
+                    continue
+                node["children"].append(self._build_tree(full, depth + 1))
+            elif os.path.isfile(full):
+                ext = os.path.splitext(entry)[1].lower()
+                if ext in self.SUPPORTED_EXT:
+                    node["children"].append({"name": entry, "path": full, "type": "file", "depth": depth + 1})
+        return node
 
-        area_icon = {
-            "code": "💻", "content": "📝", "data": "📊", "customer": "🤝",
-            "research": "🔬", "finance": "💰", "healthcare": "🏥",
-            "education": "📚", "automation": "⚙️", "multimedia": "🎨", "general": "🤖"
-        }.get(agent["area"], "🤖")
+    def _mark_tree(self, tree, filepath):
+        if tree["type"] == "file" and tree["path"] == filepath:
+            tree["is_agent"] = True
+        elif tree["type"] == "folder" and filepath.startswith(tree["path"]):
+            tree["agent_count"] += 1
+            for child in tree.get("children", []):
+                self._mark_tree(child, filepath)
 
-        # Failure analysis section
-        failure_html = ""
-        if agent["error_handling_findings"]:
-            issues = "".join(f"<li>{f}</li>" for f in agent["error_handling_findings"][:5])
-            failure_html = f"""
-            <div class="fail-section">
-                <span class="fail-title">🔍 Code Quality Issues Found:</span>
-                <ul class="fail-list">{issues}</ul>
-            </div>"""
+    def _scan_dir(self, path):
+        try:
+            entries = os.listdir(path)
+        except PermissionError:
+            return
+        for entry in entries:
+            full = os.path.join(path, entry)
+            if os.path.isdir(full):
+                if entry.startswith(".") or entry in self.SKIP_DIRS:
+                    continue
+                self._scan_dir(full)
+            elif os.path.isfile(full):
+                ext = os.path.splitext(entry)[1].lower()
+                if ext in self.SUPPORTED_EXT:
+                    self.scan_stats["total_files_scanned"] += 1
+                    self._analyze_file(full)
 
-        # Quality score color
-        qs = agent["quality_score"]
-        if qs >= 70:
-            q_color = "#00b894"
-        elif qs >= 40:
-            q_color = "#fdcb6e"
-        else:
-            q_color = "#e17055"
+    def _analyze_file(self, filepath):
+        try:
+            with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read()
+        except Exception:
+            return
+        if len(content.strip()) < 20:
+            return
 
-        success_color = "#00b894" if agent["success_rate"] > 85 else "#fdcb6e" if agent["success_rate"] > 65 else "#e17055"
+        az = SourceCodeAnalyzer(filepath, content)
+        providers = az.detect_providers()
+        frameworks = az.detect_frameworks()
+        if not providers and not frameworks:
+            return
 
-        # Token semi-circle value
-        token_pct = agent["tokens_used_pct"]
-        token_dash = min(token_pct * 1.57, 157)
-        req_dash = min((agent["api_calls_detected"] / 100) * 157, 157) if agent["api_calls_detected"] else 0
-        rpm_dash = min((agent["rate_rpm"] / 600) * 157, 157) if agent["rate_rpm"] else 0
-        success_dash = agent["success_rate"] * 1.57
+        models = az.detect_models()
+        areas = az.detect_areas()
+        desc = az.extract_description()
+        api_calls = az.count_api_calls()
 
-        agent_cards_html += f"""
-        <div class="agent-card card-{color_idx}">
-            <div class="card-header">
-                <div class="agent-icon">{area_icon}</div>
-                <div class="agent-title">
-                    <h3>{agent['agent_name']}</h3>
-                    <span class="agent-file">{agent['relative_path']}</span>
-                </div>
-                <div class="agent-shape shape-{color_idx % 6}"></div>
-            </div>
-            <div class="card-body">
-                <div class="info-grid">
-                    <div class="info-item">
-                        <span class="info-label">📦 Provider</span>
-                        <div class="info-value">{providers_badges}</div>
-                    </div>
-                    <div class="info-item">
-                        <span class="info-label">🧠 Model</span>
-                        <div class="info-value">{models_badges}</div>
-                    </div>
-                    <div class="info-item">
-                        <span class="info-label">🎯 Area</span>
-                        <span class="info-value"><span class="area-tag area-{agent['area']}">{agent['area'].title()}</span></span>
-                    </div>
-                    <div class="info-item">
-                        <span class="info-label">📄 File</span>
-                        <span class="info-value">{agent['file_size_kb']} KB | {agent['lines_of_code']} lines</span>
-                    </div>
-                </div>
+        log_reader = LogFileReader(filepath)
+        log_data = log_reader.parse_logs()
 
-                <div class="description-box">
-                    <span class="desc-label">📋 Description</span>
-                    <p>{agent['description']}</p>
-                </div>
+        env_reader = EnvConfigReader(filepath, providers)
+        api_keys = env_reader.read_api_keys_present()
+        config = env_reader.read_config()
 
-                <div class="quality-bar-container">
-                    <span class="quality-label">Code Quality Score</span>
-                    <div class="quality-bar">
-                        <div class="quality-fill" style="width:{agent['quality_score']}%;background:{q_color}"></div>
-                    </div>
-                    <span class="quality-text">{agent['quality_score']}/100</span>
-                </div>
+        usage = self._build_usage(log_data, config)
 
-                <div class="metrics-container">
-                    <div class="metric-card">
-                        <div class="metric-ring">
-                            <svg viewBox="0 0 120 120" class="semi-circle">
-                                <path d="M 10 110 A 50 50 0 1 1 110 110" fill="none" stroke="#2a2a3e" stroke-width="12"/>
-                                <path d="M 10 110 A 50 50 0 1 1 110 110" fill="none" stroke="#00d4aa" stroke-width="12"
-                                      stroke-dasharray="{token_dash} 157" stroke-linecap="round"/>
-                            </svg>
-                            <div class="metric-center">
-                                <span class="metric-num">{agent['estimated_tokens']:,}</span>
-                                <span class="metric-label">Tokens</span>
-                            </div>
-                        </div>
-                        <div class="metric-detail">
-                            <span class="meter-bar">
-                                <span class="meter-fill" style="width:{min(token_pct, 100)}%;background:linear-gradient(90deg,#00d4aa,#00b894)"></span>
-                            </span>
-                            <span class="meter-text">{token_pct}% of {agent['tokens_total_available']:,}</span>
-                        </div>
-                    </div>
+        agent = {
+            "id": hashlib.md5(filepath.encode()).hexdigest()[:12],
+            "script_name": os.path.basename(filepath),
+            "script_path": filepath,
+            "relative_path": os.path.relpath(filepath, self.root_path),
+            "folder": os.path.dirname(os.path.relpath(filepath, self.root_path)) or ".",
+            "providers": providers,
+            "models": models or ["Not specified"],
+            "frameworks": frameworks or ["Direct API"],
+            "areas": areas or ["General Purpose"],
+            "description": desc,
+            "file_size_bytes": os.path.getsize(filepath),
+            "lines_of_code": content.count("\n") + 1,
+            "api_call_sites": api_calls,
+            "last_modified": datetime.fromtimestamp(os.path.getmtime(filepath)).isoformat(),
+            "api_keys_configured": api_keys,
+            "usage": usage,
+        }
+        self.agents.append(agent)
+        self._mark_tree(self.folder_tree, filepath)
 
-                    <div class="metric-card">
-                        <div class="metric-ring">
-                            <svg viewBox="0 0 120 120" class="semi-circle">
-                                <path d="M 10 110 A 50 50 0 1 1 110 110" fill="none" stroke="#2a2a3e" stroke-width="12"/>
-                                <path d="M 10 110 A 50 50 0 1 1 110 110" fill="none" stroke="#6c5ce7" stroke-width="12"
-                                      stroke-dasharray="{req_dash} 157" stroke-linecap="round"/>
-                            </svg>
-                            <div class="metric-center">
-                                <span class="metric-num">{agent['api_calls_detected']}</span>
-                                <span class="metric-label">API Calls</span>
-                            </div>
-                        </div>
-                        <div class="metric-detail">
-                            <span class="meter-text">
-                                RPM: {agent['rate_rpm'] or 'N/A'} | 
-                                TPM: {agent['rate_tpm'] or 'N/A'} | 
-                                RPD: {agent['rate_rpd'] or 'N/A'}
-                            </span>
-                        </div>
-                    </div>
+    def _build_usage(self, log_data, config):
+        total = log_data.get("total_requests", 0)
+        success = log_data.get("successful_requests", 0)
+        failed = log_data.get("failed_requests", 0)
+        tokens = log_data.get("tokens_used", 0)
+        rpm = config.get("rpm") or config.get("rate_limit_rpm")
+        tpm = config.get("tpm") or config.get("rate_limit_tpm")
+        rpd = config.get("rpd") or config.get("rate_limit_rpd")
+        token_limit = config.get("token_limit") or config.get("max_tokens_total")
+        return {
+            "data_source": log_data.get("data_source", "none"),
+            "log_files_found": log_data.get("log_files_found", []),
+            "total_requests": total or None,
+            "successful_requests": success or None,
+            "failed_requests": failed,
+            "success_rate": round(success / total * 100, 1) if total > 0 else None,
+            "tokens_used": tokens or None,
+            "prompt_tokens": log_data.get("prompt_tokens") or None,
+            "completion_tokens": log_data.get("completion_tokens") or None,
+            "tokens_available": token_limit,
+            "tokens_percentage": round(tokens / token_limit * 100, 1) if tokens and token_limit else None,
+            "rpm": rpm, "tpm": tpm, "rpd": rpd,
+            "failure_reasons": log_data.get("failure_reasons", {}),
+            "avg_response_time_ms": log_data.get("avg_response_time_ms"),
+            "last_request_time": log_data.get("last_request_time"),
+        }
 
-                    <div class="metric-card">
-                        <div class="metric-ring">
-                            <svg viewBox="0 0 120 120" class="semi-circle">
-                                <path d="M 10 110 A 50 50 0 1 1 110 110" fill="none" stroke="#2a2a3e" stroke-width="12"/>
-                                <path d="M 10 110 A 50 50 0 1 1 110 110" fill="none" stroke="#fd79a8" stroke-width="12"
-                                      stroke-dasharray="{rpm_dash} 157" stroke-linecap="round"/>
-                            </svg>
-                            <div class="metric-center">
-                                <span class="metric-num">{agent['rate_rpm'] or '∞'}</span>
-                                <span class="metric-label">RPM Limit</span>
-                            </div>
-                        </div>
-                        <div class="metric-detail">
-                            <span class="meter-text">TPM: {agent['rate_tpm'] or '∞'} | RPD: {agent['rate_rpd'] or '∞'}</span>
-                        </div>
-                    </div>
+    def _group_projects(self):
+        projects = {}
+        for agent in self.agents:
+            parts = agent["folder"].replace("\\", "/").split("/")
+            top = parts[0] if parts and parts[0] not in (".", "") else "Root Project"
+            projects.setdefault(top, []).append(agent)
+        result = []
+        for name, agents in projects.items():
+            result.append({
+                "project_name": name,
+                "agent_count": len(agents),
+                "agents": [{"id": a["id"], "script_name": a["script_name"], "providers": a["providers"],
+                            "models": a["models"], "areas": a["areas"], "description": a["description"][:100]} for a in agents],
+                "providers_used": list({p for a in agents for p in a["providers"]}),
+                "models_used": list({m for a in agents for m in a["models"]}),
+                "total_requests": sum(a["usage"]["total_requests"] or 0 for a in agents) or None,
+                "total_tokens": sum(a["usage"]["tokens_used"] or 0 for a in agents) or None,
+                "total_success": sum(a["usage"]["successful_requests"] or 0 for a in agents) or None,
+                "total_failed": sum(a["usage"]["failed_requests"] or 0 for a in agents),
+            })
+        return result
 
-                    <div class="metric-card">
-                        <div class="metric-ring">
-                            <svg viewBox="0 0 120 120" class="semi-circle">
-                                <path d="M 10 110 A 50 50 0 1 1 110 110" fill="none" stroke="#2a2a3e" stroke-width="12"/>
-                                <path d="M 10 110 A 50 50 0 1 1 110 110" fill="none" stroke="{success_color}" stroke-width="12"
-                                      stroke-dasharray="{success_dash} 157" stroke-linecap="round"/>
-                            </svg>
-                            <div class="metric-center">
-                                <span class="metric-num">{agent['success_rate']}%</span>
-                                <span class="metric-label">Success Est.</span>
-                            </div>
-                        </div>
-                        <div class="metric-detail">
-                            <div class="request-bars">
-                                <span class="req-bar req-success" style="flex:{agent['success_count']}">✅ {agent['success_count']}</span>
-                                <span class="req-bar req-fail" style="flex:{agent['fail_count']}">❌ {agent['fail_count']}</span>
-                            </div>
-                            <span class="meter-text">{agent['total_requests']} total | {agent['quality_score']}/100 quality</span>
-                        </div>
-                    </div>
-                </div>
+    def _build_summary(self, projects):
+        pc, ac, mc = {}, {}, {}
+        tr = ts = tf = tt = 0
+        fr = {}
+        for a in self.agents:
+            for p in a["providers"]: pc[p] = pc.get(p, 0) + 1
+            for ar in a["areas"]: ac[ar] = ac.get(ar, 0) + 1
+            for m in a["models"]: mc[m] = mc.get(m, 0) + 1
+            u = a["usage"]
+            tr += u.get("total_requests") or 0
+            ts += u.get("successful_requests") or 0
+            tf += u.get("failed_requests") or 0
+            tt += u.get("tokens_used") or 0
+            for r, c in u.get("failure_reasons", {}).items():
+                fr[r] = fr.get(r, 0) + c
+        return {
+            "total_agents": len(self.agents), "total_projects": len(projects),
+            "providers_breakdown": pc, "area_breakdown": ac, "model_breakdown": mc,
+            "overall_usage": {
+                "total_requests": tr or None, "total_successful": ts or None,
+                "total_failed": tf, "overall_success_rate": round(ts / tr * 100, 1) if tr > 0 else None,
+                "total_tokens_used": tt or None, "failure_reason_breakdown": fr,
+            },
+        }
 
-                {failure_html}
-            </div>
-        </div>"""
 
-    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+# ============================================================
+# GLOBAL SCAN CACHE
+# ============================================================
+_scan_cache = {"data": None, "lock": threading.Lock()}
 
-    html = f"""<!DOCTYPE html>
+
+def get_scan_data(force=False):
+    with _scan_cache["lock"]:
+        if _scan_cache["data"] is None or force:
+            scanner = AIAgentScanner(SCAN_ROOT)
+            _scan_cache["data"] = scanner.scan()
+        return _scan_cache["data"]
+
+
+# ============================================================
+# DASHBOARD HTML (complete inline - CSS + JS + HTML)
+# ============================================================
+def get_dashboard_html():
+    return '''<!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>🤖 AI Agent Dashboard — Real Scan Results</title>
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
-    <style>
-        *, *::before, *::after {{ margin:0; padding:0; box-sizing:border-box; }}
-        :root {{
-            --bg: #0a0a1a; --bg2: #12122a; --bg3: #1a1a3e;
-            --card-bg: #16163a; --text: #e8e8f0; --text2: #a0a0c0;
-            --border: #2a2a5e; --accent1: #00d4aa; --accent2: #6c5ce7;
-            --accent3: #fd79a8; --accent4: #fdcb6e; --accent5: #74b9ff;
-            --accent6: #e17055; --shadow: 0 8px 32px rgba(0,0,0,0.4);
-            --radius: 16px;
-        }}
-        html {{ font-size: 15px; }}
-        body {{
-            font-family: 'Inter', -apple-system, sans-serif;
-            background: var(--bg); color: var(--text);
-            min-height: 100vh; overflow-x: hidden;
-        }}
-        ::-webkit-scrollbar {{ width:6px; }}
-        ::-webkit-scrollbar-track {{ background:var(--bg); }}
-        ::-webkit-scrollbar-thumb {{ background:var(--accent1); border-radius:3px; }}
-
-        .bg-particles {{
-            position:fixed; top:0; left:0; width:100%; height:100%;
-            overflow:hidden; pointer-events:none; z-index:0;
-        }}
-        .bg-particles span {{
-            position:absolute; display:block; border-radius:50%;
-            animation: float 20s infinite; opacity:0.07;
-        }}
-        .bg-particles span:nth-child(1) {{ width:300px; height:300px; top:-5%; left:-5%; background:radial-gradient(circle,#00d4aa,transparent); animation-delay:0s; }}
-        .bg-particles span:nth-child(2) {{ width:400px; height:400px; top:60%; right:-10%; background:radial-gradient(circle,#6c5ce7,transparent); animation-delay:-5s; }}
-        .bg-particles span:nth-child(3) {{ width:250px; height:250px; bottom:-5%; left:30%; background:radial-gradient(circle,#fd79a8,transparent); animation-delay:-10s; }}
-        .bg-particles span:nth-child(4) {{ width:350px; height:350px; top:20%; left:60%; background:radial-gradient(circle,#fdcb6e,transparent); animation-delay:-15s; }}
-        @keyframes float {{
-            0%,100% {{ transform:translate(0,0) scale(1); }}
-            25% {{ transform:translate(50px,-30px) scale(1.05); }}
-            50% {{ transform:translate(-20px,40px) scale(0.95); }}
-            75% {{ transform:translate(30px,20px) scale(1.02); }}
-        }}
-
-        .header {{
-            position:relative; z-index:1;
-            text-align:center; padding:40px 20px 30px;
-            background:linear-gradient(135deg, var(--bg2), var(--bg3));
-            border-bottom:1px solid var(--border);
-        }}
-        .header h1 {{
-            font-size:2.8rem; font-weight:800;
-            background:linear-gradient(135deg, #00d4aa, #6c5ce7, #fd79a8, #fdcb6e);
-            -webkit-background-clip:text; -webkit-text-fill-color:transparent;
-            letter-spacing:-1px;
-        }}
-        .header .subtitle {{ color:var(--text2); font-size:1.1rem; margin-top:8px; }}
-        .header .scan-info {{
-            display:flex; justify-content:center; gap:30px; margin-top:20px; flex-wrap:wrap;
-        }}
-        .header .stat-bubble {{
-            display:flex; align-items:center; gap:10px;
-            background:var(--card-bg); border:1px solid var(--border);
-            padding:12px 22px; border-radius:100px; font-size:0.95rem;
-        }}
-        .header .stat-bubble .num {{ font-weight:700; font-size:1.2rem; }}
-        .header .scan-path {{
-            margin-top:12px; font-size:0.85rem; color:var(--text2);
-            font-family:'JetBrains Mono', monospace;
-            background:var(--bg); display:inline-block; padding:6px 16px;
-            border-radius:8px; border:1px solid var(--border); max-width:90vw; overflow:hidden; text-overflow:ellipsis;
-        }}
-
-        .dashboard {{ position:relative; z-index:1; max-width:1440px; margin:0 auto; padding:30px 20px 60px; }}
-
-        .summary-row {{
-            display:grid;
-            grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
-            gap:20px; margin-bottom:40px;
-        }}
-        .summary-card {{
-            background:var(--card-bg); border-radius:var(--radius);
-            border:1px solid var(--border); padding:24px 16px;
-            text-align:center; position:relative; overflow:hidden;
-            transition:transform 0.3s, box-shadow 0.3s;
-        }}
-        .summary-card:hover {{ transform:translateY(-4px); box-shadow:var(--shadow); }}
-        .summary-card .shape-bg {{ position:absolute; top:-30px; right:-30px; width:100px; height:100px; opacity:0.06; }}
-        .summary-card .shape-bg svg {{ width:100%; height:100%; }}
-        .summary-card .s-value {{ font-size:2.5rem; font-weight:800; }}
-        .summary-card .s-label {{ color:var(--text2); margin-top:4px; font-size:0.9rem; }}
-        .summary-card .s-icon {{ font-size:2rem; margin-bottom:8px; }}
-        .sc-0 .s-value {{ color:#00d4aa; }} .sc-1 .s-value {{ color:#6c5ce7; }}
-        .sc-2 .s-value {{ color:#fd79a8; }} .sc-3 .s-value {{ color:#fdcb6e; }}
-        .sc-4 .s-value {{ color:#74b9ff; }} .sc-5 .s-value {{ color:#e17055; }}
-
-        .charts-row {{
-            display:grid; grid-template-columns: 1fr 1fr;
-            gap:20px; margin-bottom:40px;
-        }}
-        .chart-card {{
-            background:var(--card-bg); border-radius:var(--radius);
-            border:1px solid var(--border); padding:24px;
-        }}
-        .chart-card h3 {{ font-size:1.1rem; margin-bottom:16px; color:var(--text2); }}
-        .area-row {{ display:flex; align-items:center; gap:12px; margin-bottom:10px; }}
-        .area-name {{ width:100px; font-weight:500; font-size:0.9rem; }}
-        .area-bar {{ flex:1; height:20px; background:var(--bg3); border-radius:10px; overflow:hidden; }}
-        .area-fill {{ height:100%; border-radius:10px; transition:width 1s ease; }}
-        .area-count {{ width:30px; text-align:right; font-weight:600; }}
-
-        .prov-list {{ display:flex; flex-wrap:wrap; gap:12px; }}
-        .prov-item {{
-            display:flex; align-items:center; gap:8px;
-            background:var(--bg3); padding:8px 14px; border-radius:8px;
-        }}
-        .prov-dot {{ width:10px; height:10px; border-radius:50%; display:inline-block; }}
-        .prov-name {{ font-size:0.9rem; }}
-        .prov-count {{ font-weight:600; color:var(--text2); }}
-
-        .model-cloud {{ display:flex; flex-wrap:wrap; gap:10px; }}
-        .model-chip {{
-            display:flex; align-items:center; gap:6px;
-            background:linear-gradient(135deg, var(--bg3), var(--card-bg));
-            border:1px solid var(--border); padding:6px 14px; border-radius:20px;
-        }}
-        .model-name {{ font-size:0.85rem; }}
-        .model-count {{ font-size:0.75rem; background:var(--accent1); color:#000; padding:1px 8px; border-radius:10px; font-weight:600; }}
-
-        .agents-section h2 {{
-            font-size:1.5rem; margin-bottom:20px; display:flex; align-items:center; gap:10px;
-        }}
-        .agents-grid {{
-            display:grid; grid-template-columns: repeat(auto-fill, minmax(500px, 1fr));
-            gap:24px;
-        }}
-        .agent-card {{
-            background:var(--card-bg); border-radius:var(--radius);
-            border:1px solid var(--border); overflow:hidden;
-            transition:transform 0.3s, box-shadow 0.3s;
-        }}
-        .agent-card:hover {{ transform:translateY(-6px); box-shadow:var(--shadow); }}
-
-        .card-header {{
-            display:flex; align-items:center; gap:14px;
-            padding:18px 20px;
-            background:linear-gradient(135deg, var(--bg3), transparent);
-            border-bottom:1px solid var(--border); position:relative;
-        }}
-        .agent-icon {{ font-size:2.2rem; }}
-        .agent-title {{ flex:1; min-width:0; }}
-        .agent-title h3 {{ font-size:1.1rem; font-weight:700; }}
-        .agent-file {{ font-size:0.75rem; color:var(--text2); font-family:'JetBrains Mono',monospace; word-break:break-all; display:block; }}
-        .agent-shape {{
-            width:60px; height:60px; flex-shrink:0;
-            clip-path: polygon(50% 0%, 100% 25%, 100% 75%, 50% 100%, 0% 75%, 0% 25%);
-            opacity:0.15;
-        }}
-        .shape-0 {{ background:linear-gradient(135deg,#00d4aa,#00b894); }}
-        .shape-1 {{ background:linear-gradient(135deg,#6c5ce7,#a29bfe); }}
-        .shape-2 {{ background:linear-gradient(135deg,#fd79a8,#e84393); }}
-        .shape-3 {{ background:linear-gradient(135deg,#fdcb6e,#f39c12); }}
-        .shape-4 {{ background:linear-gradient(135deg,#74b9ff,#0984e3); }}
-        .shape-5 {{ background:linear-gradient(135deg,#e17055,#d63031); }}
-
-        .card-body {{ padding:20px; }}
-
-        .info-grid {{ display:grid; grid-template-columns:1fr 1fr; gap:14px; margin-bottom:14px; }}
-        .info-label {{ font-size:0.8rem; color:var(--text2); display:block; margin-bottom:4px; }}
-        .info-value {{ font-size:0.9rem; }}
-        .badge {{
-            display:inline-block; padding:2px 10px; border-radius:12px;
-            font-size:0.75rem; font-weight:500; margin:2px;
-        }}
-        .badge-provider {{ background:rgba(108,92,231,0.25); color:#a29bfe; border:1px solid rgba(108,92,231,0.3); }}
-        .badge-model {{ background:rgba(0,212,170,0.2); color:#00d4aa; border:1px solid rgba(0,212,170,0.3); }}
-        .area-tag {{ display:inline-block; padding:2px 12px; border-radius:12px; font-size:0.8rem; font-weight:600; }}
-        .area-code {{ background:rgba(0,184,148,0.2); color:#00b894; }}
-        .area-content {{ background:rgba(253,203,110,0.2); color:#fdcb6e; }}
-        .area-data {{ background:rgba(108,92,231,0.2); color:#a29bfe; }}
-        .area-customer {{ background:rgba(253,121,168,0.2); color:#fd79a8; }}
-        .area-research {{ background:rgba(116,185,255,0.2); color:#74b9ff; }}
-        .area-finance {{ background:rgba(248,165,194,0.2); color:#f8a5c2; }}
-        .area-healthcare {{ background:rgba(225,112,85,0.2); color:#e17055; }}
-        .area-education {{ background:rgba(129,236,236,0.2); color:#81ecec; }}
-        .area-automation {{ background:rgba(255,234,167,0.2); color:#ffeaa7; }}
-        .area-multimedia {{ background:rgba(162,155,254,0.2); color:#a29bfe; }}
-        .area-general {{ background:rgba(223,230,233,0.2); color:#dfe6e9; }}
-
-        .description-box {{
-            background:var(--bg3); border-radius:10px; padding:12px 14px; margin-bottom:14px;
-            border-left:3px solid var(--accent1);
-        }}
-        .desc-label {{ font-size:0.8rem; color:var(--text2); display:block; margin-bottom:4px; }}
-        .description-box p {{ font-size:0.88rem; line-height:1.5; color:var(--text); }}
-
-        .quality-bar-container {{
-            display:flex; align-items:center; gap:10px; margin-bottom:16px;
-        }}
-        .quality-label {{ font-size:0.8rem; color:var(--text2); width:100px; }}
-        .quality-bar {{ flex:1; height:8px; background:var(--bg); border-radius:4px; overflow:hidden; }}
-        .quality-fill {{ height:100%; border-radius:4px; transition:width 1.5s ease; }}
-        .quality-text {{ font-size:0.8rem; font-weight:600; width:40px; text-align:right; }}
-
-        .metrics-container {{
-            display:grid; grid-template-columns:1fr 1fr; gap:14px; margin-bottom:10px;
-        }}
-        .metric-card {{ background:var(--bg3); border-radius:12px; padding:12px; text-align:center; }}
-        .metric-ring {{ position:relative; width:120px; height:65px; margin:0 auto 6px; overflow:hidden; }}
-        .metric-ring .semi-circle {{ width:120px; height:65px; }}
-        .metric-center {{ position:absolute; bottom:0; left:50%; transform:translateX(-50%); text-align:center; }}
-        .metric-num {{ display:block; font-size:1.1rem; font-weight:800; }}
-        .metric-label {{ font-size:0.6rem; color:var(--text2); text-transform:uppercase; letter-spacing:1px; }}
-        .metric-detail {{ margin-top:4px; }}
-        .meter-bar {{ display:block; height:5px; background:var(--bg); border-radius:3px; overflow:hidden; }}
-        .meter-fill {{ display:block; height:100%; border-radius:3px; transition:width 1.5s ease; }}
-        .meter-text {{ font-size:0.68rem; color:var(--text2); margin-top:2px; display:block; }}
-
-        .request-bars {{ display:flex; gap:3px; height:18px; margin-bottom:3px; }}
-        .req-bar {{
-            display:flex; align-items:center; justify-content:center;
-            font-size:0.6rem; border-radius:3px; color:#000; font-weight:600;
-            padding:0 3px; white-space:nowrap;
-        }}
-        .req-success {{ background:#00b894; }}
-        .req-fail {{ background:#e17055; }}
-
-        .fail-section {{
-            margin-top:12px; padding:10px 12px;
-            background:rgba(225,112,85,0.08); border:1px solid rgba(225,112,85,0.25);
-            border-radius:10px;
-        }}
-        .fail-title {{ font-weight:600; color:#e17055; font-size:0.85rem; }}
-        .fail-list {{ margin:6px 0 0 16px; font-size:0.82rem; color:var(--text2); }}
-        .fail-list li {{ margin-bottom:2px; }}
-
-        .quality-tag {{
-            display:inline-block; padding:2px 10px; border-radius:10px;
-            font-size:0.7rem; font-weight:600;
-        }}
-        .quality-high {{ background:rgba(0,184,148,0.2); color:#00b894; }}
-        .quality-med {{ background:rgba(253,203,110,0.2); color:#fdcb6e; }}
-        .quality-low {{ background:rgba(225,112,85,0.2); color:#e17055; }}
-
-        .footer {{
-            text-align:center; padding:30px; color:var(--text2); font-size:0.85rem;
-            border-top:1px solid var(--border); margin-top:40px;
-        }}
-
-        @media (max-width: 900px) {{
-            .charts-row {{ grid-template-columns:1fr; }}
-            .agents-grid {{ grid-template-columns:1fr; }}
-            .metrics-container {{ grid-template-columns:1fr; }}
-        }}
-        @media (max-width: 600px) {{
-            .header h1 {{ font-size:2rem; }}
-            .summary-row {{ grid-template-columns:repeat(2,1fr); }}
-            .info-grid {{ grid-template-columns:1fr; }}
-        }}
-    </style>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>AI Agent Scanner</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+<style>
+:root{--bg:#0a0a1a;--bg2:#12122a;--bg3:#1a1a3e;--tx:#e8e8ff;--tx2:#9999cc;--tx3:#6666aa;--cyan:#00f5ff;--mag:#ff00ff;--grn:#00ff88;--yel:#ffee00;--org:#ff8800;--red:#ff3355;--blu:#4488ff;--pur:#aa44ff;--pnk:#ff66aa;--tea:#00ccaa;--brd:rgba(255,255,255,0.08);--rad:16px}
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--tx);min-height:100vh;overflow-x:hidden}
+::-webkit-scrollbar{width:6px}::-webkit-scrollbar-track{background:var(--bg)}::-webkit-scrollbar-thumb{background:linear-gradient(var(--cyan),var(--pur));border-radius:3px}
+.bg{position:fixed;top:0;left:0;width:100%;height:100%;z-index:-1;pointer-events:none}
+.orb{position:absolute;border-radius:50%;filter:blur(80px);animation:fl 20s ease-in-out infinite}
+.orb:nth-child(1){width:500px;height:500px;top:-100px;left:-100px;background:rgba(0,245,255,0.07)}
+.orb:nth-child(2){width:400px;height:400px;top:50%;right:-100px;background:rgba(255,0,255,0.05);animation-delay:-7s}
+.orb:nth-child(3){width:600px;height:600px;bottom:-200px;left:30%;background:rgba(0,255,136,0.04);animation-delay:-14s}
+@keyframes fl{0%,100%{transform:translate(0,0)}50%{transform:translate(40px,-40px)}}
+.hdr{background:rgba(18,18,42,0.95);backdrop-filter:blur(20px);border-bottom:1px solid var(--brd);padding:14px 28px;display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:100;flex-wrap:wrap;gap:10px}
+.hdr-l{display:flex;align-items:center;gap:12px}
+.logo{width:44px;height:44px;background:linear-gradient(135deg,var(--cyan),var(--pur));border-radius:12px;display:flex;align-items:center;justify-content:center;font-size:20px;animation:gl 3s infinite}
+@keyframes gl{0%,100%{box-shadow:0 0 15px rgba(0,245,255,0.3)}50%{box-shadow:0 0 30px rgba(0,245,255,0.5)}}
+.brand h1{font-size:18px;font-weight:800;background:linear-gradient(135deg,var(--cyan),var(--pur));-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.brand p{font-size:10px;color:var(--tx3);margin-top:1px}
+.hdr-r{display:flex;align-items:center;gap:8px}
+.btn{padding:8px 16px;border:none;border-radius:10px;font-weight:600;font-size:11px;cursor:pointer;display:flex;align-items:center;gap:6px;transition:all 0.3s;font-family:'Inter',sans-serif}
+.btn-p{background:linear-gradient(135deg,var(--cyan),var(--pur));color:#000}
+.btn-p:hover{transform:translateY(-2px);box-shadow:0 4px 15px rgba(0,245,255,0.3)}
+.btn-s{background:rgba(255,255,255,0.07);color:var(--tx);border:1px solid var(--brd)}
+.sp{background:rgba(255,255,255,0.05);border:1px solid var(--brd);border-radius:8px;padding:5px 12px;font-size:10px;color:var(--tx3);font-family:'JetBrains Mono',monospace;max-width:250px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.mn{padding:22px 28px;max-width:1800px;margin:0 auto}
+.sr{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-bottom:22px}
+.sc{background:var(--bg3);border:1px solid var(--brd);border-radius:var(--rad);padding:16px;position:relative;overflow:hidden;transition:all 0.3s}
+.sc:hover{transform:translateY(-3px);border-color:rgba(0,245,255,0.3);box-shadow:0 6px 20px rgba(0,0,0,0.3)}
+.si{width:38px;height:38px;border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:17px;margin-bottom:8px}
+.sv{font-size:24px;font-weight:800;font-family:'JetBrains Mono',monospace}
+.sl{font-size:10px;color:var(--tx3);margin-top:2px;text-transform:uppercase;letter-spacing:1px}
+.sb{position:absolute;bottom:0;left:0;height:3px;width:100%}
+.tabs{display:flex;gap:3px;margin-bottom:20px;background:rgba(255,255,255,0.03);border-radius:12px;padding:3px;flex-wrap:wrap}
+.tab{padding:8px 16px;border-radius:9px;cursor:pointer;font-size:11px;font-weight:600;color:var(--tx3);transition:all 0.3s;display:flex;align-items:center;gap:5px;white-space:nowrap}
+.tab:hover{color:var(--tx);background:rgba(255,255,255,0.05)}
+.tab.on{background:linear-gradient(135deg,var(--cyan),var(--pur));color:#000}
+.tc{display:none;animation:fi 0.3s ease}.tc.on{display:block}
+@keyframes fi{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+.g2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.g3{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:16px}
+.cs2{grid-column:span 2}
+.cd{background:var(--bg3);border:1px solid var(--brd);border-radius:var(--rad);padding:20px;transition:all 0.3s}
+.cd:hover{border-color:rgba(0,245,255,0.15)}
+.ch{display:flex;justify-content:space-between;align-items:center;margin-bottom:14px}
+.ch h3{font-size:14px;font-weight:700;display:flex;align-items:center;gap:7px}
+.hg{display:flex;flex-wrap:wrap;gap:12px;justify-content:center;padding:6px 0}
+.hex{clip-path:polygon(50% 0%,100% 25%,100% 75%,50% 100%,0% 75%,0% 25%);display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;cursor:default;transition:all 0.3s}
+.hex:hover{transform:scale(1.08)}
+.pen{clip-path:polygon(50% 0%,100% 38%,82% 100%,18% 100%,0% 38%);display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;transition:all 0.3s}
+.pen:hover{transform:scale(1.08) rotate(3deg)}
+.oct{clip-path:polygon(30% 0%,70% 0%,100% 30%,100% 70%,70% 100%,30% 100%,0% 70%,0% 30%);display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;transition:all 0.3s}
+.oct:hover{transform:scale(1.08) rotate(-3deg)}
+.smw{display:flex;flex-wrap:wrap;justify-content:center;gap:18px;padding:6px 0}
+.sem{position:relative;width:130px;height:74px;overflow:hidden}
+.sem .sv2{position:absolute;bottom:3px;left:50%;transform:translateX(-50%);font-size:16px;font-weight:800;font-family:'JetBrains Mono',monospace}
+.sem .sl2{position:absolute;bottom:-16px;left:50%;transform:translateX(-50%);font-size:9px;color:var(--tx3);white-space:nowrap}
+.ac{background:var(--bg3);border:1px solid var(--brd);border-radius:var(--rad);padding:18px;position:relative;overflow:hidden;transition:all 0.3s}
+.ac:hover{transform:translateY(-3px);box-shadow:0 6px 20px rgba(0,0,0,0.3);border-color:rgba(0,245,255,0.25)}
+.atb{position:absolute;top:0;left:0;right:0;height:4px}
+.ah{display:flex;align-items:flex-start;gap:10px;margin-bottom:12px}
+.ai2{width:42px;height:42px;border-radius:12px;display:flex;align-items:center;justify-content:center;font-size:19px;flex-shrink:0}
+.an{font-size:14px;font-weight:700;margin-bottom:2px;word-break:break-all}
+.ap{font-size:9px;color:var(--tx3);font-family:'JetBrains Mono',monospace}
+.ir{display:flex;align-items:flex-start;gap:7px;padding:4px 0;font-size:11px;border-bottom:1px solid rgba(255,255,255,0.04)}
+.ir:last-child{border-bottom:none}
+.ii{width:16px;text-align:center;color:var(--cyan);flex-shrink:0;margin-top:1px}
+.il{color:var(--tx3);min-width:65px;flex-shrink:0}
+.iv{color:var(--tx);flex:1;word-break:break-word}
+.tag{display:inline-block;padding:2px 7px;border-radius:20px;font-size:9px;font-weight:600;margin:1px;border:1px solid}
+.tp{background:rgba(0,245,255,0.1);color:var(--cyan);border-color:rgba(0,245,255,0.3)}
+.tm{background:rgba(170,68,255,0.1);color:var(--pur);border-color:rgba(170,68,255,0.3)}
+.ta{background:rgba(0,255,136,0.1);color:var(--grn);border-color:rgba(0,255,136,0.3)}
+.tf{background:rgba(255,136,0,0.1);color:var(--org);border-color:rgba(255,136,0,0.3)}
+.db{background:rgba(0,245,255,0.04);border-left:3px solid var(--cyan);border-radius:0 8px 8px 0;padding:7px 10px;margin:8px 0;font-size:10px;color:var(--tx2);line-height:1.5}
+.ug{display:grid;grid-template-columns:repeat(3,1fr);gap:5px;margin-top:8px}
+.uc{background:rgba(255,255,255,0.03);border-radius:8px;padding:7px;text-align:center}
+.uv{font-size:13px;font-weight:700;font-family:'JetBrains Mono',monospace}
+.ul{font-size:8px;color:var(--tx3);text-transform:uppercase;margin-top:1px}
+.pb{width:100%;height:6px;background:rgba(255,255,255,0.06);border-radius:3px;overflow:hidden;margin:6px 0}
+.pf{height:100%;border-radius:3px;transition:width 1.2s ease}
+.nd{font-size:9px;color:var(--tx3);font-style:italic}
+.bd{display:inline-flex;align-items:center;gap:3px;padding:2px 7px;border-radius:20px;font-size:8px;font-weight:700;text-transform:uppercase;letter-spacing:1px}
+.br{background:rgba(0,255,136,0.15);color:var(--grn);border:1px solid rgba(0,255,136,0.3)}
+.bn{background:rgba(255,136,0,0.15);color:var(--org);border:1px solid rgba(255,136,0,0.3)}
+.dt{width:100%;border-collapse:collapse}
+.dt th,.dt td{padding:9px 12px;text-align:left;border-bottom:1px solid var(--brd);font-size:11px}
+.dt th{color:var(--tx3);font-weight:600;text-transform:uppercase;font-size:9px}
+.dt tr:hover{background:rgba(255,255,255,0.02)}
+.sd{width:6px;height:6px;border-radius:50%;display:inline-block;margin-right:4px}
+.sg{background:var(--grn)}.sr2{background:var(--red)}.sy{background:var(--yel)}
+.fr{font-size:9px;color:var(--tx3);padding:1px 0}
+.fd{width:5px;height:5px;border-radius:50%;display:inline-block;margin-right:4px;background:var(--red)}
+.tb{background:var(--bg3);border:1px solid var(--brd);border-radius:var(--rad);padding:16px;max-height:500px;overflow-y:auto}
+.tn{padding:3px 0;font-family:'JetBrains Mono',monospace;font-size:11px}
+.tfo{color:var(--yel);cursor:pointer}.tfo:hover{color:var(--org)}
+.tfi{color:var(--tx2)}.tfi.ia{color:var(--grn);font-weight:600}
+.tc2{margin-left:16px}
+.tbg{display:inline-block;background:var(--cyan);color:#000;font-size:8px;font-weight:700;padding:1px 5px;border-radius:8px;margin-left:5px}
+.abg{background:var(--grn)}
+.dw{position:relative;display:inline-block}
+.dcn{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);text-align:center}
+.dv{font-size:22px;font-weight:800;font-family:'JetBrains Mono',monospace}
+.dl{font-size:9px;color:var(--tx3)}
+.lg{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}
+.li{display:flex;align-items:center;gap:4px;font-size:10px}
+.ld{width:9px;height:9px;border-radius:2px;flex-shrink:0}
+.em{text-align:center;padding:30px;color:var(--tx3)}
+.em i{font-size:40px;margin-bottom:12px;opacity:0.4;display:block}
+.ldr{position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(10,10,26,0.97);display:flex;flex-direction:column;align-items:center;justify-content:center;z-index:9999}
+.spn{width:50px;height:50px;border:4px solid rgba(0,245,255,0.2);border-top:4px solid var(--cyan);border-radius:50%;animation:sp 0.9s linear infinite}
+@keyframes sp{to{transform:rotate(360deg)}}
+.lt{margin-top:14px;font-size:14px;color:var(--cyan);font-weight:600}
+@media(max-width:1100px){.g2{grid-template-columns:1fr}.cs2{grid-column:span 1}}
+@media(max-width:768px){.hdr{padding:10px 14px}.mn{padding:14px}.sp{display:none}.sr{grid-template-columns:repeat(2,1fr)}}
+</style>
 </head>
 <body>
-    <div class="bg-particles"><span></span><span></span><span></span><span></span></div>
+<div class="bg"><div class="orb"></div><div class="orb"></div><div class="orb"></div></div>
+<div class="ldr" id="ldr"><div class="spn"></div><div class="lt">Scanning for AI Agents...</div></div>
 
-    <header class="header">
-        <h1>🤖 AI Agent Scanner</h1>
-        <p class="subtitle">Real-Time Agent Discovery &amp; Code Quality Analysis</p>
-        <div class="scan-info">
-            <div class="stat-bubble"><span>📂</span><span>Files Checked: <strong class="num">{total_agents}</strong> agents</span></div>
-            <div class="stat-bubble"><span>📊</span><span>Areas: <strong class="num">{len(area_counts)}</strong></span></div>
-            <div class="stat-bubble"><span>✅</span><span>Avg Quality: <strong class="num">{round(sum(a['quality_score'] for a in agents)/max(total_agents,1),1)}%</strong></span></div>
-        </div>
-        <div class="scan-path">📁 {root_path}</div>
-    </header>
+<header class="hdr">
+<div class="hdr-l"><div class="logo">🤖</div><div class="brand"><h1>AI Agent Scanner</h1><p id="st">Loading...</p></div></div>
+<div class="hdr-r"><div class="sp" id="spp">📁 ...</div>
+<button class="btn btn-s" onclick="exportJSON()"><i class="fas fa-download"></i> Export</button>
+<button class="btn btn-p" onclick="rescan()"><i class="fas fa-sync-alt" id="ri"></i> Rescan</button></div>
+</header>
 
-    <main class="dashboard">
-        <!-- Summary Cards -->
-        <div class="summary-row">
-            <div class="summary-card sc-0">
-                <div class="shape-bg"><svg viewBox="0 0 100 100"><polygon points="50,0 100,25 100,75 50,100 0,75 0,25" fill="#00d4aa"/></svg></div>
-                <div class="s-icon">🤖</div>
-                <div class="s-value">{total_agents}</div>
-                <div class="s-label">AI Agents Found</div>
-            </div>
-            <div class="summary-card sc-1">
-                <div class="shape-bg"><svg viewBox="0 0 100 100"><polygon points="50,0 100,38 81,100 19,100 0,38" fill="#6c5ce7"/></svg></div>
-                <div class="s-icon">🔤</div>
-                <div class="s-value">{total_tokens:,}</div>
-                <div class="s-label">Total Tokens</div>
-            </div>
-            <div class="summary-card sc-2">
-                <div class="shape-bg"><svg viewBox="0 0 100 100"><polygon points="30,0 70,0 100,30 100,70 70,100 30,100 0,70 0,30" fill="#fd79a8"/></svg></div>
-                <div class="s-icon">📨</div>
-                <div class="s-value">{total_api_calls}</div>
-                <div class="s-label">API Calls Found</div>
-            </div>
-            <div class="summary-card sc-3">
-                <div class="shape-bg"><svg viewBox="0 0 100 100"><circle cx="50" cy="50" r="45" fill="#fdcb6e"/></svg></div>
-                <div class="s-icon">📝</div>
-                <div class="s-value">{total_lines:,}</div>
-                <div class="s-label">Lines of Code</div>
-            </div>
-            <div class="summary-card sc-4">
-                <div class="shape-bg"><svg viewBox="0 0 100 100"><polygon points="50,0 100,25 100,75 50,100 0,75 0,25" fill="#74b9ff"/></svg></div>
-                <div class="s-icon">⚡</div>
-                <div class="s-value">{total_error_issues}</div>
-                <div class="s-label">Code Issues Found</div>
-            </div>
-            <div class="summary-card sc-5">
-                <div class="shape-bg"><svg viewBox="0 0 100 100"><polygon points="50,0 100,38 81,100 19,100 0,38" fill="#e17055"/></svg></div>
-                <div class="s-icon">📈</div>
-                <div class="s-value">{avg_success}%</div>
-                <div class="s-label">Avg Est. Success</div>
-            </div>
-        </div>
+<main class="mn" id="mn" style="display:none">
+<div class="sr" id="srow"></div>
+<div class="tabs">
+<div class="tab on" data-t="ov" onclick="stab('ov')"><i class="fas fa-chart-pie"></i> Overview</div>
+<div class="tab" data-t="ag" onclick="stab('ag')"><i class="fas fa-robot"></i> Agents</div>
+<div class="tab" data-t="pj" onclick="stab('pj')"><i class="fas fa-cubes"></i> Projects</div>
+<div class="tab" data-t="us" onclick="stab('us')"><i class="fas fa-chart-bar"></i> Usage</div>
+<div class="tab" data-t="fl" onclick="stab('fl')"><i class="fas fa-exclamation-triangle"></i> Failures</div>
+<div class="tab" data-t="tr" onclick="stab('tr')"><i class="fas fa-folder-tree"></i> Tree</div>
+</div>
+<div class="tc on" id="t-ov"></div><div class="tc" id="t-ag"></div><div class="tc" id="t-pj"></div>
+<div class="tc" id="t-us"></div><div class="tc" id="t-fl"></div><div class="tc" id="t-tr"></div>
+</main>
 
-        <!-- Charts -->
-        <div class="charts-row">
-            <div class="chart-card">
-                <h3>📊 Agent Distribution by Area</h3>
-                <div class="area-chart">{area_chart_html}</div>
-                <div style="margin-top:16px;display:flex;gap:12px;flex-wrap:wrap;">
-                    <span class="quality-tag quality-high">● High Quality ({high_quality})</span>
-                    <span class="quality-tag quality-med">● Medium Quality ({med_quality})</span>
-                    <span class="quality-tag quality-low">● Low Quality ({low_quality})</span>
-                </div>
-            </div>
-            <div class="chart-card">
-                <h3>🔌 AI Providers &amp; Models</h3>
-                <div class="prov-list">{provider_html}</div>
-                <h3 style="margin-top:16px;">🧠 Models Detected</h3>
-                <div class="model-cloud">{model_html}</div>
-            </div>
-        </div>
+<script>
+const C=['#00f5ff','#ff00ff','#00ff88','#ffee00','#ff8800','#ff3355','#4488ff','#aa44ff','#ff66aa','#00ccaa','#88ff00','#ff4488','#44aaff','#ffcc00','#cc88ff'];
+const G=['linear-gradient(135deg,#00f5ff,#aa44ff)','linear-gradient(135deg,#ff00ff,#ff8800)','linear-gradient(135deg,#00ff88,#00f5ff)','linear-gradient(135deg,#ffee00,#ff8800)','linear-gradient(135deg,#ff3355,#ff00ff)','linear-gradient(135deg,#4488ff,#00f5ff)','linear-gradient(135deg,#aa44ff,#ff66aa)','linear-gradient(135deg,#00ccaa,#00ff88)'];
+const IC=['🤖','🧠','⚡','🔮','🎯','🚀','💡','🔬','📊','🎨','📧','💰','🔧','🌐','📝','🦜'];
+const PI={'OpenAI':'🟢','Anthropic':'🟠','Google AI':'🔵','Hugging Face':'🤗','Cohere':'🟣','Mistral AI':'🌀','AWS Bedrock':'☁️','Azure OpenAI':'🔷','LangChain':'🦜','CrewAI':'👥','AutoGen':'🔄','Ollama':'🦙','Replicate':'🔁','Groq':'⚡'};
+let D=null;
 
-        <!-- Agent Cards -->
-        <div class="agents-section">
-            <h2><span>📋 Agent Inventory</span> <span style="font-size:0.9rem;color:var(--text2);font-weight:400;">({total_agents} agents)</span></h2>
-            <div class="agents-grid">{agent_cards_html}</div>
-        </div>
-    </main>
+document.addEventListener('DOMContentLoaded',()=>fetchData());
 
-    <footer class="footer">
-        <p>🔍 AI Agent Scanner v3.0 · No mock data — all metrics extracted from real file analysis</p>
-        <p style="margin-top:4px;font-size:0.75rem;">Generated {now} | Path: {root_path}</p>
-    </footer>
+async function fetchData(url='/api/scan'){
+try{const r=await fetch(url);if(!r.ok)throw new Error('HTTP '+r.status);D=await r.json();render()}
+catch(e){document.getElementById('ldr').innerHTML='<div style="text-align:center;color:#ff3355;padding:30px"><i class="fas fa-exclamation-triangle" style="font-size:40px;display:block;margin-bottom:12px"></i><h2>Load Failed</h2><p style="color:#9999cc;margin-top:8px">'+e.message+'</p><button class="btn btn-p" onclick="fetchData()" style="margin-top:14px"><i class="fas fa-redo"></i> Retry</button></div>'}}
 
-    <script>
-        document.addEventListener('DOMContentLoaded', () => {{
-            document.querySelectorAll('.meter-fill, .area-fill, .quality-fill').forEach(el => {{
-                const w = el.style.width;
-                el.style.width = '0%';
-                setTimeout(() => {{ el.style.width = w; }}, 200);
-            }});
-        }});
-    </script>
+async function rescan(){document.getElementById('ri').style.animation='sp 0.5s linear infinite';document.getElementById('ldr').style.display='flex';document.getElementById('mn').style.display='none';try{const r=await fetch('/api/rescan');if(!r.ok)throw new Error('HTTP '+r.status);D=await r.json();render()}catch(e){alert('Failed: '+e.message)}document.getElementById('ri').style.animation=''}
+function exportJSON(){const b=new Blob([JSON.stringify(D,null,2)],{type:'application/json'});const u=URL.createObjectURL(b);const a=document.createElement('a');a.href=u;a.download='ai_agents_'+Date.now()+'.json';a.click();URL.revokeObjectURL(u)}
+function stab(t){document.querySelectorAll('.tab').forEach(x=>x.classList.remove('on'));document.querySelectorAll('.tc').forEach(x=>x.classList.remove('on'));document.querySelector('[data-t="'+t+'"]').classList.add('on');document.getElementById('t-'+t).classList.add('on')}
+function fmt(n){if(n==null)return'N/A';if(typeof n==='string')return n;if(n>=1e6)return(n/1e6).toFixed(1)+'M';if(n>=1e3)return(n/1e3).toFixed(1)+'K';return n.toString()}
+
+function render(){
+document.getElementById('ldr').style.display='none';document.getElementById('mn').style.display='block';
+const s=D.scan_stats,sm=D.summary,u=sm.overall_usage;
+document.getElementById('spp').textContent='📁 '+D.scan_root;document.getElementById('spp').title=D.scan_root;
+document.getElementById('st').textContent='Scanned in '+s.scan_duration_ms+'ms • '+new Date(s.scan_start).toLocaleString();
+renderStats();renderOv();renderAg();renderPj();renderUs();renderFl();renderTr()}
+
+function renderStats(){const s=D.scan_stats,sm=D.summary,u=sm.overall_usage;
+const st=[{i:'🤖',l:'Agents',v:sm.total_agents,c:'#00f5ff',g:G[0]},{i:'📂',l:'Folders',v:s.total_folders_scanned,c:'#ffee00',g:G[3]},{i:'📄',l:'Files',v:s.total_files_scanned,c:'#aa44ff',g:G[6]},{i:'🏢',l:'Providers',v:Object.keys(sm.providers_breakdown).length,c:'#ff8800',g:G[1]},{i:'📡',l:'Requests',v:fmt(u.total_requests),c:'#4488ff',g:G[5]},{i:'✅',l:'Success',v:u.overall_success_rate!=null?u.overall_success_rate+'%':'N/A',c:'#00ff88',g:G[2]},{i:'🪙',l:'Tokens',v:fmt(u.total_tokens_used),c:'#ff66aa',g:G[6]},{i:'📦',l:'Projects',v:sm.total_projects,c:'#00ccaa',g:G[7]}];
+document.getElementById('srow').innerHTML=st.map(s=>'<div class="sc"><div class="si" style="background:'+s.g+'">'+s.i+'</div><div class="sv" style="color:'+s.c+'">'+s.v+'</div><div class="sl">'+s.l+'</div><div class="sb" style="background:'+s.g+'"></div></div>').join('')}
+
+function renderOv(){const sm=D.summary,u=sm.overall_usage;let h='<div class="g2">';
+h+='<div class="cd"><div class="ch"><h3><i class="fas fa-building" style="color:var(--cyan)"></i> Providers</h3></div><div class="hg">';
+const pe=Object.entries(sm.providers_breakdown);
+pe.forEach(([n,c],i)=>{h+='<div class="hex" style="background:'+G[i%G.length]+';width:105px;height:121px"><div style="font-size:16px">'+(PI[n]||'🔹')+'</div><div style="font-size:18px;font-weight:800;font-family:JetBrains Mono">'+c+'</div><div style="font-size:7px;margin-top:2px;opacity:0.9;padding:0 6px">'+n+'</div></div>'});
+if(!pe.length)h+='<div class="em"><i class="fas fa-building"></i><p>No providers</p></div>';
+h+='</div></div>';
+
+h+='<div class="cd"><div class="ch"><h3><i class="fas fa-bullseye" style="color:var(--mag)"></i> Areas</h3></div><div style="display:flex;flex-wrap:wrap;gap:10px;justify-content:center;padding:6px 0">';
+const ae=Object.entries(sm.area_breakdown);
+const clips=['polygon(50% 0%,100% 25%,100% 75%,50% 100%,0% 75%,0% 25%)','polygon(50% 0%,100% 38%,82% 100%,18% 100%,0% 38%)','polygon(30% 0%,70% 0%,100% 30%,100% 70%,70% 100%,30% 100%,0% 70%,0% 30%)'];
+const szs=['105px','92px','88px'];
+ae.forEach(([a,c],i)=>{const sz=szs[i%3];h+='<div style="width:'+sz+';height:'+sz+';clip-path:'+clips[i%3]+';background:'+G[i%G.length]+';display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;transition:all 0.3s;cursor:default" onmouseover="this.style.transform=\'scale(1.1)\'" onmouseout="this.style.transform=\'scale(1)\'"><div style="font-size:15px;font-weight:800">'+c+'</div><div style="font-size:6px;padding:0 3px;margin-top:1px">'+a.split('/')[0].trim()+'</div></div>'});
+if(!ae.length)h+='<div class="em"><p>No areas</p></div>';
+h+='</div></div>';
+
+h+='<div class="cd cs2"><div class="ch"><h3><i class="fas fa-gauge-high" style="color:var(--grn)"></i> Gauges</h3></div><div class="smw">';
+const gs=[{l:'Success Rate',v:u.overall_success_rate,mx:100,c:'#00ff88',s:'%'},{l:'Agents',v:sm.total_agents,mx:Math.max(20,sm.total_agents),c:'#aa44ff',s:''},{l:'Providers',v:Object.keys(sm.providers_breakdown).length,mx:15,c:'#00f5ff',s:''},{l:'Projects',v:sm.total_projects,mx:Math.max(10,sm.total_projects),c:'#ff8800',s:''}];
+gs.forEach(g=>{const p=g.v!=null?Math.min(g.v/g.mx*100,100):0;const cc=Math.PI*54;const off=cc-p/100*cc;
+h+='<div class="sem"><svg width="130" height="74" viewBox="0 0 130 74"><path d="M 11 65 A 54 54 0 0 1 119 65" fill="none" stroke="rgba(255,255,255,0.06)" stroke-width="9" stroke-linecap="round"/><path d="M 11 65 A 54 54 0 0 1 119 65" fill="none" stroke="'+g.c+'" stroke-width="9" stroke-linecap="round" stroke-dasharray="'+cc+'" stroke-dashoffset="'+off+'" style="transition:stroke-dashoffset 1.5s ease"/></svg><div class="sv2" style="color:'+g.c+'">'+(g.v!=null?g.v+g.s:'N/A')+'</div><div class="sl2">'+g.l+'</div></div>'});
+h+='</div></div>';
+
+const me=Object.entries(sm.model_breakdown);
+h+='<div class="cd"><div class="ch"><h3><i class="fas fa-brain" style="color:var(--yel)"></i> Models</h3></div><div style="display:flex;align-items:center;gap:20px;flex-wrap:wrap;justify-content:center"><div class="dw">'+donut(sm.model_breakdown,160)+'<div class="dcn"><div class="dv">'+me.length+'</div><div class="dl">Models</div></div></div><div class="lg">'+me.map(([n,c],i)=>'<div class="li"><div class="ld" style="background:'+C[i%C.length]+'"></div><span>'+n+' ('+c+')</span></div>').join('')+(me.length?'':'<div class="em"><p>No models</p></div>')+'</div></div></div>';
+
+h+='<div class="cd"><div class="ch"><h3><i class="fas fa-exchange-alt" style="color:var(--blu)"></i> Requests</h3></div><div style="display:flex;gap:12px;flex-wrap:wrap;justify-content:center;padding:8px 0">';
+h+='<div class="oct" style="width:105px;height:105px;background:linear-gradient(135deg,#00ff88,#00ccaa)"><i class="fas fa-check" style="font-size:15px"></i><div style="font-size:17px;font-weight:800;margin-top:3px">'+fmt(u.total_successful)+'</div><div style="font-size:7px">SUCCESS</div></div>';
+h+='<div class="oct" style="width:105px;height:105px;background:linear-gradient(135deg,#ff3355,#ff00ff)"><i class="fas fa-times" style="font-size:15px"></i><div style="font-size:17px;font-weight:800;margin-top:3px">'+fmt(u.total_failed)+'</div><div style="font-size:7px">FAILED</div></div>';
+h+='<div class="pen" style="width:105px;height:100px;background:linear-gradient(135deg,#4488ff,#00f5ff)"><i class="fas fa-paper-plane" style="font-size:15px"></i><div style="font-size:17px;font-weight:800;margin-top:3px">'+fmt(u.total_requests)+'</div><div style="font-size:7px">TOTAL</div></div>';
+h+='</div></div></div>';
+document.getElementById('t-ov').innerHTML=h}
+
+function renderAg(){if(!D.agents.length){document.getElementById('t-ag').innerHTML='<div class="cd"><div class="em"><i class="fas fa-robot"></i><p>No AI agents found.<br>Scan a folder containing Python/JS files with AI imports.</p></div></div>';return}
+let h='<div class="g3">';
+D.agents.forEach((a,i)=>{const g=G[i%G.length],ic=IC[i%IC.length],u=a.usage,hd=u.data_source==='log_files';
+h+='<div class="ac"><div class="atb" style="background:'+g+'"></div><div class="ah"><div class="ai2" style="background:'+g+'">'+ic+'</div><div style="flex:1;min-width:0"><div class="an">'+a.script_name+'</div><div class="ap">📁 '+a.relative_path+'</div><div style="margin-top:3px"><span class="bd '+(hd?'br':'bn')+'">'+(hd?'✅ Log Data':'⚠️ No Logs')+'</span></div></div></div>';
+h+='<div><div class="ir"><span class="ii"><i class="fas fa-building"></i></span><span class="il">Provider</span><span class="iv">'+(a.providers.length?a.providers.map(p=>'<span class="tag tp">'+(PI[p]||'🔹')+' '+p+'</span>').join(' '):'<span class="nd">None</span>')+'</span></div>';
+h+='<div class="ir"><span class="ii"><i class="fas fa-brain"></i></span><span class="il">Model</span><span class="iv">'+a.models.map(m=>'<span class="tag tm">'+m+'</span>').join(' ')+'</span></div>';
+h+='<div class="ir"><span class="ii"><i class="fas fa-bullseye"></i></span><span class="il">Area</span><span class="iv">'+a.areas.map(x=>'<span class="tag ta">'+x+'</span>').join(' ')+'</span></div>';
+h+='<div class="ir"><span class="ii"><i class="fas fa-cogs"></i></span><span class="il">Framework</span><span class="iv">'+a.frameworks.map(f=>'<span class="tag tf">'+f+'</span>').join(' ')+'</span></div>';
+h+='<div class="ir"><span class="ii"><i class="fas fa-code"></i></span><span class="il">Code</span><span class="iv">'+a.lines_of_code+' lines • '+a.api_call_sites+' API calls</span></div></div>';
+h+='<div class="db"><i class="fas fa-info-circle" style="color:var(--cyan)"></i> '+a.description+'</div>';
+h+='<div class="ug"><div class="uc"><div class="uv" style="color:#00ff88">'+(u.successful_requests!=null?fmt(u.successful_requests):'—')+'</div><div class="ul">✅ Success</div></div>';
+h+='<div class="uc"><div class="uv" style="color:#ff3355">'+(u.failed_requests!=null?u.failed_requests:'—')+'</div><div class="ul">❌ Failed</div></div>';
+h+='<div class="uc"><div class="uv" style="color:#00f5ff">'+(u.total_requests!=null?fmt(u.total_requests):'—')+'</div><div class="ul">📡 Total</div></div>';
+h+='<div class="uc"><div class="uv" style="color:#ffee00">'+(u.tokens_used!=null?fmt(u.tokens_used):'—')+'</div><div class="ul">🪙 Tokens</div></div>';
+h+='<div class="uc"><div class="uv" style="color:#aa44ff">'+(u.rpm!=null?u.rpm:'—')+'</div><div class="ul">⚡ RPM</div></div>';
+h+='<div class="uc"><div class="uv" style="color:#ff66aa">'+(u.avg_response_time_ms!=null?u.avg_response_time_ms+'ms':'—')+'</div><div class="ul">⏱ RT</div></div></div>';
+if(u.tokens_percentage!=null){h+='<div class="pb"><div class="pf" style="width:'+u.tokens_percentage+'%;background:'+g+'"></div></div><div style="font-size:8px;color:var(--tx3);text-align:right">🪙 '+fmt(u.tokens_used)+' / '+fmt(u.tokens_available)+' ('+u.tokens_percentage+'%)</div>'}
+if(u.success_rate!=null){h+='<div style="font-size:9px;color:var(--tx3);margin-top:4px">Rate: <b style="color:'+(u.success_rate>=90?'#00ff88':u.success_rate>=70?'#ffee00':'#ff3355')+'">'+u.success_rate+'%</b></div>'}
+const frs=Object.entries(u.failure_reasons||{});
+if(frs.length){h+='<div style="margin-top:6px;padding-top:6px;border-top:1px solid var(--brd)"><div style="font-size:9px;color:var(--red);font-weight:600;margin-bottom:3px">⚠️ Failures:</div>';frs.forEach(([r,c])=>{h+='<div class="fr"><span class="fd"></span>'+r+' <b style="color:var(--red)">('+c+'x)</b></div>'});h+='</div>'}
+if(u.log_files_found&&u.log_files_found.length){h+='<div style="margin-top:5px;font-size:8px;color:var(--tx3)">📋 '+u.log_files_found.join(', ')+'</div>'}
+h+='</div>'});
+h+='</div>';document.getElementById('t-ag').innerHTML=h}
+
+function renderPj(){if(!D.projects.length){document.getElementById('t-pj').innerHTML='<div class="cd"><div class="em"><i class="fas fa-cubes"></i><p>No projects</p></div></div>';return}
+let h='';D.projects.forEach((p,pi)=>{const g=G[pi%G.length];
+h+='<div class="cd" style="margin-bottom:16px"><div class="ch"><h3><span style="font-size:20px">📦</span> '+p.project_name+'</h3><span style="font-size:11px;color:var(--tx3)">'+p.agent_count+' agent'+(p.agent_count!==1?'s':'')+'</span></div>';
+h+='<div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:12px">';
+h+='<div class="hex" style="background:linear-gradient(135deg,#00f5ff,#4488ff);width:85px;height:98px"><div style="font-size:17px;font-weight:800">'+p.agent_count+'</div><div style="font-size:6px">AGENTS</div></div>';
+h+='<div class="pen" style="background:linear-gradient(135deg,#00ff88,#00ccaa);width:80px;height:76px"><div style="font-size:14px;font-weight:800">'+fmt(p.total_success)+'</div><div style="font-size:6px">SUCCESS</div></div>';
+h+='<div class="oct" style="background:linear-gradient(135deg,#ff3355,#ff00ff);width:78px;height:78px"><div style="font-size:14px;font-weight:800">'+(p.total_failed||0)+'</div><div style="font-size:6px">FAILED</div></div>';
+h+='<div class="pen" style="background:linear-gradient(135deg,#ffee00,#ff8800);width:80px;height:76px"><div style="font-size:13px;font-weight:800">'+fmt(p.total_tokens)+'</div><div style="font-size:6px">TOKENS</div></div></div>';
+h+='<div style="margin-bottom:10px;display:flex;flex-wrap:wrap;gap:4px">'+p.providers_used.map(x=>'<span class="tag tp">'+(PI[x]||'🔹')+' '+x+'</span>').join('')+p.models_used.slice(0,5).map(m=>'<span class="tag tm">'+m+'</span>').join('')+'</div>';
+h+='<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:6px">';
+p.agents.forEach((a,ai)=>{h+='<div style="background:rgba(255,255,255,0.03);border-radius:8px;padding:8px;border:1px solid var(--brd)"><div style="font-weight:600;font-size:11px">'+IC[ai%IC.length]+' '+a.script_name+'</div><div style="font-size:9px;color:var(--tx3);margin-top:2px">'+a.areas.join(', ')+'</div><div style="font-size:9px;color:var(--cyan);margin-top:1px">'+a.providers.join(', ')+'</div></div>'});
+h+='</div></div>'});
+document.getElementById('t-pj').innerHTML=h}
+
+function renderUs(){let h='<div class="g2">';
+const wt=D.agents.filter(a=>a.usage.tokens_used);
+h+='<div class="cd cs2"><div class="ch"><h3><i class="fas fa-chart-bar" style="color:#4488ff"></i> Token Usage</h3></div>';
+if(wt.length){wt.forEach((a,i)=>{const p=a.usage.tokens_percentage||0,c=C[i%C.length];
+h+='<div style="margin-bottom:10px"><div style="display:flex;justify-content:space-between;margin-bottom:3px"><span style="font-size:11px;font-weight:600">'+IC[i%IC.length]+' '+a.script_name+'</span><span style="font-size:10px;color:var(--tx3);font-family:JetBrains Mono">'+fmt(a.usage.tokens_used)+' / '+(a.usage.tokens_available!=null?fmt(a.usage.tokens_available):'?')+'</span></div><div class="pb" style="height:9px"><div class="pf" style="width:'+p+'%;background:'+c+';height:9px"></div></div><div style="font-size:9px;color:var(--tx3);margin-top:2px">RPM: '+(a.usage.rpm||'—')+' | TPM: '+fmt(a.usage.tpm)+' | RPD: '+fmt(a.usage.rpd)+' | RT: '+(a.usage.avg_response_time_ms!=null?a.usage.avg_response_time_ms+'ms':'—')+'</div></div>'})}
+else{h+='<div class="em"><i class="fas fa-chart-bar"></i><p>No token data in logs.<br>Add log files with token usage to see metrics.</p></div>'}
+h+='</div>';
+h+='<div class="cd cs2"><div class="ch"><h3><i class="fas fa-tachometer-alt" style="color:#ff8800"></i> Rate Limits</h3></div><table class="dt"><thead><tr><th>Agent</th><th>Provider</th><th>Data</th><th>RPM</th><th>TPM</th><th>RPD</th><th>Tokens</th><th>Avg RT</th></tr></thead><tbody>';
+D.agents.forEach((a,i)=>{const u=a.usage,hd=u.data_source==='log_files';
+h+='<tr><td>'+IC[i%IC.length]+' '+a.script_name+'</td><td>'+a.providers.map(p=>(PI[p]||'🔹')).join('')+' '+(a.providers[0]||'?')+'</td><td><span class="bd '+(hd?'br':'bn')+'" style="font-size:8px">'+(hd?'✅':'⚠️')+'</span></td>';
+h+='<td>'+(u.rpm!=null?u.rpm:'<span class="nd">—</span>')+'</td><td>'+(u.tpm!=null?fmt(u.tpm):'<span class="nd">—</span>')+'</td><td>'+(u.rpd!=null?fmt(u.rpd):'<span class="nd">—</span>')+'</td>';
+h+='<td>'+(u.tokens_used!=null?fmt(u.tokens_used):'<span class="nd">—</span>')+'</td><td>'+(u.avg_response_time_ms!=null?u.avg_response_time_ms+'ms':'<span class="nd">—</span>')+'</td></tr>'});
+h+='</tbody></table></div></div>';
+document.getElementById('t-us').innerHTML=h}
+
+function renderFl(){const u=D.summary.overall_usage;let h='';
+h+='<div class="cd" style="margin-bottom:16px"><div class="ch"><h3><i class="fas fa-exclamation-triangle" style="color:var(--red)"></i> Summary</h3></div><div style="display:flex;gap:14px;flex-wrap:wrap;justify-content:center;padding:12px 0">';
+h+='<div class="hex" style="background:linear-gradient(135deg,#00ff88,#00ccaa);width:125px;height:144px"><i class="fas fa-check-circle" style="font-size:18px"></i><div style="font-size:20px;font-weight:800;font-family:JetBrains Mono;margin-top:3px">'+fmt(u.total_successful)+'</div><div style="font-size:7px;margin-top:2px;opacity:0.9">Successful</div></div>';
+h+='<div class="hex" style="background:linear-gradient(135deg,#ff3355,#ff00ff);width:125px;height:144px"><i class="fas fa-times-circle" style="font-size:18px"></i><div style="font-size:20px;font-weight:800;font-family:JetBrains Mono;margin-top:3px">'+fmt(u.total_failed)+'</div><div style="font-size:7px;margin-top:2px;opacity:0.9">Failed</div></div>';
+h+='<div class="hex" style="background:linear-gradient(135deg,#4488ff,#00f5ff);width:125px;height:144px"><i class="fas fa-percentage" style="font-size:18px"></i><div style="font-size:20px;font-weight:800;font-family:JetBrains Mono;margin-top:3px">'+(u.overall_success_rate!=null?u.overall_success_rate+'%':'N/A')+'</div><div style="font-size:7px;margin-top:2px;opacity:0.9">Success Rate</div></div>';
+h+='</div></div>';
+
+const frs=u.failure_reason_breakdown||{};const fe=Object.entries(frs);
+if(fe.length){h+='<div class="cd" style="margin-bottom:16px"><div class="ch"><h3><i class="fas fa-bug" style="color:var(--org)"></i> Failure Reasons</h3></div><div style="display:flex;flex-wrap:wrap;gap:10px;justify-content:center;padding:8px 0">';
+fe.forEach(([r,c],i)=>{const sz=['100px','90px','85px'];const s=sz[i%3];
+h+='<div style="width:'+s+';height:'+s+';clip-path:'+clips[i%3]+';background:'+G[i%G.length]+';display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:5px"><div style="font-size:15px;font-weight:800">'+c+'</div><div style="font-size:6px;margin-top:1px;padding:0 3px">'+r.substring(0,25)+'</div></div>'});
+h+='</div></div>'}else{h+='<div class="cd" style="margin-bottom:16px"><div class="em"><i class="fas fa-bug"></i><p>No failures found in logs.</p></div></div>'}
+
+h+='<div class="cd"><div class="ch"><h3><i class="fas fa-list" style="color:var(--pur)"></i> Per-Agent</h3></div><table class="dt"><thead><tr><th>Agent</th><th>Total</th><th>Success</th><th>Failed</th><th>Rate</th><th>Reasons</th></tr></thead><tbody>';
+D.agents.forEach((a,i)=>{const u2=a.usage;const rc=u2.success_rate!=null?(u2.success_rate>=95?'var(--grn)':u2.success_rate>=70?'var(--yel)':'var(--red)'):'var(--tx3)';
+h+='<tr><td>'+IC[i%IC.length]+' '+a.script_name+'</td><td>'+(u2.total_requests!=null?fmt(u2.total_requests):'<span class="nd">—</span>')+'</td>';
+h+='<td><span class="sd sg"></span>'+(u2.successful_requests!=null?fmt(u2.successful_requests):'—')+'</td>';
+h+='<td><span class="sd '+((u2.failed_requests||0)>0?'sr2':'sg')+'"></span>'+(u2.failed_requests||0)+'</td>';
+h+='<td style="color:'+rc+';font-weight:700">'+(u2.success_rate!=null?u2.success_rate+'%':'N/A')+'</td>';
+h+='<td style="max-width:250px">';
+const uf=Object.entries(u2.failure_reasons||{});
+h+=uf.length?uf.map(([r,c])=>'<div class="fr"><span class="fd"></span>'+r+' <b style="color:var(--red)">('+c+'x)</b></div>').join(''):'<span style="color:var(--grn);font-size:10px">✅ None</span>';
+h+='</td></tr>'});
+h+='</tbody></table></div>';
+document.getElementById('t-fl').innerHTML=h}
+
+const clips=['polygon(50% 0%,100% 25%,100% 75%,50% 100%,0% 75%,0% 25%)','polygon(50% 0%,100% 38%,82% 100%,18% 100%,0% 38%)','polygon(30% 0%,70% 0%,100% 30%,100% 70%,70% 100%,30% 100%,0% 70%,0% 30%)'];
+
+function renderTr(){const aps=new Set(D.agents.map(a=>a.script_path));
+function nd(n){if(n.type==='folder'){const b=n.agent_count>0?'<span class="tbg">'+n.agent_count+' 🤖</span>':'';
+const ch=(n.children||[]).map(c=>nd(c)).join('');
+return'<div class="tn"><span class="tfo" onclick="tgl(this)">📂 '+n.name+b+'</span><div class="tc2">'+ch+'</div></div>'}
+const ia=aps.has(n.path);return'<div class="tn"><span class="tfi'+(ia?' ia':'')+'">'+( ia?'🤖':'📄')+' '+n.name+(ia?'<span class="tbg abg">Agent</span>':'')+'</span></div>'}
+document.getElementById('t-tr').innerHTML='<div class="tb"><div style="margin-bottom:10px;font-size:12px;font-weight:600;color:var(--cyan)"><i class="fas fa-folder-tree"></i> '+D.scan_root+'</div>'+nd(D.folder_tree)+'</div>'}
+
+function tgl(el){const ch=el.nextElementSibling;if(ch)ch.style.display=ch.style.display==='none'?'block':'none'}
+
+function donut(data,sz){const e=Object.entries(data);const t=e.reduce((s,[,v])=>s+v,0);
+if(!t)return'<svg width="'+sz+'" height="'+sz+'"><circle cx="'+(sz/2)+'" cy="'+(sz/2)+'" r="'+(sz*.35)+'" fill="none" stroke="rgba(255,255,255,0.06)" stroke-width="'+(sz*.12)+'"/></svg>';
+const cx=sz/2,cy=sz/2,r=sz*.35,cc=2*Math.PI*r;let off=0,p='';
+e.forEach(([,v],i)=>{const d=(v/t)*cc;p+='<circle cx="'+cx+'" cy="'+cy+'" r="'+r+'" fill="none" stroke="'+C[i%C.length]+'" stroke-width="'+(sz*.12)+'" stroke-dasharray="'+d+' '+(cc-d)+'" stroke-dashoffset="'+(-off)+'" transform="rotate(-90 '+cx+' '+cy+')" style="transition:all 0.5s"/>';off+=d});
+return'<svg width="'+sz+'" height="'+sz+'" viewBox="0 0 '+sz+' '+sz+'">'+p+'</svg>'}
+</script>
 </body>
-</html>"""
-
-    return html
+</html>'''
 
 
-# ================================================================
-#  MAIN
-# ================================================================
+# ============================================================
+# FLASK APPLICATION (if Flask available)
+# ============================================================
+if USE_FLASK:
+    application = Flask(__name__)
+    app = application
 
-def create_sample_agents(target_dir):
-    """Create sample agent files for demo purposes when no agents found."""
-    print("[*] No AI agents found. Creating sample agents for demo...")
-    samples_dir = Path(target_dir) / "ai_agents"
-    samples_dir.mkdir(parents=True, exist_ok=True)
+    @application.route("/", methods=["GET"])
+    @application.route("/dashboard", methods=["GET"])
+    def dashboard():
+        return Response(get_dashboard_html(), mimetype="text/html")
 
-    samples = [
-        {
-            "name": "code_review_agent.py",
-            "content": '''"""
-Code Review AI Agent
-Purpose: Automatically reviews pull requests for code quality and bugs.
-Uses LangChain + OpenAI to analyze code diffs.
-"""
-import logging
-from typing import Optional
-from langchain.agents import AgentExecutor, tool
-from langchain_openai import ChatOpenAI
-
-logger = logging.getLogger(__name__)
-
-class CodeReviewAgent:
-    """Reviews code changes and provides actionable feedback."""
-    
-    role = "Senior Code Reviewer"
-    goal = "Ensure code quality and catch bugs before merge"
-    backstory = "Expert software engineer with 15 years experience"
-    
-    def __init__(self, model: str = "gpt-4o", temperature: float = 0.1):
-        self.llm = ChatOpenAI(model=model, temperature=temperature)
-        self.max_retries = 3
-        
-    @tool
-    def analyze_code_diff(self, diff: str) -> str:
-        """Analyze a git diff and return review comments."""
+    @application.route("/api/scan", methods=["GET"])
+    def api_scan():
         try:
-            result = self.llm.invoke(f"Review this code diff:\\n{diff}")
-            logger.info("Code review completed successfully")
-            return str(result)
+            return jsonify(get_scan_data())
         except Exception as e:
-            logger.error(f"Review failed: {e}")
-            raise
-    
-    def review_pull_request(self, pr_changes: str) -> Optional[str]:
-        """Main entry point for PR review."""
-        for attempt in range(self.max_retries):
-            try:
-                return self.analyze_code_diff(pr_changes)
-            except Exception as e:
-                if attempt == self.max_retries - 1:
-                    logger.critical(f"All retries exhausted: {e}")
-                    return None
-'''
-        },
-        {
-            "name": "customer_support_agent.py",
-            "content": '''"""
-Customer Support Agent
-Handles customer inquiries and support tickets using CrewAI + Claude.
-"""
-import logging
-from crewai import Agent, Task, Crew
+            return jsonify({"error": str(e)}), 500
 
-logger = logging.getLogger(__name__)
-
-class SupportAgent:
-    """Resolves customer issues with empathy and efficiency."""
-    
-    role = "Customer Support Specialist"
-    goal = "Resolve customer issues quickly and empathetically"
-    backstory = "Expert in customer service and technical support"
-    
-    def __init__(self):
-        self.llm_config = {"model": "claude-3.5-sonnet", "provider": "Anthropic"}
-        self.agent = Agent(
-            role=self.role,
-            goal=self.goal,
-            backstory=self.backstory,
-            llm=self.llm_config,
-            allow_delegation=True
-        )
-        
-    def handle_ticket(self, ticket_id: str, description: str) -> str:
-        """Handle a customer support ticket."""
+    @application.route("/api/rescan", methods=["GET", "POST"])
+    def api_rescan():
         try:
-            task = Task(
-                description=f"Handle ticket #{ticket_id}: {description}",
-                agent=self.agent
-            )
-            crew = Crew(agents=[self.agent], tasks=[task], verbose=True)
-            result = crew.kickoff()
-            logger.info(f"Ticket {ticket_id} resolved")
-            return str(result)
+            return jsonify(get_scan_data(force=True))
         except Exception as e:
-            logger.error(f"Failed to handle ticket {ticket_id}: {e}")
-            return f"Error: {e}"
-'''
-        },
-        {
-            "name": "data_analysis_agent.py",
-            "content": '''"""
-Data Analysis Agent
-Analyzes datasets and generates insights using AutoGen + Gemini.
-"""
-import logging
-from typing import Any
-from autogen import AssistantAgent, UserProxyAgent
+            return jsonify({"error": str(e)}), 500
 
-logger = logging.getLogger(__name__)
+    @application.route("/api/agent/<agent_id>", methods=["GET"])
+    def api_agent(agent_id):
+        data = get_scan_data()
+        for a in data.get("agents", []):
+            if a["id"] == agent_id:
+                return jsonify(a)
+        return jsonify({"error": "Not found"}), 404
 
-class DataAnalysisAgent:
-    """Extracts actionable insights from data."""
-    
-    role = "Data Analyst"
-    goal = "Extract actionable insights from data"
-    
-    def __init__(self):
-        self.llm_config = {
-            "model": "gemini-1.5-pro",
-            "provider": "Google",
-            "temperature": 0.2
-        }
-        self.analyst = AssistantAgent(
-            name="DataAnalyst",
-            llm_config=self.llm_config,
-            system_message="You are an expert data analyst."
-        )
-        
-    def analyze_dataset(self, dataset_path: str) -> Any:
-        """Load and analyze a dataset."""
-        try:
-            response = self.analyst.generate_reply(
-                messages=[{"role": "user", "content": f"Analyze dataset at {dataset_path} and provide insights"}]
-            )
-            logger.info(f"Analysis completed for {dataset_path}")
-            return response
-        except Exception as e:
-            logger.error(f"Analysis failed: {e}")
-            return None
-'''
-        },
-        {
-            "name": "content_writer_agent.py",
-            "content": '''"""
-Content Writer Agent
-Creates blog posts, articles, and marketing copy using LangChain + Claude.
-"""
-import logging
-from typing import Optional
-from langchain.agents import tool
-from langchain_anthropic import ChatAnthropic
-import time
+    @application.route("/health", methods=["GET"])
+    @application.route("/health-check", methods=["GET"])
+    def health():
+        return jsonify({"status": "healthy", "service": "AI Agent Scanner"}), 200
 
-logger = logging.getLogger(__name__)
+    @application.errorhandler(404)
+    def e404(e):
+        return jsonify({"error": "Not found"}), 404
 
-@tool
-def research_topic(topic: str) -> str:
-    """Research a topic and return key points and references."""
-    return f"Research compiled for: {topic}"
+    @application.errorhandler(405)
+    def e405(e):
+        return jsonify({"error": "Method not allowed"}), 405
 
-class ContentWriterAgent:
-    """Generates high-quality, SEO-optimized written content."""
-    
-    role = "Content Creator"
-    goal = "Produce engaging, SEO-optimized content readers love"
-    
-    def __init__(self):
-        self.llm = ChatAnthropic(model="claude-3-haiku", temperature=0.7)
-        self.tools = [research_topic]
-        self.retries = 2
-        
-    def write_article(self, topic: str, tone: str = "professional") -> Optional[str]:
-        """Write an article on the given topic with specified tone."""
-        for attempt in range(self.retries):
-            try:
-                prompt = (
-                    f"Write a {tone} article about '{topic}'. "
-                    f"Include an introduction, 3 main sections, and a conclusion."
-                )
-                result = self.llm.invoke(prompt)
-                logger.info(f"Article written on: {topic}")
-                return str(result)
-            except Exception as e:
-                logger.warning(f"Attempt {attempt+1} failed: {e}")
-                time.sleep(1)
-        logger.error(f"Failed to write article after {self.retries} retries")
-        return None
-'''
-        },
-        {
-            "name": "research_assistant_agent.py",
-            "content": '''"""
-Research Assistant Agent
-Searches and summarizes academic papers using OpenAI.
-"""
-import os
-import logging
-import time
-from typing import Optional
-from openai import OpenAI
-
-logger = logging.getLogger(__name__)
-
-class ResearchAgent:
-    """Assists with research tasks and literature review."""
-    
-    role = "Research Assistant"
-    goal = "Find and summarize relevant research papers efficiently"
-    backstory = "PhD-level researcher with broad scientific knowledge"
-    
-    def __init__(self):
-        api_key = os.getenv("OPENAI_API_KEY")
-        if not api_key:
-            raise ValueError("OPENAI_API_KEY environment variable not set")
-        self.client = OpenAI(api_key=api_key)
-        self.model = "gpt-4-turbo"
-        self.max_retries = 3
-        
-    def search_papers(self, query: str, max_results: int = 5) -> Optional[list]:
-        """Search for academic papers matching the query."""
-        for attempt in range(self.max_retries):
-            try:
-                response = self.client.chat.completions.create(
-                    model=self.model,
-                    messages=[
-                        {"role": "system", "content": "You are a research assistant."},
-                        {"role": "user", "content": f"Find {max_results} papers on: {query}"}
-                    ],
-                    temperature=0.3
-                )
-                result = response.choices[0].message.content
-                logger.info(f"Found papers for query: {query}")
-                return [result]
-            except Exception as e:
-                logger.warning(f"Search attempt {attempt+1} failed: {e}")
-                time.sleep(2 ** attempt)
-        logger.error(f"All search attempts failed for: {query}")
-        return None
-'''
-        },
-        {
-            "name": "agent_config.yaml",
-            "content": '''# AI Agent Configuration for Finance & Health
-agents:
-  - name: "FinanceBot"
-    role: "Financial Analyst"
-    goal: "Analyze market trends and provide investment insights"
-    provider: "Mistral"
-    model: "mistral-large"
-    tools:
-      - stock_data_fetcher
-      - sentiment_analyzer
-    rpm: 300
-    tpm: 50000
-    rpd: 5000
-  - name: "HealthAdvisor"
-    role: "Healthcare Assistant"
-    goal: "Provide general health information and wellness tips"
-    provider: "OpenAI"
-    model: "gpt-4o-mini"
-    tools:
-      - symptom_checker
-      - medication_lookup
-    rpm: 200
-    tpm: 30000
-    rpd: 3000
-'''
-        },
-        {
-            "name": "automation_pipeline.py",
-            "content": '''"""
-Automation Pipeline Agent
-Orchestrates multi-step workflows using Haystack + Llama.
-"""
-import logging
-from typing import Any, Dict
-from haystack import Pipeline
-from haystack.components.builders import PromptBuilder
-
-logger = logging.getLogger(__name__)
-
-class AutomationAgent:
-    """Automates complex workflows across different systems."""
-    
-    role = "Automation Engineer"
-    goal = "Streamline repetitive tasks through intelligent automation"
-    
-    def __init__(self):
-        self.pipeline = Pipeline()
-        self.model = "llama-3.1"
-        self.provider = "Meta"
-        self.max_retries = 2
-        
-    def create_workflow(self, steps: list) -> Dict[str, Any]:
-        """Create and execute an automated workflow from steps."""
-        try:
-            for i, step in enumerate(steps):
-                component = PromptBuilder(template=step)
-                self.pipeline.add_component(f"step_{i}", component)
-            
-            result = self.pipeline.run(data={"prompt": "Execute automation workflow"})
-            logger.info(f"Workflow with {len(steps)} steps completed")
-            return result
-        except Exception as e:
-            logger.error(f"Pipeline execution failed: {e}")
-            return {"error": str(e)}
-'''
-        },
-    ]
-
-    for sample in samples:
-        filepath = samples_dir / sample["name"]
-        filepath.write_text(sample["content"])
-        print(f"  [+] Created: {filepath.relative_to(target_dir)}")
-
-    return samples_dir
+    @application.errorhandler(500)
+    def e500(e):
+        return jsonify({"error": "Server error"}), 500
 
 
+# ============================================================
+# FALLBACK: Built-in HTTP server (no Flask)
+# ============================================================
+else:
+    from http.server import HTTPServer, BaseHTTPRequestHandler
+    from urllib.parse import urlparse
+
+    class FallbackHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            path = urlparse(self.path).path
+            if path in ("/", "/dashboard"):
+                self._html(get_dashboard_html())
+            elif path == "/api/scan":
+                self._json(get_scan_data())
+            elif path in ("/api/rescan",):
+                self._json(get_scan_data(force=True))
+            elif path in ("/health", "/health-check"):
+                self._json({"status": "healthy"})
+            else:
+                self.send_error(404)
+
+        def do_POST(self):
+            self.do_GET()
+
+        def _html(self, content):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(content.encode("utf-8"))
+
+        def _json(self, data):
+            body = json.dumps(data, indent=2, default=str).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    application = None  # No WSGI app for fallback
+
+
+# ============================================================
+# MAIN ENTRY POINT
+# ============================================================
 def main():
-    print("=" * 65)
-    print("   🤖  AI AGENT SCANNER v3.0")
-    print("   Recursive scan → real agent detection → zero hardcoded data")
-    print("=" * 65)
+    print("\n" + "=" * 58)
+    print("🤖  AI AGENT SCANNER - SINGLE FILE EDITION")
+    print("=" * 58)
+    print(f"  ✅ 100% real data - no hardcoded/simulated values")
+    print(f"  ✅ Reads: source code, log files, .env, config.json")
+    print(f"  ✅ {'Flask mode (production-ready)' if USE_FLASK else 'Fallback HTTPServer mode'}")
+    print(f"  📁 Scan root: {os.path.abspath(SCAN_ROOT)}")
+    print()
 
-    if len(sys.argv) > 1:
-        scan_path = sys.argv[1]
+    # Pre-scan
+    data = get_scan_data()
+    s = data["scan_stats"]
+    sm = data["summary"]
+    print(f"📊 Scan Complete!")
+    print(f"   📂 Folders: {s['total_folders_scanned']}")
+    print(f"   📄 Files:   {s['total_files_scanned']}")
+    print(f"   🤖 Agents:  {s['total_agents_found']}")
+    print(f"   ⏱️  Time:    {s['scan_duration_ms']}ms")
+
+    for i, agent in enumerate(data["agents"], 1):
+        u = agent["usage"]
+        src = u.get("data_source", "none")
+        print(f"\n  {i}. {agent['script_name']}")
+        print(f"     📍 {agent['relative_path']}")
+        print(f"     🏢 {', '.join(agent['providers'])}")
+        print(f"     🧠 {', '.join(agent['models'][:3])}")
+        print(f"     🎯 {', '.join(agent['areas'])}")
+        print(f"     📊 {'✅ Real logs' if src == 'log_files' else '⚠️  No logs found'}")
+
+    print(f"\n{'─' * 58}")
+
+    import webbrowser
+
+    if USE_FLASK:
+        print(f"🌐 http://localhost:{SERVER_PORT}")
+        threading.Timer(1.5, lambda: webbrowser.open(f"http://localhost:{SERVER_PORT}")).start()
+        application.run(host="0.0.0.0", port=SERVER_PORT, debug=False)
     else:
-        scan_path = input("📁 Enter folder path to scan (Enter for current dir): ").strip()
-        if not scan_path:
-            scan_path = "."
-
-    scan_path = os.path.abspath(scan_path)
-
-    if not os.path.isdir(scan_path):
-        print(f"[!] Path not found: {scan_path}")
-        print("[*] Creating sample agents for demo...")
-        scan_path = os.path.abspath(".")
-        create_sample_agents(scan_path)
-        scan_path = os.path.join(scan_path, "ai_agents")
-
-    # Check if folder is empty
-    if not any(Path(scan_path).rglob("*")):
-        print("[*] Directory is empty. Creating sample agents for demo...")
-        create_sample_agents(scan_path)
-
-    print(f"\n[*] Scanning path: {scan_path}")
-    print("[*] Looking in .py, .json, .yaml, .yml, .toml, .cfg, .env files...")
-    print("-" * 65)
-
-    agents = scan_folder(scan_path)
-
-    if not agents:
-        print("\n[!] No AI agents detected. Creating samples for demo...")
-        samples_dir = create_sample_agents(scan_path)
-        agents = scan_folder(samples_dir)
-
-    print(f"\n{'='*65}")
-    print(f"   ✅  Found {len(agents)} AI Agent(s)")
-    print(f"{'='*65}")
-
-    # Generate dashboard
-    print("\n[*] Generating HTML dashboard from REAL data...")
-    html = generate_dashboard(agents, scan_path)
-
-    # Save
-    output_path = Path(scan_path) / "ai_agent_dashboard.html"
-    output_path.write_text(html, encoding="utf-8")
-
-    # Also save to CWD
-    cwd_copy = Path.cwd() / "ai_agent_dashboard.html"
-    cwd_copy.write_text(html, encoding="utf-8")
-
-    print(f"\n{'='*65}")
-    print(f"   🎉  Dashboard ready!")
-    print(f"   📄  Open: {output_path.resolve()}")
-    print(f"   📄  Also: {cwd_copy.resolve()}")
-    print(f"{'='*65}")
-
-    # Summary
-    print("\n📊  AGENT INVENTORY (Live Data):")
-    print("-" * 65)
-    for a in agents:
-        prov = a['providers'][0] if a['providers'] else 'Unknown'
-        print(f"   🤖 {a['agent_name']:28s} | {prov:15s} | {a['area']:12s} | "
-              f"{a['lines_of_code']:>4} lines | {a['api_calls_detected']} API calls | "
-              f"Quality: {a['quality_score']}/100")
-    print("-" * 65)
-    total_lines = sum(a['lines_of_code'] for a in agents)
-    total_api = sum(a['api_calls_detected'] for a in agents)
-    avg_q = round(sum(a['quality_score'] for a in agents) / max(len(agents), 1), 1)
-    print(f"   TOTALS → {len(agents)} agents | {total_lines} lines | {total_api} API calls | "
-          f"Avg Quality: {avg_q}/100")
-    print(f"{'='*65}\n")
+        print(f"🌐 http://localhost:{SERVER_PORT}")
+        print("   (Install flask for production: pip install flask gunicorn)")
+        threading.Timer(1.5, lambda: webbrowser.open(f"http://localhost:{SERVER_PORT}")).start()
+        server = HTTPServer(("", SERVER_PORT), FallbackHandler)
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            print("\n👋 Stopped.")
+            server.server_close()
 
 
 if __name__ == "__main__":
