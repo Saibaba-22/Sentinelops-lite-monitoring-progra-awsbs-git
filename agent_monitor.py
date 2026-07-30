@@ -1012,15 +1012,18 @@ def generate_dashboard_html(agents, root_path, total_py_files=0):
     char_counts = Counter()
     for a in agents:
         for c in a.get("characteristics_met_list", []):
-            # Normalize labels
-            short = c.replace("Uses AI/LLM Model", "1. Uses AI Model")
-                       .replace("Accepts & Processes Input", "2. Accepts Input")
-                       .replace("Makes Autonomous Decisions", "3. Autonomous Decisions")
-                       .replace("Interacts with Tools/APIs", "4. Interacts Tools/API")
-                       .replace("Maintains Context/Memory", "5. Context/Memory")
-                       .replace("Produces Intelligent Outputs", "6. Intelligent Output")
-                       .replace("Agent Orchestration Logic", "7. Orchestration Logic")
-            char_counts[short] += 1
+
+            # Normalize labels using dict lookup
+            label_map = {
+                "Uses AI/LLM Model": "1. Uses AI Model",
+                "Accepts & Processes Input": "2. Accepts Input",
+                "Makes Autonomous Decisions": "3. Autonomous Decisions",
+                "Interacts with Tools/APIs": "4. Interacts Tools/API",
+                "Maintains Context/Memory": "5. Context/Memory",
+                "Produces Intelligent Outputs": "6. Intelligent Output",
+                "Agent Orchestration Logic": "7. Orchestration Logic",
+            }
+            short = label_map.get(c, c)
     
     char_dist_html = ""
     for char_name, count in char_counts.most_common():
