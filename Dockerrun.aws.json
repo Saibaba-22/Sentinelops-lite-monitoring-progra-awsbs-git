@@ -26,16 +26,15 @@
       "portMappings": [
         { "hostPort": 5000, "containerPort": 5000 }
       ],
-      "links": ["prometheus"],
       "environment": [
-        { "name": "PORT",            "value": "5000" },
-        { "name": "APP_VERSION",     "value": "1.0.0" },
-        { "name": "BUILD_NUMBER",    "value": "replace_with_build_number" },
-        { "name": "ENVIRONMENT",     "value": "production" },
-        { "name": "METRICS_INTERVAL","value": "5" },
-        { "name": "MONITOR_TOKEN",   "value": "replace_with_monitor_token" },
-        { "name": "PYTHONPATH",      "value": "/app" },
-        { "name": "PROMETHEUS_URL",  "value": "http://prometheus:9090/prometheus" }
+        { "name": "PORT",             "value": "5000" },
+        { "name": "APP_VERSION",      "value": "1.0.0" },
+        { "name": "BUILD_NUMBER",     "value": "replace_with_build_number" },
+        { "name": "ENVIRONMENT",      "value": "production" },
+        { "name": "METRICS_INTERVAL", "value": "5" },
+        { "name": "MONITOR_TOKEN",    "value": "replace_with_monitor_token" },
+        { "name": "PYTHONPATH",       "value": "/app" },
+        { "name": "PROMETHEUS_URL",   "value": "http://prometheus:9090/prometheus" }
       ],
       "mountPoints": [
         {
@@ -52,7 +51,7 @@
       "portMappings": [
         { "hostPort": 9090, "containerPort": 9090 }
       ],
-      "links": ["app", "node-exporter"],
+      "links": ["node-exporter"],
       "command": [
         "--config.file=/etc/prometheus/prometheus.yml",
         "--web.external-url=/prometheus/",
@@ -69,14 +68,14 @@
       ],
       "links": ["prometheus"],
       "environment": [
-        { "name": "GF_SECURITY_ADMIN_USER",          "value": "admin" },
-        { "name": "GF_SECURITY_ADMIN_PASSWORD",      "value": "replace_with_grafana_password" },
-        { "name": "GF_USERS_ALLOW_SIGN_UP",          "value": "false" },
-        { "name": "GF_SERVER_DOMAIN",                "value": "replace_with_gf_server_domain" },
-        { "name": "GF_SERVER_ROOT_URL",              "value": "replace_with_gf_server_root_url" },
-        { "name": "GF_SERVER_SUB_PATH",              "value": "/grafana/" },
-        { "name": "GF_SERVER_SERVE_FROM_SUB_PATH",   "value": "true" },
-        { "name": "PROMETHEUS_URL",                  "value": "http://prometheus:9090/prometheus/" }
+        { "name": "GF_SECURITY_ADMIN_USER",        "value": "admin" },
+        { "name": "GF_SECURITY_ADMIN_PASSWORD",    "value": "replace_with_grafana_password" },
+        { "name": "GF_USERS_ALLOW_SIGN_UP",        "value": "false" },
+        { "name": "GF_SERVER_DOMAIN",              "value": "replace_with_gf_server_domain" },
+        { "name": "GF_SERVER_ROOT_URL",            "value": "replace_with_gf_server_root_url" },
+        { "name": "GF_SERVER_SUB_PATH",            "value": "/grafana/" },
+        { "name": "GF_SERVER_SERVE_FROM_SUB_PATH", "value": "true" },
+        { "name": "PROMETHEUS_URL",                "value": "http://prometheus:9090/prometheus/" }
       ]
     },
     {
