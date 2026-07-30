@@ -51,7 +51,7 @@
       "portMappings": [
         { "hostPort": 9090, "containerPort": 9090 }
       ],
-      "links": ["node-exporter"],
+      "links": ["app", "node-exporter"],
       "mountPoints": [
         {
           "sourceVolume": "prometheus-conf",
