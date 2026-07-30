@@ -229,14 +229,14 @@ jobs:
           AWS_ACCESS_KEY_ID_VALUE: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY_VALUE: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         run: |
-          test -n "$AWS_APP_NAME"               || { echo "Missing variable AWS_APP_NAME"; exit 1; }
-          test -n "$AWS_ENV_NAME"               || { echo "Missing variable AWS_ENV_NAME"; exit 1; }
-          test -n "$AWS_REGION"                 || { echo "Missing variable AWS_REGION"; exit 1; }
-          test -n "$DOCKERHUB_USERNAME"         || { echo "Missing variable DOCKERHUB_USERNAME"; exit 1; }
-          test -n "$DOCKERHUB_REPOSITORY"       || { echo "Missing variable DOCKERHUB_REPOSITORY or REPOSITORY"; exit 1; }
-          test -n "$GRAFANA_ADMIN_PASSWORD"     || { echo "Add repository secret GRAFANA_ADMIN_PASSWORD"; exit 1; }
-          test -n "$AWS_ACCESS_KEY_ID_VALUE"    || { echo "Missing secret AWS_ACCESS_KEY_ID"; exit 1; }
-          test -n "$AWS_SECRET_ACCESS_KEY_VALUE"|| { echo "Missing secret AWS_SECRET_ACCESS_KEY"; exit 1; }
+          test -n "$AWS_APP_NAME"                || { echo "Missing variable AWS_APP_NAME"; exit 1; }
+          test -n "$AWS_ENV_NAME"                || { echo "Missing variable AWS_ENV_NAME"; exit 1; }
+          test -n "$AWS_REGION"                  || { echo "Missing variable AWS_REGION"; exit 1; }
+          test -n "$DOCKERHUB_USERNAME"          || { echo "Missing variable DOCKERHUB_USERNAME"; exit 1; }
+          test -n "$DOCKERHUB_REPOSITORY"        || { echo "Missing variable DOCKERHUB_REPOSITORY or REPOSITORY"; exit 1; }
+          test -n "$GRAFANA_ADMIN_PASSWORD"      || { echo "Add repository secret GRAFANA_ADMIN_PASSWORD"; exit 1; }
+          test -n "$AWS_ACCESS_KEY_ID_VALUE"     || { echo "Missing secret AWS_ACCESS_KEY_ID"; exit 1; }
+          test -n "$AWS_SECRET_ACCESS_KEY_VALUE" || { echo "Missing secret AWS_SECRET_ACCESS_KEY"; exit 1; }
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -270,9 +270,9 @@ jobs:
           test -n "$CNAME" && test "$CNAME" != "None" || { echo "AWS environment has no CNAME"; exit 1; }
           test -n "$PLATFORM" && test "$PLATFORM" != "None" || { echo "AWS platform could not be resolved"; exit 1; }
           BASE_URL="${AWS_BASE_URL:-http://${CNAME}}"
-          echo "cname=$CNAME"         >> "$GITHUB_OUTPUT"
-          echo "platform=$PLATFORM"   >> "$GITHUB_OUTPUT"
-          echo "app_url=$BASE_URL"    >> "$GITHUB_OUTPUT"
+          echo "cname=$CNAME"       >> "$GITHUB_OUTPUT"
+          echo "platform=$PLATFORM" >> "$GITHUB_OUTPUT"
+          echo "app_url=$BASE_URL"  >> "$GITHUB_OUTPUT"
           echo "AWS app URL : $BASE_URL"
           echo "AWS platform: $PLATFORM"
 
@@ -292,7 +292,6 @@ jobs:
               "GF_SECURITY_ADMIN_PASSWORD": os.environ["GRAFANA_ADMIN_PASSWORD"],
               "GF_SERVER_DOMAIN":           os.environ["CNAME"],
               "GF_SERVER_ROOT_URL":         os.environ["BASE_URL"].rstrip("/") + "/grafana/",
-              # ✅ FIXED: internal URL so containers can talk to each other
               "PROMETHEUS_URL":             "http://prometheus:9090/prometheus",
           }
           options = [{
@@ -344,7 +343,6 @@ jobs:
           base_url   = os.environ["BASE_URL"].rstrip("/")
           cname      = os.environ["CNAME"]
 
-          # ── Image for every container ──────────────────────────────────
           image_map = {
               "app":           f"{base_image}:{sha}",
               "nginx":         f"{base_image}:nginx-{sha}",
@@ -353,7 +351,6 @@ jobs:
               "node-exporter": "prom/node-exporter:v1.8.0",
           }
 
-          # ── Environment variables per container ────────────────────────
           env_map = {
               "app": {
                   "PORT":             "5000",
@@ -363,7 +360,6 @@ jobs:
                   "METRICS_INTERVAL": "5",
                   "MONITOR_TOKEN":    os.environ["MONITOR_TOKEN"],
                   "PYTHONPATH":       "/app",
-                  # ✅ internal URL - containers talk directly
                   "PROMETHEUS_URL":   "http://prometheus:9090/prometheus",
               },
               "grafana": {
@@ -387,13 +383,11 @@ jobs:
           for container in manifest.get("containerDefinitions", []):
               name = container.get("name")
 
-              # Set image
               if name in image_map:
                   old = container.get("image", "")
                   container["image"] = image_map[name]
                   print(f"  image [{name}]: {old!r} → {image_map[name]!r}")
 
-              # Set / override environment variables
               if name in env_map:
                   existing = {e["name"]: e for e in container.get("environment", [])}
                   for key, value in env_map[name].items():
@@ -401,7 +395,6 @@ jobs:
                   container["environment"] = list(existing.values())
                   print(f"  env   [{name}]: {list(env_map[name].keys())}")
 
-              # Ensure prometheus command is always correct
               if name == "prometheus":
                   container["command"] = [
                       "--config.file=/etc/prometheus/prometheus.yml",
@@ -410,7 +403,6 @@ jobs:
                   ]
                   print(f"  cmd   [prometheus]: set")
 
-          # Fix nginx-conf volume source path
           for volume in manifest.setdefault("volumes", []):
               if volume.get("name") == "nginx-conf":
                   volume.setdefault("host", {})["sourcePath"] = \
@@ -421,12 +413,10 @@ jobs:
           print("\nDockerrun.aws.json rendered successfully.")
           PY
 
-          # ── Show final rendered file ───────────────────────────────────
           echo ""
           echo "=== Final Dockerrun.aws.json ==="
           cat Dockerrun.aws.json
 
-          # ── Hard-fail if any placeholder survived ──────────────────────
           echo ""
           echo "=== Checking for unreplaced placeholders ==="
           if grep -E "replace_with" Dockerrun.aws.json; then
@@ -435,7 +425,6 @@ jobs:
           fi
           echo "Placeholder check passed."
 
-          # ── Copy nginx config ──────────────────────────────────────────
           source="docker/nginx/nginx-aws.conf"
           [ -f "$source" ] || source="docker/nginx/nginx.conf"
           mkdir -p docker/nginx-ecs
@@ -460,8 +449,8 @@ jobs:
             --region "$AWS_REGION" \
             --platform "${{ steps.aws-host.outputs.platform }}"
           eb use "$AWS_ENV_NAME"
-      
-            - name: Wait for environment to be Ready before deploy
+
+      - name: Wait for environment to be Ready before deploy
         run: |
           echo "Checking environment state before deploying..."
           for attempt in $(seq 1 20); do
