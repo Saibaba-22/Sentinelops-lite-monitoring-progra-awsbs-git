@@ -460,6 +460,24 @@ jobs:
             --region "$AWS_REGION" \
             --platform "${{ steps.aws-host.outputs.platform }}"
           eb use "$AWS_ENV_NAME"
+      
+            - name: Wait for environment to be Ready before deploy
+        run: |
+          echo "Checking environment state before deploying..."
+          for attempt in $(seq 1 20); do
+            STATUS=$(aws elasticbeanstalk describe-environments \
+              --application-name "$AWS_APP_NAME" \
+              --environment-names "$AWS_ENV_NAME" \
+              --query 'Environments[0].Status' --output text)
+            echo "Attempt $attempt/20 — Status: $STATUS"
+            if [ "$STATUS" = "Ready" ]; then
+              echo "Environment is Ready. Proceeding with deployment."
+              exit 0
+            fi
+            sleep 30
+          done
+          echo "Environment did not become Ready in time."
+          exit 1
 
       - name: Deploy AWS bundle
         id: aws_deploy

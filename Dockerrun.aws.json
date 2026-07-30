@@ -52,6 +52,13 @@
         { "hostPort": 9090, "containerPort": 9090 }
       ],
       "links": ["node-exporter"],
+      "mountPoints": [
+        {
+          "sourceVolume": "prometheus-conf",
+          "containerPath": "/etc/prometheus",
+          "readOnly": true
+        }
+      ],
       "command": [
         "--config.file=/etc/prometheus/prometheus.yml",
         "--web.external-url=/prometheus/",
@@ -76,6 +83,18 @@
         { "name": "GF_SERVER_SUB_PATH",            "value": "/grafana/" },
         { "name": "GF_SERVER_SERVE_FROM_SUB_PATH", "value": "true" },
         { "name": "PROMETHEUS_URL",                "value": "http://prometheus:9090/prometheus/" }
+      ],
+      "mountPoints": [
+        {
+          "sourceVolume": "grafana-provisioning",
+          "containerPath": "/etc/grafana/provisioning",
+          "readOnly": true
+        },
+        {
+          "sourceVolume": "grafana-dashboards",
+          "containerPath": "/var/lib/grafana/dashboards",
+          "readOnly": true
+        }
       ]
     },
     {
@@ -113,6 +132,18 @@
     {
       "name": "app-logs",
       "host": { "sourcePath": "/var/app/current/logs" }
+    },
+    {
+      "name": "prometheus-conf",
+      "host": { "sourcePath": "/var/app/current/monitoring/prometheus" }
+    },
+    {
+      "name": "grafana-provisioning",
+      "host": { "sourcePath": "/var/app/current/monitoring/grafana/provisioning" }
+    },
+    {
+      "name": "grafana-dashboards",
+      "host": { "sourcePath": "/var/app/current/monitoring/grafana/dashboards" }
     },
     {
       "name": "host-proc",
