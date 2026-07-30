@@ -1,2440 +1,2645 @@
+#!/usr/bin/env python3
 """
-agent_monitor.py
-================
-Complete SentinelOps-Lite backend.
+AI Repository Audit Tool
+========================
+Scans a repository and generates a standalone HTML audit report.
+Outputs: repository_audit.html, repository_audit.json, repository_audit.csv, repository_audit.md
 
-Contains:
-  - Flask application object
-  - All Prometheus metrics
-  - All configuration
-  - All business logic
-  - monitor_bp  Blueprint  → /monitor/*
-  - scanner_bp  Blueprint  → /scanner/*
-  - handle_monitor_status() → called by app.py /monitor/status route
-
-app.py only owns:
-  GET  /          → render_template("index.html")
-  POST /monitor/status → delegates to handle_monitor_status()
+Usage:
+    python ai_audit.py .
+    python ai_audit.py /path/to/repo --output ./reports --no-open
 """
 
 from __future__ import annotations
 
-# ── stdlib ────────────────────────────────────────────────────
-import ast
+import argparse
+import csv
 import datetime
-import hmac
+import html as _html
 import json
 import os
 import re
 import sys
-import time
+import webbrowser
 from collections import Counter, defaultdict
-from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from threading import Lock, Thread
-from typing import Any
+from typing import Any, Dict, List, Optional, Tuple
 
-# ── Flask ─────────────────────────────────────────────────────
-from flask import Blueprint, Flask, Response, jsonify, render_template_string, request
+# ──────────────────────────────────────────────────────────────
+# CONSTANTS
+# ──────────────────────────────────────────────────────────────
 
-# ── Prometheus ────────────────────────────────────────────────
-import psutil
-from prometheus_client import (
-    CONTENT_TYPE_LATEST,
-    Counter as PCounter,
-    Gauge,
-    Histogram,
-    Info,
-    generate_latest,
-)
-
-
-# ══════════════════════════════════════════════════════════════
-# FLASK APPLICATION OBJECT
-# ══════════════════════════════════════════════════════════════
-
-application = Flask(__name__)
-
-
-# ══════════════════════════════════════════════════════════════
-# CENTRALISED CONFIG  —  read once at startup
-# ══════════════════════════════════════════════════════════════
-
-_CFG: dict[str, str] = {
-    "provider":      os.getenv("AI_PROVIDER",    "gemini"),
-    "model":         os.getenv("AI_MODEL",       "gemini-2.5-flash"),
-    "version":       os.getenv("APP_VERSION",    "1.0.0"),
-    "build":         os.getenv("BUILD_NUMBER",   "unknown"),
-    "environment":   os.getenv("ENVIRONMENT",    "production"),
-    "cloud":         os.getenv("TARGET_CLOUD",   "aws"),
-    "region":        os.getenv("AWS_REGION",     "us-east-1"),
-    "monitor_token": os.getenv("MONITOR_TOKEN",  ""),
-    "metrics_token": os.getenv("METRICS_TOKEN",  ""),
-    "port":          os.getenv("PORT",           "8000"),
-}
-
-# ── startup timestamp ─────────────────────────────────────────
-_START_TIME: float = time.time()
-
-# ── cached psutil process handle ─────────────────────────────
-# One object reused across all calls so cpu_percent() delta is correct.
-# First call always returns 0.0 — prime it once at startup.
-_PROC: psutil.Process = psutil.Process()
-_PROC.cpu_percent(interval=0.1)   # blocks 100 ms once, correct thereafter
-
-# ── blueprint loaded flag ─────────────────────────────────────
-_SCANNER_LOADED: bool = False
-
-
-# ══════════════════════════════════════════════════════════════
-# PROMETHEUS METRICS
-# ══════════════════════════════════════════════════════════════
-
-# ── HTTP ──────────────────────────────────────────────────────
-REQUEST_COUNT = PCounter(
-    "app_requests_total",
-    "Total HTTP requests",
-    ["method", "endpoint", "status"],
-)
-
-REQUEST_LATENCY = Histogram(
-    "app_request_duration_seconds",
-    "HTTP request latency in seconds",
-    ["method", "endpoint"],
-    buckets=[0.005, 0.01, 0.025, 0.05,
-             0.1, 0.25, 0.5, 1.0, 2.5, 5.0],
-)
-
-# ── Agent ─────────────────────────────────────────────────────
-AGENT_STATUS = Gauge(
-    "agent_status",
-    "AI agent running status (1=running, 0=stopped)",
-)
-
-AGENT_INFO = Info(
-    "agent",
-    "AI agent static information — set once at startup",
-)
-
-AGENT_REQUESTS_TOTAL = PCounter(
-    "agent_requests_total",
-    "Total requests made by the AI agent",
-    ["provider", "model", "status"],
-)
-
-AGENT_MODEL_INFO = Gauge(
-    "agent_model_info",
-    "AI model label carrier — value is always 1",
-    ["provider", "model", "version", "environment"],
-)
-
-AGENT_UPTIME_SECONDS = Gauge(
-    "agent_uptime_seconds",
-    "Seconds since the agent process started",
-)
-
-AGENT_CPU_PERCENT = Gauge(
-    "agent_cpu_percent",
-    "CPU usage percent of the agent process",
-)
-
-AGENT_MEMORY_MB = Gauge(
-    "agent_memory_mb",
-    "RSS memory used by the agent process in MB",
-)
-
-SCANNER_LOADED_GAUGE = Gauge(
-    "agent_scanner_loaded",
-    "1 if the AI scanner blueprint loaded successfully, 0 otherwise",
-)
-
-# ── System ────────────────────────────────────────────────────
-SYSTEM_CPU = Gauge(
-    "system_cpu_percent",
-    "System-wide CPU usage percent",
-)
-
-SYSTEM_MEMORY_PERCENT = Gauge(
-    "system_memory_percent",
-    "System memory usage percent",
-)
-
-SYSTEM_MEMORY_USED_MB = Gauge(
-    "system_memory_used_mb",
-    "System memory used in MB",
-)
-
-# ── backward-compat alias ─────────────────────────────────────
-PROCESS_CPU = Gauge(
-    "python_process_cpu_percent",
-    "CPU usage percent of this process (alias of agent_cpu_percent)",
-)
-
-
-# ══════════════════════════════════════════════════════════════
-# METRIC HELPERS
-# ══════════════════════════════════════════════════════════════
-
-def _init_static_metrics() -> None:
-    """
-    Set metrics that never change after startup.
-    Called exactly ONCE — Info.info() raises if called twice.
-    """
-    AGENT_INFO.info({
-        "provider":    _CFG["provider"],
-        "model":       _CFG["model"],
-        "version":     _CFG["version"],
-        "environment": _CFG["environment"],
-        "build":       _CFG["build"],
-        "cloud":       _CFG["cloud"],
-        "region":      _CFG["region"],
-    })
-    AGENT_MODEL_INFO.labels(
-        provider=    _CFG["provider"],
-        model=       _CFG["model"],
-        version=     _CFG["version"],
-        environment= _CFG["environment"],
-    ).set(1)
-    SCANNER_LOADED_GAUGE.set(1 if _SCANNER_LOADED else 0)
-    AGENT_STATUS.set(1)
-
-
-def _update_dynamic_metrics() -> None:
-    """
-    Refresh metrics that change over time.
-    Called before every Prometheus scrape and on /agent/status.
-    Never raises — all psutil errors are caught.
-    """
-    try:
-        cpu    = _PROC.cpu_percent(interval=None)
-        mem_mb = round(_PROC.memory_info().rss / 1024 / 1024, 2)
-        AGENT_CPU_PERCENT.set(cpu)
-        AGENT_MEMORY_MB.set(mem_mb)
-        PROCESS_CPU.set(cpu)
-        AGENT_UPTIME_SECONDS.set(round(time.time() - _START_TIME, 1))
-        AGENT_STATUS.set(1)
-    except (psutil.AccessDenied,
-            psutil.NoSuchProcess,
-            psutil.ZombieProcess) as exc:
-        print(f"⚠️  psutil process error: {exc}")
-        AGENT_STATUS.set(0)
-
-    try:
-        vmem = psutil.virtual_memory()
-        SYSTEM_CPU.set(psutil.cpu_percent(interval=None))
-        SYSTEM_MEMORY_PERCENT.set(vmem.percent)
-        SYSTEM_MEMORY_USED_MB.set(round(vmem.used / 1024 / 1024, 2))
-    except Exception as exc:                        # noqa: BLE001
-        print(f"⚠️  psutil system error: {exc}")
-
-
-def _record(endpoint: str, status: int = 200) -> float:
-    """Increment request counter and return start timestamp."""
-    REQUEST_COUNT.labels(
-        method=   request.method,
-        endpoint= endpoint,
-        status=   str(status),
-    ).inc()
-    return time.perf_counter()
-
-
-def _finish(endpoint: str, start: float) -> None:
-    """Observe request latency in the histogram."""
-    REQUEST_LATENCY.labels(
-        method=   request.method,
-        endpoint= endpoint,
-    ).observe(time.perf_counter() - start)
-
-
-def _safe_system_snapshot() -> dict[str, Any]:
-    """Return system + process metrics — all psutil errors caught."""
-    snap: dict[str, Any] = {
-        "cpu_usage_percent":   -1,
-        "memory_total_mb":     -1,
-        "memory_used_mb":      -1,
-        "memory_percent":      -1,
-        "process_cpu_percent": -1,
-        "process_memory_mb":   -1,
-    }
-    try:
-        vmem = psutil.virtual_memory()
-        snap["cpu_usage_percent"]   = psutil.cpu_percent(interval=None)
-        snap["memory_total_mb"]     = round(vmem.total / 1024 / 1024, 1)
-        snap["memory_used_mb"]      = round(vmem.used  / 1024 / 1024, 1)
-        snap["memory_percent"]      = vmem.percent
-        snap["process_cpu_percent"] = _PROC.cpu_percent(interval=None)
-        snap["process_memory_mb"]   = round(
-            _PROC.memory_info().rss / 1024 / 1024, 1
-        )
-    except (psutil.AccessDenied, psutil.NoSuchProcess) as exc:
-        print(f"⚠️  snapshot error: {exc}")
-    return snap
-
-
-def _check_metrics_auth() -> bool:
-    """
-    True if /metrics request is authorised.
-    Empty METRICS_TOKEN → open (standard Prometheus pull).
-    Set METRICS_TOKEN   → require Authorization: Bearer <token>.
-    """
-    token = _CFG["metrics_token"]
-    if not token:
-        return True
-    auth = request.headers.get("Authorization", "")
-    if not auth.startswith("Bearer "):
-        return False
-    return hmac.compare_digest(
-        auth[len("Bearer "):].encode(),
-        token.encode(),
-    )
-
-
-def _check_monitor_auth() -> bool:
-    """
-    True if /monitor/status request is authorised.
-    Empty MONITOR_TOKEN → open.
-    Set MONITOR_TOKEN   → require X-Monitor-Token header.
-    """
-    token = _CFG["monitor_token"]
-    if not token:
-        return True
-    provided = request.headers.get("X-Monitor-Token", "")
-    return hmac.compare_digest(
-        provided.encode(),
-        token.encode(),
-    )
-
-
-# ══════════════════════════════════════════════════════════════
-# MONITOR STATUS HANDLER
-# called by app.py  POST /monitor/status
-# ══════════════════════════════════════════════════════════════
-
-def handle_monitor_status() -> tuple[Response, int]:
-    """
-    CI / monitoring webhook receiver.
-    app.py delegates POST /monitor/status entirely to this function.
-    Accepts optional JSON payload — only the token matters for 200 OK.
-    """
-    t = _record("/monitor/status")
-
-    if not _check_monitor_auth():
-        _finish("/monitor/status", t)
-        return jsonify(error="unauthorized"), 401
-
-    _finish("/monitor/status", t)
-    return jsonify(ok=True), 200
-
-
-# ══════════════════════════════════════════════════════════════
-# MONITOR BLUEPRINT  —  /monitor/*
-# ══════════════════════════════════════════════════════════════
-
-monitor_bp = Blueprint("monitor", __name__, url_prefix="/monitor")
-
-
-@monitor_bp.get("/health")
-def monitor_health() -> tuple[Response, int]:
-    """
-    JSON liveness / readiness probe.
-    Returns JSON so ALB, Kubernetes, and Beanstalk health checks
-    can parse the response body.
-    HTTP 200 = healthy | HTTP 503 = degraded
-    """
-    t = _record("/monitor/health")
-
-    checks: dict[str, str] = {
-        "app":     "ok",
-        "scanner": "ok" if _SCANNER_LOADED else "degraded",
-    }
-    healthy = True
-    try:
-        _PROC.status()
-    except (psutil.NoSuchProcess, psutil.ZombieProcess):
-        checks["process"] = "error"
-        healthy = False
-
-    code = 200 if healthy else 503
-    _record("/monitor/health", code)
-    _finish("/monitor/health", t)
-
-    return jsonify(
-        status=         "healthy" if healthy else "degraded",
-        checks=         checks,
-        uptime_seconds= round(time.time() - _START_TIME, 1),
-        version=        _CFG["version"],
-        build=          _CFG["build"],
-        environment=    _CFG["environment"],
-        cloud=          _CFG["cloud"],
-        region=         _CFG["region"],
-    ), code
-
-
-@monitor_bp.get("/api")
-def monitor_api() -> Response:
-    """Hello world — confirms app is alive."""
-    t = _record("/monitor/api")
-    result = jsonify(
-        message= "Hello from SentinelOps-Lite!",
-        status=  "running",
-        version= _CFG["version"],
-        build=   _CFG["build"],
-    )
-    _finish("/monitor/api", t)
-    return result
-
-
-@monitor_bp.get("/api/status")
-def monitor_api_status() -> Response:
-    """Full system status — application, system, agent, deployment."""
-    t = _record("/monitor/api/status")
-    result = jsonify(
-        application={
-            "name":        "SentinelOps-Lite",
-            "version":     _CFG["version"],
-            "build":       _CFG["build"],
-            "environment": _CFG["environment"],
-        },
-        system=     _safe_system_snapshot(),
-        agent={
-            "provider":       _CFG["provider"],
-            "model":          _CFG["model"],
-            "status":         "running",
-            "uptime_seconds": round(time.time() - _START_TIME, 1),
-        },
-        deployment={
-            "version": _CFG["version"],
-            "build":   _CFG["build"],
-            "cloud":   _CFG["cloud"],
-            "region":  _CFG["region"],
-        },
-        scanner={
-            "loaded": _SCANNER_LOADED,
-        },
-    )
-    _finish("/monitor/api/status", t)
-    return result
-
-
-@monitor_bp.get("/agent/status")
-def monitor_agent_status() -> tuple[Response, int]:
-    """AI agent running status — also refreshes dynamic metrics."""
-    t = _record("/monitor/agent/status")
-    _update_dynamic_metrics()
-    AGENT_REQUESTS_TOTAL.labels(
-        provider= _CFG["provider"],
-        model=    _CFG["model"],
-        status=   "success",
-    ).inc()
-    result = jsonify(
-        status=         "running",
-        provider=       _CFG["provider"],
-        model=          _CFG["model"],
-        uptime_seconds= round(time.time() - _START_TIME, 1),
-        scanner_loaded= _SCANNER_LOADED,
-    )
-    _finish("/monitor/agent/status", t)
-    return result, 200
-
-
-@monitor_bp.get("/metrics")
-def monitor_metrics() -> tuple[Response, int]:
-    """
-    Prometheus scrape endpoint.
-    METRICS_TOKEN empty (default) → open.
-    METRICS_TOKEN set             → Authorization: Bearer <token> required.
-    """
-    t = _record("/monitor/metrics")
-    if not _check_metrics_auth():
-        _finish("/monitor/metrics", t)
-        return (
-            Response("Unauthorized\n", status=401, mimetype="text/plain"),
-            401,
-        )
-    _update_dynamic_metrics()
-    payload = generate_latest()
-    _finish("/monitor/metrics", t)
-    return Response(payload, mimetype=CONTENT_TYPE_LATEST), 200
-
-
-# ══════════════════════════════════════════════════════════════
-# SCANNER CONSTANTS
-# ══════════════════════════════════════════════════════════════
-
-IGNORED_DIRS: set[str] = {
+IGNORED_DIRS: set = {
     ".git", ".terraform", "node_modules", "venv", "__pycache__",
-    "dist", "build", "target", "coverage", ".cache", ".idea",
-    ".vscode", ".eggs", ".tox", ".pytest_cache", ".mypy_cache",
-    ".ruff_cache", "vendor", "bower_components", ".next", ".nuxt",
+    "dist", "build", "target", "coverage", ".cache", ".idea", ".vscode",
+    ".pytest_cache", ".mypy_cache", "site-packages", ".tox", "eggs",
+    ".eggs", "htmlcov", ".hypothesis", "env", "virtualenv",
+    ".next", ".nuxt", "bower_components", "vendor", "tmp", "temp",
+    "__MACOSX", ".serverless", "cdk.out", ".aws-sam",
 }
 
-EXTENSION_LANGUAGE_MAP: dict[str, str] = {
-    ".py": "Python", ".pyw": "Python", ".pyi": "Python",
-    ".java": "Java", ".kt": "Kotlin", ".scala": "Scala",
-    ".cs": "C#", ".vb": "VB.NET", ".fs": "F#",
-    ".js": "JavaScript", ".mjs": "JavaScript", ".jsx": "JavaScript",
-    ".ts": "TypeScript", ".tsx": "TypeScript",
-    ".go": "Go", ".rs": "Rust",
-    ".c": "C", ".cpp": "C++", ".cc": "C++", ".h": "C/C++ Header",
-    ".sh": "Shell", ".bash": "Shell", ".zsh": "Shell",
-    ".ps1": "PowerShell", ".psm1": "PowerShell",
-    ".yaml": "YAML", ".yml": "YAML",
-    ".json": "JSON", ".jsonc": "JSON",
-    ".toml": "TOML", ".ini": "INI", ".cfg": "Config", ".conf": "Config",
-    ".xml": "XML", ".html": "HTML", ".htm": "HTML",
-    ".css": "CSS", ".scss": "SCSS",
-    ".sql": "SQL", ".md": "Markdown", ".rst": "reStructuredText",
-    ".txt": "Text", ".env": "Environment",
-    ".tf": "Terraform", ".tfvars": "Terraform", ".hcl": "HCL",
-    ".proto": "Protobuf", ".graphql": "GraphQL",
-    ".rb": "Ruby", ".php": "PHP", ".swift": "Swift", ".dart": "Dart",
-    ".ipynb": "Jupyter Notebook",
-    ".dockerfile": "Dockerfile",
+EXTENSION_MAP: Dict[str, Tuple[str, str]] = {
+    ".py":           ("Python",             "source"),
+    ".java":         ("Java",               "source"),
+    ".cs":           ("C#",                 "source"),
+    ".js":           ("JavaScript",         "source"),
+    ".jsx":          ("JavaScript/React",   "source"),
+    ".ts":           ("TypeScript",         "source"),
+    ".tsx":          ("TypeScript/React",   "source"),
+    ".go":           ("Go",                 "source"),
+    ".rs":           ("Rust",               "source"),
+    ".kt":           ("Kotlin",             "source"),
+    ".scala":        ("Scala",              "source"),
+    ".c":            ("C",                  "source"),
+    ".cpp":          ("C++",                "source"),
+    ".h":            ("C/C++ Header",       "source"),
+    ".hpp":          ("C++ Header",         "source"),
+    ".sh":           ("Shell",              "source"),
+    ".bash":         ("Bash",               "source"),
+    ".ps1":          ("PowerShell",         "source"),
+    ".rb":           ("Ruby",               "source"),
+    ".php":          ("PHP",                "source"),
+    ".swift":        ("Swift",              "source"),
+    ".r":            ("R",                  "source"),
+    ".ipynb":        ("Jupyter Notebook",   "source"),
+    ".yaml":         ("YAML",               "config"),
+    ".yml":          ("YAML",               "config"),
+    ".json":         ("JSON",               "config"),
+    ".toml":         ("TOML",               "config"),
+    ".ini":          ("INI",                "config"),
+    ".cfg":          ("Config",             "config"),
+    ".conf":         ("Config",             "config"),
+    ".properties":   ("Properties",         "config"),
+    ".env":          ("Environment",        "config"),
+    ".dockerfile":   ("Docker",             "infrastructure"),
+    ".tf":           ("Terraform",          "infrastructure"),
+    ".tfvars":       ("Terraform Vars",     "infrastructure"),
+    ".hcl":          ("HCL",                "infrastructure"),
+    ".md":           ("Markdown",           "documentation"),
+    ".rst":          ("reStructuredText",   "documentation"),
+    ".txt":          ("Text",               "documentation"),
+    ".xml":          ("XML",                "config"),
+    ".html":         ("HTML",               "frontend"),
+    ".htm":          ("HTML",               "frontend"),
+    ".css":          ("CSS",                "frontend"),
+    ".scss":         ("SCSS",               "frontend"),
+    ".less":         ("Less",               "frontend"),
+    ".sql":          ("SQL",                "database"),
+    ".graphql":      ("GraphQL",            "api"),
+    ".proto":        ("Protobuf",           "api"),
+    ".jinja":        ("Jinja Template",     "template"),
+    ".jinja2":       ("Jinja Template",     "template"),
+    ".j2":           ("Jinja Template",     "template"),
+    ".prompt":       ("Prompt",             "ai"),
+    ".lock":         ("Lock File",          "config"),
+    ".requirements": ("Requirements",       "config"),
+    ".makefile":     ("Makefile",           "config"),
 }
 
-AI_PROVIDER_PATTERNS: dict[str, dict[str, list[str]]] = {
-    "OpenAI": {
-        "imports":   [r"import openai", r"from openai", r"openai\."],
-        "env_vars":  [r"OPENAI_API_KEY", r"OPENAI_ORG_ID", r"OPENAI_BASE_URL"],
-        "endpoints": [r"api\.openai\.com"],
-        "sdk":       "openai",
-    },
-    "Azure OpenAI": {
-        "imports":   [r"AzureOpenAI", r"openai.*azure"],
-        "env_vars":  [r"AZURE_OPENAI_KEY", r"AZURE_OPENAI_ENDPOINT",
-                      r"AZURE_OPENAI_API_KEY", r"AZURE_OPENAI_API_VERSION"],
-        "endpoints": [r"\.openai\.azure\.com"],
-        "sdk":       "openai (Azure)",
-    },
-    "Anthropic": {
-        "imports":   [r"import anthropic", r"from anthropic", r"anthropic\."],
-        "env_vars":  [r"ANTHROPIC_API_KEY", r"CLAUDE_API_KEY"],
-        "endpoints": [r"api\.anthropic\.com"],
-        "sdk":       "anthropic",
-    },
-    "Google Gemini": {
-        "imports":   [r"import google\.generativeai",
-                      r"from google\.generativeai",
-                      r"genai\.", r"GenerativeModel", r"import vertexai"],
-        "env_vars":  [r"GEMINI_API_KEY", r"GOOGLE_API_KEY",
-                      r"GOOGLE_APPLICATION_CREDENTIALS"],
-        "endpoints": [r"generativelanguage\.googleapis\.com"],
-        "sdk":       "google-generativeai",
-    },
-    "AWS Bedrock": {
-        "imports":   [r"bedrock", r"boto3.*bedrock", r"BedrockRuntime"],
-        "env_vars":  [r"AWS_ACCESS_KEY_ID", r"AWS_SECRET_ACCESS_KEY",
-                      r"BEDROCK_REGION"],
-        "endpoints": [r"bedrock\.amazonaws\.com"],
-        "sdk":       "boto3",
-    },
-    "Groq": {
-        "imports":   [r"import groq", r"from groq", r"groq\."],
-        "env_vars":  [r"GROQ_API_KEY"],
-        "endpoints": [r"api\.groq\.com"],
-        "sdk":       "groq",
-    },
-    "Cohere": {
-        "imports":   [r"import cohere", r"from cohere", r"cohere\."],
-        "env_vars":  [r"COHERE_API_KEY", r"CO_API_KEY"],
-        "endpoints": [r"api\.cohere\.ai"],
-        "sdk":       "cohere",
-    },
-    "Mistral": {
-        "imports":   [r"import mistralai", r"from mistralai", r"MistralClient"],
-        "env_vars":  [r"MISTRAL_API_KEY"],
-        "endpoints": [r"api\.mistral\.ai"],
-        "sdk":       "mistralai",
-    },
-    "Ollama": {
-        "imports":   [r"import ollama", r"from ollama", r"ollama\."],
-        "env_vars":  [r"OLLAMA_HOST", r"OLLAMA_BASE_URL"],
-        "endpoints": [r"localhost:11434"],
-        "sdk":       "ollama",
-    },
-    "HuggingFace": {
-        "imports":   [r"from transformers", r"import transformers",
-                      r"huggingface_hub", r"AutoModel", r"AutoTokenizer",
-                      r"pipeline\("],
-        "env_vars":  [r"HUGGINGFACE_API_KEY", r"HF_TOKEN",
-                      r"HUGGINGFACEHUB_API_TOKEN"],
-        "endpoints": [r"huggingface\.co"],
-        "sdk":       "transformers",
-    },
-    "OpenRouter": {
-        "imports":   [r"openrouter"],
-        "env_vars":  [r"OPENROUTER_API_KEY"],
-        "endpoints": [r"openrouter\.ai/api"],
-        "sdk":       "openai (OpenRouter)",
-    },
-    "DeepSeek": {
-        "imports":   [r"deepseek"],
-        "env_vars":  [r"DEEPSEEK_API_KEY"],
-        "endpoints": [r"api\.deepseek\.com"],
-        "sdk":       "openai (DeepSeek)",
-    },
-    "Perplexity": {
-        "imports":   [r"perplexity"],
-        "env_vars":  [r"PERPLEXITY_API_KEY", r"PPLX_API_KEY"],
-        "endpoints": [r"api\.perplexity\.ai"],
-        "sdk":       "openai (Perplexity)",
-    },
-    "LiteLLM": {
-        "imports":   [r"import litellm", r"from litellm", r"litellm\."],
-        "env_vars":  [r"LITELLM_API_KEY"],
-        "endpoints": [r"litellm"],
-        "sdk":       "litellm",
-    },
+AI_SDKS: Dict[str, Dict] = {
+    "openai":            {"name": "OpenAI SDK",              "provider": "OpenAI"},
+    "langchain":         {"name": "LangChain",               "provider": "Multiple"},
+    "langgraph":         {"name": "LangGraph",               "provider": "Multiple"},
+    "semantic_kernel":   {"name": "Semantic Kernel",         "provider": "Multiple"},
+    "autogen":           {"name": "AutoGen",                 "provider": "Multiple"},
+    "crewai":            {"name": "CrewAI",                  "provider": "Multiple"},
+    "llama_index":       {"name": "LlamaIndex",              "provider": "Multiple"},
+    "haystack":          {"name": "Haystack",                "provider": "Multiple"},
+    "dspy":              {"name": "DSPy",                    "provider": "Multiple"},
+    "transformers":      {"name": "HuggingFace Transformers","provider": "HuggingFace"},
+    "litellm":           {"name": "LiteLLM",                 "provider": "Multiple"},
+    "instructor":        {"name": "Instructor",              "provider": "Multiple"},
+    "ollama":            {"name": "Ollama SDK",              "provider": "Ollama"},
+    "anthropic":         {"name": "Anthropic SDK",           "provider": "Anthropic"},
+    "google.generativeai":{"name":"Google GenAI SDK",        "provider": "Google Gemini"},
+    "vertexai":          {"name": "Vertex AI SDK",           "provider": "Google Vertex AI"},
+    "boto3":             {"name": "Boto3 (AWS SDK)",         "provider": "AWS Bedrock"},
+    "groq":              {"name": "Groq SDK",                "provider": "Groq"},
+    "cohere":            {"name": "Cohere SDK",              "provider": "Cohere"},
+    "mistralai":         {"name": "Mistral SDK",             "provider": "Mistral"},
+    "together":          {"name": "Together AI SDK",         "provider": "Together AI"},
+    "replicate":         {"name": "Replicate SDK",           "provider": "Replicate"},
+    "huggingface_hub":   {"name": "HuggingFace Hub",         "provider": "HuggingFace"},
+    "deepseek":          {"name": "DeepSeek SDK",            "provider": "DeepSeek"},
+    "mem0":              {"name": "Mem0",                    "provider": "Mem0"},
+    "pydantic_ai":       {"name": "Pydantic AI",             "provider": "Multiple"},
+    "smolagents":        {"name": "SmolAgents",              "provider": "HuggingFace"},
+    "phidata":           {"name": "Phidata",                 "provider": "Multiple"},
+    "agno":              {"name": "Agno",                    "provider": "Multiple"},
+    "requests":          {"name": "Requests (HTTP client)",  "provider": "Generic HTTP"},
+    "httpx":             {"name": "HTTPX (HTTP client)",     "provider": "Generic HTTP"},
+    "aiohttp":           {"name": "aiohttp",                 "provider": "Generic HTTP"},
 }
 
-AI_MODEL_PATTERNS: list[str] = [
-    r"gpt-?4\.?1(?:-mini|-nano|-preview)?",
-    r"gpt-?4o(?:-mini|-preview|-audio|-realtime)?",
-    r"gpt-?4(?:-turbo|-vision|-32k|-0125|-1106|-0613)?",
-    r"gpt-?3\.?5(?:-turbo(?:-16k|-instruct|-0125|-1106)?)?",
-    r"gpt-?5", r"\bo3(?:-mini|-preview)?\b",
-    r"\bo4(?:-mini)?\b", r"\bo1(?:-mini|-preview)?\b",
-    r"claude-?3(?:\.\d+)?(?:-opus|-sonnet|-haiku)?",
-    r"claude-?3\.?5(?:-sonnet|-haiku)?",
-    r"claude-?4(?:-opus|-sonnet)?", r"claude-?2(?:\.\d+)?",
-    r"gemini-?(?:pro|ultra|flash|nano)?(?:-\d+\.\d+)?(?:-latest|-preview)?",
-    r"gemini-?1\.?5(?:-pro|-flash)?",
-    r"gemini-?2\.?0(?:-flash)?",
-    r"gemini-?2\.?5(?:-flash|-pro)?",
-    r"llama-?3(?:\.\d+)?(?:-\d+[bB])?(?:-instruct|-chat)?",
-    r"llama-?2(?:-\d+[bB])?(?:-chat|-instruct)?",
-    r"llama-?3\.?1(?:-\d+[bB])?", r"llama-?3\.?2(?:-\d+[bB])?",
-    r"mistral-(?:7b|large|medium|small|tiny|nemo)(?:-instruct)?",
-    r"mixtral-?(?:8x7b|8x22b)?(?:-instruct)?",
-    r"deepseek-(?:coder|chat|r1|v\d+|v3)(?:-\d+[bB])?",
-    r"command-?(?:r|r-plus|light|nightly)?(?:-\d+)?",
-    r"phi-?[234](?:-mini|-medium|-vision)?",
-    r"qwen(?:\d+(?:\.\d+)?)?(?:-\d+[bB])?(?:-instruct|-chat)?",
-    r"falcon-?(?:7b|40b|180b)?(?:-instruct)?",
-    r"starcoder(?:-\d+[bB]|-base)?", r"codestral",
-    r"bert-(?:base|large)(?:-uncased|-cased)?",
-    r"t5-(?:small|base|large|xl|xxl)",
+AI_PROVIDERS: Dict[str, str] = {
+    "openai":         "OpenAI",
+    "azure":          "Azure OpenAI",
+    "azure_openai":   "Azure OpenAI",
+    "anthropic":      "Anthropic",
+    "claude":         "Anthropic",
+    "gemini":         "Google Gemini",
+    "google":         "Google",
+    "vertexai":       "Google Vertex AI",
+    "bedrock":        "AWS Bedrock",
+    "aws":            "AWS",
+    "llama":          "Meta Llama",
+    "mistral":        "Mistral",
+    "groq":           "Groq",
+    "cohere":         "Cohere",
+    "ollama":         "Ollama",
+    "openrouter":     "OpenRouter",
+    "huggingface":    "HuggingFace",
+    "deepseek":       "DeepSeek",
+    "perplexity":     "Perplexity",
+    "together":       "Together AI",
+    "replicate":      "Replicate",
+    "local":          "Local LLM",
+    "xai":            "xAI",
+    "grok":           "xAI Grok",
+}
+
+AI_MODELS: List[str] = [
+    # OpenAI
+    "gpt-5","gpt-4.1","gpt-4o","gpt-4o-mini","gpt-4.1-mini","gpt-4.1-nano",
+    "gpt-4-turbo","gpt-4","gpt-3.5-turbo","gpt-3.5",
+    "o1","o1-mini","o1-preview","o3","o3-mini","o4-mini",
+    "dall-e-3","dall-e-2","whisper",
+    "text-embedding-3-large","text-embedding-3-small","text-embedding-ada-002",
+    # Anthropic
+    "claude-3-5-sonnet","claude-3-5-haiku","claude-3-opus","claude-3-sonnet",
+    "claude-3-haiku","claude-2","claude-instant","claude",
+    # Google
+    "gemini-2.0","gemini-1.5-pro","gemini-1.5-flash","gemini-pro",
+    "gemini-ultra","gemini-flash","gemini",
+    # Meta
+    "llama-3.3","llama-3.2","llama-3.1","llama-3","llama-2","llama",
+    # Mistral
+    "mistral-large","mistral-medium","mistral-small","mistral-7b",
+    "mixtral-8x22b","mixtral-8x7b","mixtral","codestral","pixtral",
+    # DeepSeek
+    "deepseek-r1","deepseek-v3","deepseek-v2","deepseek-coder","deepseek",
+    # Cohere
+    "command-r-plus","command-r","command",
+    # Microsoft
+    "phi-4","phi-3","phi-2","phi",
+    # Alibaba
+    "qwen-2.5","qwen-2","qwen","qwq",
+    # AWS
+    "titan","nova",
+    # xAI
+    "grok-2","grok-1","grok",
+    # HuggingFace
+    "falcon","bloom","starcoder","codegen","mpt",
 ]
 
-AI_SDK_PATTERNS: dict[str, list[str]] = {
-    "LangChain":       [r"from langchain", r"import langchain",
-                        r"LLMChain", r"AgentExecutor", r"ChatOpenAI",
-                        r"PromptTemplate", r"ChatPromptTemplate"],
-    "LangGraph":       [r"from langgraph", r"import langgraph",
-                        r"StateGraph", r"MessageGraph"],
-    "Semantic Kernel": [r"semantic_kernel", r"SemanticKernel",
-                        r"KernelPlugin", r"KernelFunction"],
-    "AutoGen":         [r"import autogen", r"from autogen",
-                        r"AssistantAgent", r"UserProxyAgent", r"GroupChat"],
-    "CrewAI":          [r"import crewai", r"from crewai", r"Crew\("],
-    "LlamaIndex":      [r"from llama_index", r"import llama_index",
-                        r"VectorStoreIndex", r"SimpleDirectoryReader"],
-    "Haystack":        [r"import haystack", r"from haystack",
-                        r"DocumentStore"],
-    "DSPy":            [r"import dspy", r"from dspy",
-                        r"dspy\.Predict", r"dspy\.ChainOfThought"],
-    "Transformers":    [r"from transformers", r"import transformers",
-                        r"AutoModel", r"AutoTokenizer", r"pipeline\("],
-    "LiteLLM":         [r"import litellm", r"from litellm",
-                        r"litellm\.completion"],
-    "Instructor":      [r"import instructor", r"from instructor",
-                        r"instructor\.patch"],
-    "Ollama SDK":      [r"import ollama", r"from ollama",
-                        r"ollama\.chat", r"ollama\.generate"],
-    "OpenAI SDK":      [r"from openai import", r"import openai",
-                        r"client\.chat\.completions", r"AsyncOpenAI",
-                        r"OpenAI\("],
-    "Anthropic SDK":   [r"from anthropic import", r"import anthropic",
-                        r"client\.messages\.create", r"AsyncAnthropic"],
-    "Google AI SDK":   [r"import google\.generativeai",
-                        r"from google\.generativeai",
-                        r"genai\.GenerativeModel", r"vertexai\.init"],
-    "Pydantic AI":     [r"from pydantic_ai", r"import pydantic_ai"],
+API_KEY_ENV_VARS: Dict[str, str] = {
+    "OPENAI_API_KEY":               "OpenAI",
+    "OPENAI_KEY":                   "OpenAI",
+    "AZURE_OPENAI_KEY":             "Azure OpenAI",
+    "AZURE_OPENAI_API_KEY":         "Azure OpenAI",
+    "AZURE_OPENAI_ENDPOINT":        "Azure OpenAI",
+    "AZURE_API_KEY":                "Azure OpenAI",
+    "ANTHROPIC_API_KEY":            "Anthropic",
+    "CLAUDE_API_KEY":               "Anthropic",
+    "GEMINI_API_KEY":               "Google Gemini",
+    "GOOGLE_API_KEY":               "Google",
+    "GOOGLE_APPLICATION_CREDENTIALS":"Google",
+    "GROQ_API_KEY":                 "Groq",
+    "COHERE_API_KEY":               "Cohere",
+    "MISTRAL_API_KEY":              "Mistral",
+    "TOGETHER_API_KEY":             "Together AI",
+    "REPLICATE_API_KEY":            "Replicate",
+    "HUGGINGFACE_API_KEY":          "HuggingFace",
+    "HF_TOKEN":                     "HuggingFace",
+    "HUGGING_FACE_HUB_TOKEN":       "HuggingFace",
+    "AWS_ACCESS_KEY_ID":            "AWS",
+    "AWS_SECRET_ACCESS_KEY":        "AWS",
+    "AWS_SESSION_TOKEN":            "AWS",
+    "AWS_DEFAULT_REGION":           "AWS",
+    "DEEPSEEK_API_KEY":             "DeepSeek",
+    "PERPLEXITY_API_KEY":           "Perplexity",
+    "OPENROUTER_API_KEY":           "OpenRouter",
+    "OLLAMA_HOST":                  "Ollama",
+    "OLLAMA_BASE_URL":              "Ollama",
+    "LANGCHAIN_API_KEY":            "LangChain",
+    "LANGSMITH_API_KEY":            "LangSmith",
+    "XAI_API_KEY":                  "xAI",
+    "GROK_API_KEY":                 "xAI",
+    "MEM0_API_KEY":                 "Mem0",
+    "DATABASE_URL":                 "Database",
+    "SECRET_KEY":                   "Application",
+    "FLASK_SECRET_KEY":             "Flask",
+    "PORT":                         "Application",
 }
 
-AGENT_DETECTION_PATTERNS: list[str] = [
-    r"class\s+\w*[Aa]gent\w*", r"class\s+\w*[Bb]ot\w*",
-    r"class\s+\w*[Aa]ssistant\w*", r"class\s+\w*[Oo]rchestrat\w*",
-    r"AgentExecutor", r"AssistantAgent", r"UserProxyAgent",
-    r"ConversableAgent", r"Crew\s*\(",
-    r"StateGraph\s*\(", r"MessageGraph\s*\(",
-    r"create_agent", r"build_agent", r"initialize_agent",
-    r"agent\.run\s*\(", r"agent\.invoke\s*\(",
-    r"chat_completion", r"completion\.create",
-    r"messages\.create", r"generate_content",
-    r"chain\.invoke\s*\(", r"chain\.run\s*\(",
-    r"@tool\b", r"tool_calls", r"function_call",
+AGENT_PATTERNS: List[str] = [
+    r"class\s+\w*[Aa]gent\w*\b",
+    r"class\s+\w*[Bb]ot\w*\b",
+    r"class\s+\w*[Aa]ssistant\w*\b",
+    r"class\s+\w*[Oo]rchestrator\w*\b",
+    r"class\s+\w*[Pp]lanner\w*\b",
+    r"class\s+\w*[Ee]xecutor\w*\b",
+    r"class\s+\w*[Mm]onitor\w*\b",
+    r"class\s+\w*[Ss]canner\w*\b",
+    r"class\s+\w*[Ss]entinel\w*\b",
+    r"AgentExecutor\s*\(",
+    r"create_agent\s*\(",
+    r"initialize_agent\s*\(",
+    r"autogen\.\w+Agent\s*\(",
+    r"crew\s*=\s*Crew\s*\(",
+    r"Agent\s*\(",
+    r"ReActAgent\s*\(",
+    r"supervisor_agent\s*=",
+    r"worker_agent\s*=",
+    r"@agent\b",
 ]
 
-PROMPT_PATTERNS: list[str] = [
-    r"system_prompt\s*=", r"user_prompt\s*=",
-    r"system_message\s*=", r"prompt_template\s*=",
-    r"PromptTemplate\s*\(", r"ChatPromptTemplate",
-    r"SystemMessage\s*\(", r"HumanMessage\s*\(",
-    r'"role"\s*:\s*"system"', r'"role"\s*:\s*"user"',
-    r"SYSTEM_PROMPT", r"USER_PROMPT",
-    r'prompt\s*=\s*f"""', r'prompt\s*=\s*"""',
-    r"system_instruction",
+PROMPT_PATTERNS: List[str] = [
+    r"system_prompt\s*=",
+    r"system_message\s*=",
+    r"user_prompt\s*=",
+    r"prompt_template\s*=",
+    r"PromptTemplate\s*\(",
+    r"ChatPromptTemplate",
+    r"HumanMessagePromptTemplate",
+    r"SystemMessagePromptTemplate",
+    r'"role"\s*:\s*"system"',
+    r"'role'\s*:\s*'system'",
+    r'"role"\s*:\s*"user"',
+    r"SYSTEM_PROMPT\s*=",
+    r"USER_PROMPT\s*=",
+    r"PROMPT\s*=\s*[\"']",
+    r"prompt\s*=\s*f[\"']",
+    r'prompt\s*=\s*"""',
+    r'template\s*=\s*"""',
+    r'instruction\s*=\s*"""',
 ]
 
-API_KEY_MAP: dict[str, str] = {
-    "OPENAI_API_KEY":           "OpenAI",
-    "AZURE_OPENAI_KEY":         "Azure OpenAI",
-    "AZURE_OPENAI_API_KEY":     "Azure OpenAI",
-    "ANTHROPIC_API_KEY":        "Anthropic",
-    "GEMINI_API_KEY":           "Google Gemini",
-    "GOOGLE_API_KEY":           "Google",
-    "GROQ_API_KEY":             "Groq",
-    "COHERE_API_KEY":           "Cohere",
-    "MISTRAL_API_KEY":          "Mistral",
-    "HUGGINGFACE_API_KEY":      "HuggingFace",
-    "HF_TOKEN":                 "HuggingFace",
-    "HUGGINGFACEHUB_API_TOKEN": "HuggingFace",
-    "AWS_ACCESS_KEY_ID":        "AWS",
-    "AWS_SECRET_ACCESS_KEY":    "AWS",
-    "OPENROUTER_API_KEY":       "OpenRouter",
-    "DEEPSEEK_API_KEY":         "DeepSeek",
-    "PERPLEXITY_API_KEY":       "Perplexity",
-    "OLLAMA_HOST":              "Ollama",
-    "LITELLM_API_KEY":          "LiteLLM",
-    "TOGETHER_API_KEY":         "Together AI",
-    "REPLICATE_API_TOKEN":      "Replicate",
-    "PINECONE_API_KEY":         "Pinecone",
-    "WEAVIATE_API_KEY":         "Weaviate",
-    "QDRANT_API_KEY":           "Qdrant",
-    "SERPAPI_API_KEY":          "SerpAPI",
-    "TAVILY_API_KEY":           "Tavily",
+TOOL_PATTERNS: Dict[str, List[str]] = {
+    "Web Search":    [r"tavily",r"serp",r"google_search",r"bing_search",r"duckduckgo",r"web_search"],
+    "Database":      [r"sqlalchemy",r"psycopg2",r"pymongo",r"sqlite3",r"mysql",r"db\.execute",r"\.query\("],
+    "Vector Store":  [r"pinecone",r"weaviate",r"chromadb",r"qdrant",r"faiss",r"milvus",r"vectorstore"],
+    "RAG":           [r"retrieval",r"rag\b",r"retrieve",r"document_loader",r"text_splitter"],
+    "HTTP Calls":    [r"requests\.get",r"requests\.post",r"httpx\.",r"aiohttp\.",r"urllib\.request"],
+    "Email":         [r"smtplib",r"sendgrid",r"mailgun",r"email\.mime"],
+    "Slack":         [r"slack_sdk",r"slack_bolt",r"WebClient"],
+    "GitHub":        [r"pygithub",r"github\.Github",r"github\.rest"],
+    "Filesystem":    [r"open\s*\(",r"pathlib\.Path",r"os\.path",r"shutil\.",r"glob\."],
+    "Shell":         [r"subprocess\.",r"os\.system",r"os\.popen"],
+    "Memory":        [r"memory\b",r"conversation_buffer",r"chat_history",r"mem0"],
+    "Monitoring":    [r"prometheus",r"datadog",r"cloudwatch",r"grafana",r"alertmanager"],
+    "AWS Services":  [r"boto3\.",r"s3\.",r"ec2\.",r"lambda_",r"sqs\.",r"sns\."],
+    "Flask/Web":     [r"@app\.",r"@blueprint\.",r"render_template",r"jsonify",r"make_response"],
+    "Scheduling":    [r"schedule\.",r"cron",r"apscheduler",r"celery"],
 }
 
-TOKEN_CONFIG_PATTERNS: dict[str, str] = {
-    "max_tokens":            r"max_tokens\s*=\s*(\d+)",
-    "temperature":           r"temperature\s*=\s*([\d.]+)",
-    "top_p":                 r"top_p\s*=\s*([\d.]+)",
-    "max_completion_tokens": r"max_completion_tokens\s*=\s*(\d+)",
-    "max_output_tokens":     r"max_output_tokens\s*=\s*(\d+)",
-    "context_window":        r"context_window\s*=\s*(\d+)",
-    "top_k":                 r"top_k\s*=\s*(\d+)",
-    "presence_penalty":      r"presence_penalty\s*=\s*([\d.-]+)",
-    "frequency_penalty":     r"frequency_penalty\s*=\s*([\d.-]+)",
+WORKFLOW_PATTERNS: Dict[str, List[str]] = {
+    "Planning":         [r"planner",r"create_plan",r"task_plan",r"plan_step"],
+    "Execution":        [r"executor",r"run_agent",r"execute_task",r"agent\.run"],
+    "Reflection":       [r"reflect",r"reflection",r"self_critique",r"critique"],
+    "Retry / Backoff":  [r"max_retries",r"retry_logic",r"exponential_backoff",r"backoff",r"tenacity"],
+    "Evaluation":       [r"evaluator",r"judge",r"scorer",r"evaluate_output"],
+    "Memory":           [r"memory",r"remember",r"recall",r"chat_history"],
+    "RAG":              [r"retrieve",r"retrieval",r"semantic_search",r"similarity_search"],
+    "Tool Calling":     [r"tool_call",r"function_call",r"use_tool",r"call_tool"],
+    "Streaming":        [r"stream_response",r"async_stream",r"streaming",r"yield\s+chunk"],
+    "Multi-agent":      [r"multi_agent",r"multiagent",r"agent_network",r"agent_team"],
+    "Supervisor":       [r"supervisor",r"orchestrator",r"coordinator",r"router_agent"],
+    "Monitoring Loop":  [r"while\s+True",r"poll",r"watch_loop",r"monitor_loop",r"event_loop"],
+    "Webhook":          [r"webhook",r"callback_url",r"event_handler",r"on_event"],
+    "Alert":            [r"alert",r"notify",r"send_alert",r"trigger_alarm"],
 }
 
-TOOL_PATTERNS: dict[str, list[str]] = {
-    "Web Search":       [r"serpapi", r"tavily", r"DuckDuckGoSearch",
-                         r"GoogleSearch", r"web_search"],
-    "Vector Store":     [r"pinecone", r"weaviate", r"qdrant", r"chroma",
-                         r"faiss", r"milvus", r"VectorStore"],
-    "Database":         [r"sqlite", r"postgresql", r"mysql", r"mongodb",
-                         r"SQLDatabase"],
-    "RAG":              [r"\bRAG\b", r"retrieval_augmented",
-                         r"VectorStoreRetriever", r"similarity_search"],
-    "Calculator":       [r"calculator", r"Calculator", r"wolfram",
-                         r"LLMMathChain"],
-    "Browser":          [r"playwright", r"selenium", r"puppeteer",
-                         r"WebBrowser"],
-    "Email":            [r"smtp", r"sendgrid", r"mailgun", r"EmailTool"],
-    "Slack":            [r"slack_sdk", r"SlackTool"],
-    "GitHub":           [r"PyGithub", r"github_tool", r"GitHubToolkit"],
-    "Filesystem":       [r"ReadFileTool", r"WriteFileTool",
-                         r"FilesystemTool"],
-    "Shell":            [r"BashProcess", r"ShellTool", r"shell_tool"],
-    "Python REPL":      [r"PythonREPL", r"python_repl",
-                         r"PythonInterpreter"],
-    "Memory":           [r"ConversationBufferMemory", r"MemorySaver",
-                         r"checkpointer", r"ConversationSummaryMemory"],
-    "Code Interpreter": [r"code_interpreter", r"CodeInterpreter", r"E2B"],
-}
-
-WORKFLOW_PATTERNS: dict[str, list[str]] = {
-    "Planning":        [r"plan\s*\(", r"planner", r"PlanAndExecute"],
-    "Execution":       [r"execute\s*\(", r"executor", r"AgentExecutor"],
-    "Reflection":      [r"reflect\s*\(", r"reflection", r"self_critique"],
-    "Retry":           [r"retry", r"backoff", r"tenacity", r"max_retries"],
-    "Evaluation":      [r"evaluate\s*\(", r"evaluator", r"QAEvalChain"],
-    "Memory":          [r"memory\s*=", r"ConversationMemory",
-                        r"MemorySaver"],
-    "RAG":             [r"retrieve\s*\(", r"retriever\s*=",
-                        r"similarity_search"],
-    "Tool Calling":    [r"tool_calls", r"function_call", r"@tool",
-                        r"Tool\s*\("],
-    "Streaming":       [r"stream\s*\(", r"streaming\s*=\s*True",
-                        r"stream_tokens"],
-    "Multi-agent":     [r"MultiAgent", r"GroupChat", r"Crew\s*\(",
-                        r"supervisor"],
-    "Supervisor":      [r"supervisor", r"SupervisorAgent",
-                        r"orchestrator"],
-    "Function Calling":[r"functions\s*=\s*\[", r"tools\s*=\s*\["],
-}
+FLASK_ROUTE_PATTERN = re.compile(
+    r'@\w+\.(get|post|put|delete|patch|route)\s*\(\s*["\']([^"\']+)["\']',
+    re.IGNORECASE,
+)
+BLUEPRINT_PATTERN = re.compile(
+    r'Blueprint\s*\(\s*["\'](\w+)["\']',
+    re.IGNORECASE,
+)
 
 
-# ══════════════════════════════════════════════════════════════
-# DATA CLASSES
-# ══════════════════════════════════════════════════════════════
+# ──────────────────────────────────────────────────────────────
+# UTILITIES
+# ──────────────────────────────────────────────────────────────
 
-@dataclass
-class FileRecord:
-    serial:        int  = 0
-    relative_path: str  = ""
-    file_name:     str  = ""
-    extension:     str  = ""
-    language:      str  = ""
-    category:      str  = ""
-    purpose:       str  = ""
-    description:   str  = ""
-    size_bytes:    int  = 0
-    lines_of_code: int  = 0
-    is_used:       str  = "Unknown"
-    is_referenced: str  = "Unknown"
-    is_ai_related: bool = False
-    dependencies:  list = field(default_factory=list)
-    classes:       list = field(default_factory=list)
-    functions:     list = field(default_factory=list)
-    imports:       list = field(default_factory=list)
+def safe_read(filepath: str) -> Optional[str]:
+    for enc in ("utf-8", "latin-1", "cp1252", "ascii"):
+        try:
+            with open(filepath, "r", encoding=enc, errors="replace") as fh:
+                return fh.read()
+        except Exception:
+            continue
+    return None
 
 
-@dataclass
-class AgentRecord:
-    name:         str  = ""
-    file:         str  = ""
-    agent_type:   str  = ""
-    purpose:      str  = ""
-    provider:     str  = "Unknown"
-    sdk:          str  = "Unknown"
-    model:        str  = "Not Specified"
-    tools:        list = field(default_factory=list)
-    workflows:    list = field(default_factory=list)
-    prompts:      list = field(default_factory=list)
-    token_config: dict = field(default_factory=dict)
-    line_number:  int  = 0
+def count_lines(content: str) -> int:
+    return len([l for l in content.splitlines() if l.strip()])
 
 
-@dataclass
-class ProviderRecord:
-    name:        str  = ""
-    sdk:         str  = ""
-    endpoint:    str  = ""
-    auth_method: str  = "API Key"
-    env_vars:    list = field(default_factory=list)
-    files:       list = field(default_factory=list)
+def fmt_size(n: int) -> str:
+    if n < 1024:
+        return f"{n} B"
+    if n < 1024 ** 2:
+        return f"{n / 1024:.1f} KB"
+    return f"{n / (1024 ** 2):.1f} MB"
 
 
-@dataclass
-class ModelRecord:
-    name:            str  = ""
-    provider:        str  = ""
-    files:           list = field(default_factory=list)
-    reference_count: int  = 0
+def esc(text: Any) -> str:
+    return _html.escape(str(text)) if text is not None else ""
 
 
-@dataclass
-class PromptRecord:
-    name:            str = ""
-    location:        str = ""
-    line_number:     int = 0
-    prompt_type:     str = ""
-    agent:           str = "Unknown"
-    content_preview: str = ""
+def trunc(text: Any, n: int = 80) -> str:
+    s = str(text) if text is not None else ""
+    return s[:n] + "…" if len(s) > n else s
 
 
-@dataclass
-class APIKeyRecord:
-    variable_name: str  = ""
-    provider:      str  = ""
-    used_in:       list = field(default_factory=list)
-    loaded_from:   str  = "Unknown"
+def fsize(fp: str) -> int:
+    try:
+        return os.path.getsize(fp)
+    except Exception:
+        return 0
 
 
-@dataclass
-class SDKRecord:
-    name:         str  = ""
-    files:        list = field(default_factory=list)
-    import_count: int  = 0
-
-
-@dataclass
-class ToolRecord:
-    name:  str  = ""
-    files: list = field(default_factory=list)
-
-
-@dataclass
-class WorkflowRecord:
-    name:  str  = ""
-    files: list = field(default_factory=list)
-
-
-@dataclass
-class ScanResult:
-    scan_date:       str  = ""
-    root_path:       str  = ""
-    repo_name:       str  = ""
-    total_dirs:      int  = 0
-    total_files:     int  = 0
-    source_files:    int  = 0
-    config_files:    int  = 0
-    doc_files:       int  = 0
-    test_files:      int  = 0
-    infra_files:     int  = 0
-    ai_files:        int  = 0
-    total_agents:    int  = 0
-    total_providers: int  = 0
-    total_models:    int  = 0
-    total_prompts:   int  = 0
-    total_sdks:      int  = 0
-    total_tools:     int  = 0
-    total_api_keys:  int  = 0
-    total_workflows: int  = 0
-    total_classes:   int  = 0
-    total_functions: int  = 0
-    total_endpoints: int  = 0
-    files:           list = field(default_factory=list)
-    agents:          list = field(default_factory=list)
-    providers:       dict = field(default_factory=dict)
-    models:          dict = field(default_factory=dict)
-    prompts:         list = field(default_factory=list)
-    api_keys:        dict = field(default_factory=dict)
-    sdks:            dict = field(default_factory=dict)
-    tools:           dict = field(default_factory=dict)
-    workflows:       dict = field(default_factory=dict)
-    directory_tree:  str  = ""
-    errors:          list = field(default_factory=list)
-
-
-# ══════════════════════════════════════════════════════════════
-# SCANNER ENGINE
-# ══════════════════════════════════════════════════════════════
+# ──────────────────────────────────────────────────────────────
+# SCANNER
+# ──────────────────────────────────────────────────────────────
 
 class RepoScanner:
-    """Pure static-analysis scanner. Never executes or modifies files."""
+    """Recursively scans a repository directory and extracts all metadata."""
 
     def __init__(self, root: str) -> None:
-        self.root   = Path(root).resolve()
-        self.result = ScanResult(
-            scan_date = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            root_path = str(self.root),
-            repo_name = self.root.name,
-        )
-        self._ref_files: set[str]            = set()
-        self._all_paths: set[str]            = set()
-        self._dep_graph: dict[str, list[str]] = defaultdict(list)
+        self.root       = os.path.abspath(root)
+        self.repo_name  = os.path.basename(self.root)
+        self.scan_date  = datetime.datetime.now().isoformat()
 
-    def scan(self) -> ScanResult:
-        self._discover()
-        self._analyse()
-        self._resolve_deps()
-        self._mark_refs()
-        self._build_tree()
-        self._finalise_counts()
-        return self.result
+        # File records
+        self.files:     List[Dict] = []
+        self.dirs:      List[str]  = []
 
-    # ── discovery ─────────────────────────────────────────────
-    def _discover(self) -> None:
-        serial = 0
-        dirs: list[str] = []
-        for dirpath, dirnames, filenames in os.walk(self.root):
-            dirnames[:] = sorted(
-                d for d in dirnames
-                if d not in IGNORED_DIRS
-                and not (d.startswith(".")
-                         and d not in {".github", ".circleci", ".gitlab"})
-                and not d.endswith(".egg-info")
-            )
-            dirs.append(str(Path(dirpath).relative_to(self.root)) or "/")
-            for fname in sorted(filenames):
-                fpath = Path(dirpath) / fname
-                try:
-                    stat = fpath.stat()
-                except OSError:
-                    continue
-                serial += 1
-                rel  = str(fpath.relative_to(self.root))
-                ext  = self._ext(fpath)
-                lang = EXTENSION_LANGUAGE_MAP.get(ext, "Unknown")
-                self._all_paths.add(rel)
-                self.result.files.append(FileRecord(
-                    serial=        serial,
-                    relative_path= rel,
-                    file_name=     fname,
-                    extension=     ext,
-                    language=      lang,
-                    category=      self._quick_cat(rel, fname, ext),
-                    size_bytes=    stat.st_size,
-                ))
-        self.result.total_dirs  = len(dirs)
-        self.result.total_files = len(self.result.files)
+        # AI artefacts
+        self.agents:    List[Dict] = []
+        self.providers: Dict[str, Dict] = {}
+        self.models:    Dict[str, Dict] = {}
+        self.sdks:      Dict[str, Dict] = {}
+        self.prompts:   List[Dict] = []
+        self.api_keys:  List[Dict] = []
+        self.tools:     Dict[str, List[str]] = defaultdict(list)
+        self.workflows: Dict[str, List[str]] = defaultdict(list)
 
-    # ── content analysis ──────────────────────────────────────
-    def _analyse(self) -> None:
-        for rec in self.result.files:
-            content = self._read(self.root / rec.relative_path)
-            if content is None:
+        # Framework / web artefacts
+        self.routes:     List[Dict] = []
+        self.blueprints: List[str]  = []
+        self.env_files:  List[str]  = []
+
+        # Stats
+        self.stats: Dict[str, Any] = defaultdict(int)
+
+    # ── Public entry ──────────────────────────────────────────
+
+    def scan(self) -> "RepoScanner":
+        print(f"\n[*] Scanning → {self.root}")
+        self._walk()
+        print(f"[*] Found {len(self.files)} files in {len(self.dirs)} directories")
+        self._analyse_all()
+        self._build_ref_graph()
+        self._compute_stats()
+        print("[*] Scan complete.\n")
+        return self
+
+    # ── Walk filesystem ───────────────────────────────────────
+
+    def _walk(self) -> None:
+        for dirpath, dirnames, filenames in os.walk(self.root, topdown=True):
+            dirnames[:] = sorted(d for d in dirnames if d not in IGNORED_DIRS)
+
+            rel_dir = os.path.relpath(dirpath, self.root)
+            if rel_dir != ".":
+                self.dirs.append(rel_dir)
+
+            for fn in sorted(filenames):
+                fp  = os.path.join(dirpath, fn)
+                rel = os.path.relpath(fp, self.root)
+                ext = self._classify_ext(fn)
+                lang, cat = EXTENSION_MAP.get(ext, ("Unknown", "other"))
+
+                self.files.append({
+                    # identity
+                    "serial":       0,
+                    "filepath":     fp,
+                    "rel_path":     rel,
+                    "filename":     fn,
+                    "extension":    ext or "(none)",
+                    "language":     lang,
+                    "category":     cat,
+                    # analysis outputs
+                    "purpose":      "Unknown",
+                    "description":  "",
+                    "size":         fsize(fp),
+                    "size_fmt":     fmt_size(fsize(fp)),
+                    "lines":        0,
+                    "content":      None,
+                    # flags
+                    "is_used":       False,
+                    "is_referenced": False,
+                    "is_ai_related": False,
+                    "has_tests":     False,
+                    "has_api":       False,
+                    # collections
+                    "imports":        [],
+                    "classes":        [],
+                    "functions":      [],
+                    "routes":         [],
+                    "blueprints":     [],
+                    "agents_found":   [],
+                    "models_found":   [],
+                    "providers_found":[],
+                    "sdks_found":     [],
+                    "prompts_found":  [],
+                    "keys_found":     [],
+                    "tools_found":    [],
+                    "workflows_found":[],
+                    "token_config":   {},
+                })
+
+    @staticmethod
+    def _classify_ext(fn: str) -> str:
+        """Return a normalised extension, handling special filenames."""
+        fl = fn.lower()
+        if fl == "dockerfile" or fl.startswith("dockerfile."):
+            return ".dockerfile"
+        if fl == "makefile":
+            return ".makefile"
+        if fl in ("requirements.txt", "requirements-dev.txt",
+                  "requirements-test.txt", "requirements-prod.txt"):
+            return ".requirements"
+        if fl == ".env" or re.match(r"^\.env\.\w+$", fl):
+            return ".env"
+        return Path(fn).suffix.lower()
+
+    # ── Analyse each file ─────────────────────────────────────
+
+    def _analyse_all(self) -> None:
+        total = len(self.files)
+        for i, fi in enumerate(self.files, 1):
+            fi["serial"] = i
+            sys.stdout.write(f"\r  Analysing [{i}/{total}] {fi['filename'][:55]:<55}")
+            sys.stdout.flush()
+
+            if fi["size"] > 20 * 1024 * 1024:
                 continue
-            rec.lines_of_code = content.count("\n") + 1
-            rec.imports        = self._imports(content, rec.language)
-            rec.classes        = self._classes(content, rec.language)
-            rec.functions      = self._functions(content, rec.language)
-            rec.is_ai_related  = self._is_ai(content, rec.relative_path)
-            rec.purpose, rec.description = self._purpose(rec, content)
-            rec.dependencies   = rec.imports[:8]
-            if rec.is_ai_related and rec.category not in (
-                "Test", "Configuration", "Documentation"
-            ):
-                rec.category = "AI"
-            self.result.total_classes   += len(rec.classes)
-            self.result.total_functions += len(rec.functions)
-            self.result.total_endpoints += len(re.findall(
-                r'@(?:app|router|blueprint)\s*\.\s*'
-                r'(?:get|post|put|delete|patch|route)',
-                content, re.IGNORECASE,
-            ))
-            self._detect_providers(content, rec.relative_path)
-            self._detect_models(content, rec.relative_path)
-            self._detect_prompts(content, rec.relative_path)
-            self._detect_api_keys(content, rec.relative_path)
-            self._detect_sdks(content, rec.relative_path)
-            self._detect_tools(content, rec.relative_path)
-            self._detect_workflows(content, rec.relative_path)
-            self._detect_agents(content, rec)
 
-    # ── dependency resolution ─────────────────────────────────
-    def _resolve_deps(self) -> None:
-        name_map: dict[str, str] = {}
-        for f in self.result.files:
-            name_map[Path(f.file_name).stem] = f.relative_path
-            name_map[f.file_name]            = f.relative_path
-        for f in self.result.files:
-            for imp in f.imports:
-                key = imp.split(".")[-1]
-                if key in name_map and name_map[key] != f.relative_path:
-                    self._dep_graph[f.relative_path].append(name_map[key])
-                    self._ref_files.add(name_map[key])
+            content = safe_read(fi["filepath"])
+            if not content:
+                continue
 
-    # ── mark references ───────────────────────────────────────
-    def _mark_refs(self) -> None:
-        for f in self.result.files:
-            if f.relative_path in self._ref_files:
-                f.is_referenced = "Yes"
-                f.is_used       = "Yes"
-            else:
-                f.is_referenced = "No"
-                f.is_used = "Likely" if any(
-                    x in f.file_name.lower()
-                    for x in ["main", "app", "server", "index",
-                               "__init__", "config", "settings"]
-                ) else "Unknown"
+            fi["content"] = content
+            fi["lines"]   = count_lines(content)
 
-    # ── directory tree ────────────────────────────────────────
-    def _build_tree(self) -> None:
-        lines = [self.root.name + "/"]
-        self._tree_walk(self.root, "", lines, 0, 5)
-        self.result.directory_tree = "\n".join(lines)
+            self._detect_purpose(fi)
+            self._detect_imports(fi)
+            self._detect_routes(fi)
+            self._detect_ai(fi)
+            self._detect_prompts(fi)
+            self._detect_keys(fi)
+            self._detect_tools(fi)
+            self._detect_workflows(fi)
+            self._detect_token_cfg(fi)
+            self._detect_cls_fn(fi)
+            self._detect_tests(fi)
+            self._refine_category(fi)
 
-    def _tree_walk(
-        self, path: Path, prefix: str,
-        lines: list, depth: int, max_depth: int,
-    ) -> None:
-        if depth >= max_depth:
-            return
-        try:
-            entries = sorted(path.iterdir())
-        except PermissionError:
-            return
-        entries = [
-            e for e in entries
-            if e.name not in IGNORED_DIRS
-            and not (e.name.startswith(".")
-                     and e.name not in {".github", ".circleci", ".gitlab"})
+            # Track .env files
+            if fi["extension"] == ".env":
+                self.env_files.append(fi["rel_path"])
+
+        print()
+
+    # ── Purpose detection ─────────────────────────────────────
+
+    def _detect_purpose(self, fi: Dict) -> None:
+        name  = fi["filename"].lower()
+        rpath = fi["rel_path"].lower().replace("\\", "/")
+        snip  = (fi["content"] or "")[:800].lower()
+        hay   = f"{name} {rpath} {snip}"
+
+        rules = [
+            (["sentinel","ops","sentinelops"],          "AI Operations Monitor"),
+            (["agent_monitor","agentmonitor"],           "Agent Monitor"),
+            (["agent", "agents"],                        "AI Agent"),
+            (["llm","language_model","language model"],  "LLM Interface"),
+            (["prompt", "prompts"],                      "Prompt"),
+            (["memory", "mem0"],                         "Memory"),
+            (["tool", "tools"],                          "Tool"),
+            (["workflow", "pipeline", "flow"],           "Workflow / Pipeline"),
+            (["rag", "retrieval", "retriever"],          "RAG"),
+            (["embed", "embedding", "embeddings"],       "Embeddings"),
+            (["vector", "vectorstore"],                  "Vector Store"),
+            (["chain"],                                  "Chain"),
+            (["router", "routing"],                      "Router"),
+            (["supervisor", "orchestrat"],               "Orchestrator"),
+            (["api", "endpoint", "route", "routes"],     "API / Routes"),
+            (["controller", "handler"],                  "Controller"),
+            (["service"],                                "Service"),
+            (["repository", "dao", "store"],             "Repository / DAO"),
+            (["database", "db", "schema", "migration"],  "Database"),
+            (["auth", "authentication", "jwt", "oauth"], "Authentication"),
+            (["config", "configuration", "settings"],    "Configuration"),
+            (["utils", "utility", "helpers", "common"],  "Utility / Helper"),
+            (["log", "logging", "logger"],               "Logging"),
+            (["monitor", "metrics", "telemetry", "ops"], "Monitoring / Metrics"),
+            (["test", "spec"],                           "Testing"),
+            (["docker", "compose"],                      "Docker"),
+            (["terraform"],                              "Terraform"),
+            (["kubernetes", "k8s", "helm"],              "Kubernetes"),
+            (["deploy", "ci", "cd", "github/workflows"], "CI/CD / Deployment"),
+            (["queue", "worker", "celery", "kafka"],     "Queue / Worker"),
+            (["scheduler", "cron"],                      "Scheduler"),
+            (["cli", "command", "cmd"],                  "CLI"),
+            (["main", "app", "application", "server",
+              "__init__", "entrypoint", "wsgi"],         "Application Entry"),
+            (["requirements", "dependencies", "package"],"Dependencies"),
+            (["readme", "changelog", "contributing"],    "Documentation"),
+            (["setup", "install", "build"],              "Build / Setup"),
+            (["frontend", "ui", "component", "page",
+              "template", "index.html"],                 "Frontend / Template"),
         ]
-        all_e = [e for e in entries if e.is_dir()] + \
-                [e for e in entries if e.is_file()]
-        for i, entry in enumerate(all_e):
-            last = i == len(all_e) - 1
-            lines.append(prefix + ("└── " if last else "├── ") +
-                         entry.name + ("/" if entry.is_dir() else ""))
-            if entry.is_dir():
-                self._tree_walk(entry, prefix + ("    " if last else "│   "),
-                                lines, depth + 1, max_depth)
 
-    # ── finalise counts ───────────────────────────────────────
-    def _finalise_counts(self) -> None:
-        cats = Counter(f.category for f in self.result.files)
-        self.result.source_files    = cats.get("Source", 0)
-        self.result.config_files    = cats.get("Configuration", 0)
-        self.result.doc_files       = cats.get("Documentation", 0)
-        self.result.test_files      = cats.get("Test", 0)
-        self.result.infra_files     = cats.get("Infrastructure", 0)
-        self.result.ai_files        = sum(1 for f in self.result.files
-                                          if f.is_ai_related)
-        self.result.total_agents    = len(self.result.agents)
-        self.result.total_providers = len(self.result.providers)
-        self.result.total_models    = len(self.result.models)
-        self.result.total_prompts   = len(self.result.prompts)
-        self.result.total_sdks      = len(self.result.sdks)
-        self.result.total_tools     = len(self.result.tools)
-        self.result.total_api_keys  = len(self.result.api_keys)
-        self.result.total_workflows = len(self.result.workflows)
+        for keywords, purpose in rules:
+            if any(kw in hay for kw in keywords):
+                fi["purpose"] = purpose
+                return
 
-    # ── static helpers ────────────────────────────────────────
-    @staticmethod
-    def _ext(p: Path) -> str:
-        if p.name.lower() in ("dockerfile", "makefile",
-                               "jenkinsfile", "procfile"):
-            return p.name.lower()
-        return p.suffix.lower()
-
-    @staticmethod
-    def _read(p: Path) -> str | None:
-        if p.stat().st_size > 5 * 1024 * 1024:
-            return None
-        for enc in ("utf-8", "latin-1"):
-            try:
-                return p.read_text(encoding=enc, errors="ignore")
-            except Exception:
-                continue
-        return None
-
-    @staticmethod
-    def _quick_cat(rel: str, fname: str, ext: str) -> str:
-        pl = (rel + "/" + fname).lower()
-        if re.search(r"test_|_test\.|spec\.|/tests?/|__tests__", pl):
-            return "Test"
-        if re.search(r"config|settings|\.env|\.yaml$|\.yml$|\.toml$|\.ini$", pl):
-            return "Configuration"
-        if re.search(r"\.md$|readme|changelog|license|docs?/", pl):
-            return "Documentation"
-        if re.search(r"\.tf$|dockerfile|docker-compose|kubernetes|k8s|"
-                     r"helm|terraform", pl):
-            return "Infrastructure"
-        if re.search(r"agent|llm|prompt|openai|anthropic|gemini|gpt|"
-                     r"claude|llama|mistral|groq|langchain|transformer|"
-                     r"semantic_kernel|autogen|crewai", pl):
-            return "AI"
-        if ext in (".py", ".js", ".ts", ".java", ".cs", ".go", ".rs",
-                   ".kt", ".scala", ".rb", ".php", ".swift", ".c", ".cpp"):
-            return "Source"
-        return "Other"
-
-    @staticmethod
-    def _imports(content: str, lang: str) -> list[str]:
-        if lang == "Python":
-            return list(dict.fromkeys(
-                m.group(1)
-                for m in re.finditer(
-                    r'^(?:import|from)\s+([\w.]+)', content, re.MULTILINE
-                )
-            ))[:25]
-        if lang in ("JavaScript", "TypeScript"):
-            return list(dict.fromkeys(
-                m.group(1)
-                for m in re.finditer(
-                    r"(?:import|require)\s*\(?['\"]([^'\"]+)['\"]", content
-                )
-            ))[:25]
-        if lang in ("Java", "Kotlin", "Scala"):
-            return list(dict.fromkeys(
-                m.group(1)
-                for m in re.finditer(
-                    r'^import\s+([\w.]+)', content, re.MULTILINE
-                )
-            ))[:25]
-        if lang == "Go":
-            return list(dict.fromkeys(
-                m.group(1)
-                for m in re.finditer(r'"([^"]+)"', content)
-            ))[:25]
-        if lang == "C#":
-            return list(dict.fromkeys(
-                m.group(1)
-                for m in re.finditer(
-                    r'^using\s+([\w.]+)', content, re.MULTILINE
-                )
-            ))[:25]
-        if lang == "Rust":
-            return list(dict.fromkeys(
-                m.group(1)
-                for m in re.finditer(
-                    r'^use\s+([\w:]+)', content, re.MULTILINE
-                )
-            ))[:25]
-        return []
-
-    @staticmethod
-    def _classes(content: str, lang: str) -> list[str]:
-        if lang == "Python":
-            return re.findall(r'^class\s+(\w+)', content, re.MULTILINE)[:20]
-        if lang in ("Java", "Kotlin", "Scala", "C#"):
-            return re.findall(r'(?:class|interface)\s+(\w+)', content)[:20]
-        if lang in ("JavaScript", "TypeScript"):
-            return re.findall(r'class\s+(\w+)', content)[:20]
-        if lang == "Go":
-            return re.findall(r'type\s+(\w+)\s+struct', content)[:20]
-        return []
-
-    @staticmethod
-    def _functions(content: str, lang: str) -> list[str]:
-        if lang == "Python":
-            return re.findall(
-                r'^(?:async\s+)?def\s+(\w+)\s*\(', content, re.MULTILINE
-            )[:40]
-        if lang in ("JavaScript", "TypeScript"):
-            return re.findall(r'function\s+(\w+)\s*\(', content)[:40]
-        if lang == "Go":
-            return re.findall(
-                r'^func\s+(?:\(\w+\s+\*?\w+\)\s+)?(\w+)\s*\(',
-                content, re.MULTILINE
-            )[:40]
-        if lang == "Rust":
-            return re.findall(
-                r'^(?:pub\s+)?fn\s+(\w+)', content, re.MULTILINE
-            )[:40]
-        return []
-
-    @staticmethod
-    def _is_ai(content: str, rel: str) -> bool:
-        kws = ["agent", "llm", "prompt", "openai", "anthropic", "gemini",
-               "langchain", "embedding", "vector", "rag", "gpt", "claude",
-               "llama", "mistral", "groq", "semantic_kernel", "autogen",
-               "crewai", "llamaindex"]
-        if any(k in rel.lower() for k in kws):
-            return True
-        sample = content[:4000].lower()
-        return sum(
-            1 for k in ["openai", "anthropic", "langchain", "llm",
-                         "gpt-4", "gpt-3", "claude", "gemini", "llama",
-                         "completion", "embedding", "chat_completion",
-                         "messages.create", "generate_content",
-                         "prompt_template", "system_prompt"]
-            if k in sample
-        ) >= 2
-
-    @staticmethod
-    def _purpose(rec: FileRecord, content: str) -> tuple[str, str]:
-        kws: dict[str, list[str]] = {
-            "AI Agent":          ["agent", "autonomous"],
-            "LLM Wrapper":       ["llm", "language_model", "chat_model"],
-            "Prompt Management": ["prompt", "template", "system_message"],
-            "RAG Pipeline":      ["rag", "retrieval", "vectorstore"],
-            "Embedding":         ["embedding", "embed"],
-            "Workflow":          ["workflow", "pipeline", "chain", "graph"],
-            "API Controller":    ["controller", "router", "endpoint", "route"],
-            "Service Layer":     ["service", "manager", "handler"],
-            "Data Model":        ["model", "schema", "entity"],
-            "Database Access":   ["repository", "dao", "database", "db"],
-            "Authentication":    ["auth", "login", "jwt", "oauth"],
-            "Configuration":     ["config", "settings", "constants"],
-            "Logging":           ["logging", "logger"],
-            "Testing":           ["test", "spec", "unittest", "pytest"],
-            "Deployment":        ["deploy", "dockerfile", "terraform"],
-            "Utility":           ["util", "helper", "common", "shared"],
-            "Documentation":     ["readme", "docs", "changelog"],
+        fallbacks = {
+            ".py": "Python Module", ".js": "JavaScript Module",
+            ".ts": "TypeScript Module", ".java": "Java Class",
+            ".cs": "C# Module", ".go": "Go Module", ".rs": "Rust Module",
+            ".yaml": "YAML Config", ".yml": "YAML Config",
+            ".json": "JSON Config", ".md": "Documentation",
+            ".sql": "SQL", ".sh": "Shell Script",
+            ".html": "HTML Template", ".css": "Stylesheet",
         }
-        pl  = (rec.relative_path + "/" + rec.file_name).lower()
-        cl  = content[:2000].lower()
-        matched = [
-            p for p, ws in kws.items()
-            if any(w in pl or w in cl for w in ws)
-        ]
-        primary = matched[0] if matched else "Utility"
-        parts: list[str] = []
-        if rec.classes:
-            parts.append(f"Classes: {', '.join(rec.classes[:3])}")
-        if rec.functions:
-            parts.append(f"{len(rec.functions)} function(s)")
-        if len(matched) > 1:
-            parts.append(f"Roles: {', '.join(matched[:3])}")
-        return primary, "; ".join(parts) or f"{primary} file"
+        fi["purpose"] = fallbacks.get(fi["extension"], "Unknown")
 
-    # ── AI component detectors ────────────────────────────────
-    def _detect_providers(self, content: str, rel: str) -> None:
-        for name, cfg in AI_PROVIDER_PATTERNS.items():
-            found = (
-                any(re.search(p, content, re.I)
-                    for p in cfg.get("imports", []))
-                or any(re.search(p, content, re.I)
-                       for p in cfg.get("endpoints", []))
-            )
-            evs = [
-                p.rstrip("$")
-                for p in cfg.get("env_vars", [])
-                if re.search(p, content, re.I)
-            ]
-            if found or evs:
-                if name not in self.result.providers:
-                    self.result.providers[name] = asdict(ProviderRecord(
-                        name=name, sdk=cfg.get("sdk", ""),
-                        env_vars=evs, files=[rel],
-                    ))
-                else:
-                    pr = self.result.providers[name]
-                    if rel not in pr["files"]:
-                        pr["files"].append(rel)
-                    for ev in evs:
-                        if ev not in pr["env_vars"]:
-                            pr["env_vars"].append(ev)
+    # ── Imports ───────────────────────────────────────────────
 
-    def _detect_models(self, content: str, rel: str) -> None:
-        for pat in AI_MODEL_PATTERNS:
-            for m in re.finditer(pat, content, re.I):
-                name = m.group(0).lower().strip()
-                if len(name) < 3:
-                    continue
-                if name not in self.result.models:
-                    self.result.models[name] = asdict(ModelRecord(
-                        name=name,
-                        provider=self._infer_provider(name),
-                        files=[rel], reference_count=1,
-                    ))
-                else:
-                    mr = self.result.models[name]
-                    mr["reference_count"] += 1
-                    if rel not in mr["files"]:
-                        mr["files"].append(rel)
+    def _detect_imports(self, fi: Dict) -> None:
+        content = fi["content"] or ""
+        ext     = fi["extension"]
+        imps    = []
+
+        if ext == ".py":
+            for m in re.finditer(r"^\s*(?:import|from)\s+([\w\.]+)", content, re.M):
+                pkg = m.group(1).split(".")[0]
+                if pkg and pkg not in imps:
+                    imps.append(pkg)
+        elif ext in (".js", ".ts", ".jsx", ".tsx"):
+            for m in re.finditer(
+                    r"(?:import\s+.*?from|require\s*\()\s*[\"']([^\"']+)[\"']", content):
+                raw = m.group(1)
+                if not raw.startswith("."):
+                    pkg = raw.split("/")[0].lstrip("@")
+                    if pkg and pkg not in imps:
+                        imps.append(pkg)
+        elif ext == ".java":
+            for m in re.finditer(r"^import\s+([\w\.]+)", content, re.M):
+                pkg = m.group(1).split(".")[0]
+                if pkg and pkg not in imps:
+                    imps.append(pkg)
+
+        fi["imports"] = imps[:60]
+
+    # ── Flask routes & blueprints ─────────────────────────────
+
+    def _detect_routes(self, fi: Dict) -> None:
+        content = fi["content"] or ""
+
+        # Routes
+        for m in FLASK_ROUTE_PATTERN.finditer(content):
+            method = m.group(1).upper()
+            path   = m.group(2)
+            rec = {"method": method, "path": path, "file": fi["rel_path"]}
+            fi["routes"].append(rec)
+            self.routes.append(rec)
+
+        # Blueprints
+        for m in BLUEPRINT_PATTERN.finditer(content):
+            bp = m.group(1)
+            if bp not in fi["blueprints"]:
+                fi["blueprints"].append(bp)
+            if bp not in self.blueprints:
+                self.blueprints.append(bp)
+
+        if fi["routes"]:
+            fi["has_api"] = True
+            self.stats["total_endpoints"] += len(fi["routes"])
+            self.stats["total_apis"]      += 1
+
+    # ── AI components ─────────────────────────────────────────
+
+    def _detect_ai(self, fi: Dict) -> None:
+        content = fi["content"] or ""
+        cl      = content.lower()
+
+        # SDKs
+        for sdk_key, sdk_info in AI_SDKS.items():
+            pat = sdk_key.replace("_", r"[\._]?").replace("-", r"[\-_]?")
+            if re.search(r"\b" + pat + r"\b", cl):
+                name = sdk_info["name"]
+                if name not in fi["sdks_found"]:
+                    fi["sdks_found"].append(name)
+                    fi["is_ai_related"] = True
+                    if name not in self.sdks:
+                        self.sdks[name] = {
+                            "name": name, "provider": sdk_info["provider"],
+                            "files": [], "count": 0,
+                        }
+                    self.sdks[name]["files"].append(fi["rel_path"])
+                    self.sdks[name]["count"] += 1
+
+        # Models
+        for model in AI_MODELS:
+            if re.search(re.escape(model), cl):
+                if model not in fi["models_found"]:
+                    fi["models_found"].append(model)
+                    fi["is_ai_related"] = True
+                    if model not in self.models:
+                        self.models[model] = {
+                            "name": model,
+                            "provider": self._model_provider(model),
+                            "files": [], "count": 0,
+                        }
+                    self.models[model]["files"].append(fi["rel_path"])
+                    self.models[model]["count"] += 1
+
+        # Providers
+        for key, pname in AI_PROVIDERS.items():
+            if re.search(r"\b" + re.escape(key) + r"\b", cl):
+                if pname not in fi["providers_found"]:
+                    fi["providers_found"].append(pname)
+                    fi["is_ai_related"] = True
+                    if pname not in self.providers:
+                        self.providers[pname] = {
+                            "name": pname, "files": [],
+                            "count": 0, "env_vars": [],
+                        }
+                    self.providers[pname]["files"].append(fi["rel_path"])
+                    self.providers[pname]["count"] += 1
+
+        # Agents
+        for pat in AGENT_PATTERNS:
+            for m in re.finditer(pat, content):
+                raw    = m.group(0)
+                cmatch = re.search(r"class\s+(\w+)", raw)
+                aname  = cmatch.group(1) if cmatch else raw.strip()[:40]
+                if aname and not any(
+                        a["name"] == aname and a["file"] == fi["rel_path"]
+                        for a in fi["agents_found"]):
+                    rec = {
+                        "name":      aname,
+                        "file":      fi["rel_path"],
+                        "type":      self._agent_type(aname, content),
+                        "purpose":   self._agent_purpose(aname, content),
+                        "providers": list(fi["providers_found"]),
+                        "models":    list(fi["models_found"]),
+                        "sdks":      list(fi["sdks_found"]),
+                    }
+                    fi["agents_found"].append(rec)
+                    fi["is_ai_related"] = True
+                    self.agents.append(rec)
 
     @staticmethod
-    def _infer_provider(mn: str) -> str:
-        if any(x in mn for x in ["gpt", "o1", "o2", "o3", "o4",
-                                   "dall-e", "whisper"]):
+    def _model_provider(m: str) -> str:
+        m = m.lower()
+        if any(x in m for x in ("gpt","o1","o3","o4","dall-e","whisper","text-embedding")):
             return "OpenAI"
-        if "claude"  in mn:  return "Anthropic"
-        if any(x in mn for x in ["gemini", "palm", "bard"]): return "Google"
-        if "llama"   in mn:  return "Meta"
-        if any(x in mn for x in ["mistral", "mixtral", "codestral"]):
-            return "Mistral"
-        if "deepseek" in mn: return "DeepSeek"
-        if any(x in mn for x in ["command", "aya"]): return "Cohere"
-        if "phi"     in mn:  return "Microsoft"
-        if "qwen"    in mn:  return "Alibaba"
+        if "claude"   in m: return "Anthropic"
+        if any(x in m for x in ("gemini","palm")): return "Google"
+        if "llama"    in m: return "Meta"
+        if any(x in m for x in ("mistral","mixtral","codestral")): return "Mistral"
+        if "deepseek" in m: return "DeepSeek"
+        if "command"  in m: return "Cohere"
+        if "phi"      in m: return "Microsoft"
+        if any(x in m for x in ("qwen","qwq")): return "Alibaba"
+        if any(x in m for x in ("titan","nova")): return "AWS"
+        if "grok"     in m: return "xAI"
         return "Unknown"
 
-    def _detect_prompts(self, content: str, rel: str) -> None:
-        for pat in PROMPT_PATTERNS:
-            for m in re.finditer(pat, content, re.I | re.M):
-                ln      = content[:m.start()].count("\n") + 1
-                snippet = content[m.end():m.end() + 120].strip()[:80]
-                ptype   = (
-                    "System Prompt" if "system"   in pat.lower() else
-                    "User Prompt"   if "user"     in pat.lower() else
-                    "Template"      if "template" in pat.lower() else
-                    "Prompt"
-                )
-                self.result.prompts.append(asdict(PromptRecord(
-                    name=            f"Prompt @ line {ln}",
-                    location=        rel,
-                    line_number=     ln,
-                    prompt_type=     ptype,
-                    content_preview= snippet.replace("\n", " "),
-                )))
-                break
+    @staticmethod
+    def _agent_type(name: str, content: str) -> str:
+        n = name.lower();  c = content.lower()
+        if any(x in n for x in ("supervisor","orchestrat","coordinator")):
+            return "Supervisor / Orchestrator"
+        if "monitor"  in n: return "Monitoring Agent"
+        if "scanner"  in n: return "Scanner Agent"
+        if "sentinel" in n: return "Sentinel / Ops Agent"
+        if "plan"     in n: return "Planning Agent"
+        if "execut"   in n: return "Execution Agent"
+        if any(x in n for x in ("react","reason")): return "ReAct Agent"
+        if any(x in n for x in ("rag","retriev")):   return "RAG Agent"
+        if "tool"     in n: return "Tool-using Agent"
+        if any(x in n for x in ("chat","convers")):  return "Conversational Agent"
+        if any(x in n for x in ("code","coder")):    return "Code Agent"
+        if "crewai"   in c: return "CrewAI Agent"
+        if "autogen"  in c: return "AutoGen Agent"
+        if "langgraph" in c: return "LangGraph Agent"
+        return "General AI Agent"
 
-        if any(rel.endswith(e)
-               for e in [".prompt", ".j2", ".jinja", ".jinja2"]):
-            self.result.prompts.append(asdict(PromptRecord(
-                name=        Path(rel).name,
-                location=    rel,
-                line_number= 1,
-                prompt_type= "Template File",
-                content_preview= content[:80].replace("\n", " "),
-            )))
+    @staticmethod
+    def _agent_purpose(name: str, content: str) -> str:
+        n = name.lower();  c = content[:800].lower()
+        if "monitor"  in n or "monitor"   in c: return "System / agent monitoring"
+        if "scanner"  in n or "scan"      in c: return "Repository / code scanning"
+        if "sentinel" in n or "sentinel"  in c: return "Operational intelligence"
+        if "search"   in n or "search"    in c: return "Search and retrieval"
+        if "code"     in n:                     return "Code generation / analysis"
+        if any(x in n for x in ("data","analys")): return "Data analysis"
+        if any(x in n for x in ("write","content")): return "Content generation"
+        if "plan"     in n:                     return "Task planning"
+        if any(x in n for x in ("customer","support")): return "Customer support"
+        return "General AI assistance"
 
-    def _detect_api_keys(self, content: str, rel: str) -> None:
-        for var, provider in API_KEY_MAP.items():
-            if not re.search(r'\b' + re.escape(var) + r'\b', content):
-                continue
-            loaded = (
-                "os.environ"  if "os.environ"  in content else
-                "os.getenv"   if "os.getenv"   in content else
-                ".env file"   if ("load_dotenv" in content
-                                   or "dotenv" in content) else
-                f"Config ({rel})" if rel.endswith(
-                    (".yaml", ".yml", ".json")
-                ) else "Unknown"
-            )
-            if var not in self.result.api_keys:
-                self.result.api_keys[var] = asdict(APIKeyRecord(
-                    variable_name=var, provider=provider,
-                    used_in=[rel], loaded_from=loaded,
-                ))
-            elif rel not in self.result.api_keys[var]["used_in"]:
-                self.result.api_keys[var]["used_in"].append(rel)
+    # ── Prompts ───────────────────────────────────────────────
 
-    def _detect_sdks(self, content: str, rel: str) -> None:
-        for sdk, pats in AI_SDK_PATTERNS.items():
-            if any(re.search(p, content, re.I) for p in pats):
-                if sdk not in self.result.sdks:
-                    self.result.sdks[sdk] = asdict(SDKRecord(
-                        name=sdk, files=[rel], import_count=1,
-                    ))
-                else:
-                    sr = self.result.sdks[sdk]
-                    sr["import_count"] += 1
-                    if rel not in sr["files"]:
-                        sr["files"].append(rel)
+    def _detect_prompts(self, fi: Dict) -> None:
+        content = fi["content"] or ""
 
-    def _detect_tools(self, content: str, rel: str) -> None:
-        for tool, pats in TOOL_PATTERNS.items():
-            if any(re.search(p, content, re.I) for p in pats):
-                if tool not in self.result.tools:
-                    self.result.tools[tool] = asdict(ToolRecord(
-                        name=tool, files=[rel],
-                    ))
-                elif rel not in self.result.tools[tool]["files"]:
-                    self.result.tools[tool]["files"].append(rel)
-
-    def _detect_workflows(self, content: str, rel: str) -> None:
-        for wf, pats in WORKFLOW_PATTERNS.items():
-            if any(re.search(p, content, re.I) for p in pats):
-                if wf not in self.result.workflows:
-                    self.result.workflows[wf] = asdict(WorkflowRecord(
-                        name=wf, files=[rel],
-                    ))
-                elif rel not in self.result.workflows[wf]["files"]:
-                    self.result.workflows[wf]["files"].append(rel)
-
-    def _detect_agents(self, content: str, rec: FileRecord) -> None:
-        existing = sum(
-            1 for a in self.result.agents
-            if a["file"] == rec.relative_path
-        )
-        if existing >= 8:
+        if fi["extension"] == ".prompt":
+            p = {"name": fi["filename"], "file": fi["rel_path"],
+                 "type": "Prompt File", "purpose": "Dedicated prompt", "agent": "Unknown"}
+            fi["prompts_found"].append(p)
+            self.prompts.append(p)
+            fi["is_ai_related"] = True
             return
-        for pat in AGENT_DETECTION_PATTERNS:
-            for m in re.finditer(pat, content, re.I):
-                ln   = content[:m.start()].count("\n") + 1
-                text = m.group(0)
-                cm   = re.match(r'class\s+(\w+)', text)
-                name = (
-                    cm.group(1)      if cm                       else
-                    "AgentExecutor"  if "AgentExecutor"  in text else
-                    "AssistantAgent" if "AssistantAgent"  in text else
-                    "UserProxyAgent" if "UserProxyAgent"  in text else
-                    "CrewAI Agent"   if "Crew"            in text else
-                    "LangGraph Agent"if "StateGraph"      in text else
-                    "AI Agent"
-                )
-                cs  = max(0, m.start() - 400)
-                ce  = min(len(content), m.end() + 400)
-                ctx = content[cs:ce]
-                tc: dict[str, str] = {
-                    k: mm.group(1)
-                    for k, p in TOKEN_CONFIG_PATTERNS.items()
-                    if (mm := re.search(p, ctx, re.I))
-                }
-                agent_type = (
-                    "Class-based Agent" if "class"        in text.lower() else
-                    "LangChain Agent"   if "AgentExecutor"in text         else
-                    "CrewAI Agent"      if "Crew"         in text         else
-                    "LangGraph Agent"   if "StateGraph"   in text
-                                          or "MessageGraph" in text        else
-                    "AutoGen Agent"     if "AssistantAgent" in text
-                                          or "UserProxyAgent" in text      else
-                    "API-based Agent"
-                )
-                self.result.agents.append(asdict(AgentRecord(
-                    name=         name,
-                    file=         rec.relative_path,
-                    agent_type=   agent_type,
-                    purpose=      rec.purpose,
-                    provider=     self._ctx_provider(ctx),
-                    sdk=          self._ctx_sdk(ctx),
-                    model=        self._ctx_model(ctx),
-                    tools=        self._ctx_tools(ctx),
-                    workflows=    self._ctx_workflows(ctx),
-                    token_config= tc,
-                    line_number=  ln,
-                )))
-                existing += 1
-                if existing >= 8:
-                    return
 
-    @staticmethod
-    def _ctx_provider(ctx: str) -> str:
-        for name, cfg in AI_PROVIDER_PATTERNS.items():
-            if any(re.search(p, ctx, re.I) for p in cfg.get("imports", [])):
-                return name
-        return "Unknown"
+        for pat in PROMPT_PATTERNS:
+            if re.search(pat, content, re.IGNORECASE):
+                ptype = ("System Prompt"    if "system"   in pat.lower() else
+                         "User Prompt"      if "user"     in pat.lower() else
+                         "Prompt Template"  if "template" in pat.lower() else
+                         "Inline Prompt")
+                key = (fi["rel_path"], ptype)
+                if not any((p["file"], p["type"]) == key for p in fi["prompts_found"]):
+                    p = {"name": f"{ptype} in {fi['filename']}", "file": fi["rel_path"],
+                         "type": ptype, "purpose": "AI instruction", "agent": "Unknown"}
+                    fi["prompts_found"].append(p)
+                    if not any((p2["file"], p2["type"]) == key for p2 in self.prompts):
+                        self.prompts.append(p)
+                    fi["is_ai_related"] = True
 
-    @staticmethod
-    def _ctx_model(ctx: str) -> str:
-        for pat in AI_MODEL_PATTERNS:
-            m = re.search(pat, ctx, re.I)
-            if m:
-                return m.group(0)
-        return "Not Specified"
+        if fi["extension"] == ".md" and re.search(
+                r"(system|user|assistant)\s*(prompt|message|instruction)",
+                content, re.IGNORECASE):
+            p = {"name": f"Markdown Prompt: {fi['filename']}", "file": fi["rel_path"],
+                 "type": "Markdown Prompt", "purpose": "Documentation / template",
+                 "agent": "Unknown"}
+            fi["prompts_found"].append(p)
+            self.prompts.append(p)
+            fi["is_ai_related"] = True
 
-    @staticmethod
-    def _ctx_sdk(ctx: str) -> str:
-        for sdk, pats in AI_SDK_PATTERNS.items():
-            if any(re.search(p, ctx, re.I) for p in pats):
-                return sdk
-        return "Unknown"
+    # ── API keys ──────────────────────────────────────────────
 
-    @staticmethod
-    def _ctx_tools(ctx: str) -> list[str]:
-        return [
-            t for t, pats in TOOL_PATTERNS.items()
-            if any(re.search(p, ctx, re.I) for p in pats)
+    def _detect_keys(self, fi: Dict) -> None:
+        content = fi["content"] or ""
+        for var, provider in API_KEY_ENV_VARS.items():
+            if var in content:
+                src = ("os.environ / os.getenv" if re.search(r"os\.getenv|os\.environ\.get", content)
+                       else ".env file (dotenv)" if re.search(r"dotenv|load_dotenv", content, re.I)
+                       else "process.env"        if "process.env" in content
+                       else "Settings module"    if "settings."   in content.lower()
+                       else "Environment Variable")
+                rec = {"variable": var, "provider": provider,
+                       "file": fi["rel_path"], "loaded_from": src}
+                fi["keys_found"].append(rec)
+                if not any(k["variable"] == var and k["file"] == fi["rel_path"]
+                           for k in self.api_keys):
+                    self.api_keys.append(rec)
+                fi["is_ai_related"] = True
+                if provider in self.providers and var not in self.providers[provider]["env_vars"]:
+                    self.providers[provider]["env_vars"].append(var)
+
+    # ── Tools ─────────────────────────────────────────────────
+
+    def _detect_tools(self, fi: Dict) -> None:
+        cl = (fi["content"] or "").lower()
+        for tname, pats in TOOL_PATTERNS.items():
+            if any(re.search(p, cl) for p in pats):
+                if tname not in fi["tools_found"]:
+                    fi["tools_found"].append(tname)
+                    self.tools[tname].append(fi["rel_path"])
+
+    # ── Workflows ─────────────────────────────────────────────
+
+    def _detect_workflows(self, fi: Dict) -> None:
+        cl = (fi["content"] or "").lower()
+        for wname, pats in WORKFLOW_PATTERNS.items():
+            if any(re.search(p, cl) for p in pats):
+                if wname not in fi["workflows_found"]:
+                    fi["workflows_found"].append(wname)
+                    self.workflows[wname].append(fi["rel_path"])
+
+    # ── Token configuration ───────────────────────────────────
+
+    def _detect_token_cfg(self, fi: Dict) -> None:
+        content = fi["content"] or ""
+        cfg = {}
+        checks = [
+            (r"max_tokens\s*[=:]\s*(\d+)",              "max_tokens",     int),
+            (r"max_completion_tokens\s*[=:]\s*(\d+)",   "max_tokens",     int),
+            (r"MAX_TOKENS\s*=\s*(\d+)",                  "max_tokens",     int),
+            (r"temperature\s*[=:]\s*([0-9.]+)",          "temperature",    float),
+            (r"top_p\s*[=:]\s*([0-9.]+)",                "top_p",          float),
+            (r"context_window\s*[=:]\s*(\d+)",           "context_window", int),
+            (r"context_length\s*[=:]\s*(\d+)",           "context_window", int),
+            (r"timeout\s*[=:]\s*(\d+)",                  "timeout",        int),
+            (r"max_retries\s*[=:]\s*(\d+)",              "max_retries",    int),
         ]
+        for pat, key, cast in checks:
+            m = re.search(pat, content, re.IGNORECASE)
+            if m and key not in cfg:
+                try:
+                    cfg[key] = cast(m.group(1))
+                except Exception:
+                    pass
+        if cfg:
+            fi["token_config"]  = cfg
+            fi["is_ai_related"] = True
 
-    @staticmethod
-    def _ctx_workflows(ctx: str) -> list[str]:
-        return [
-            w for w, pats in WORKFLOW_PATTERNS.items()
-            if any(re.search(p, ctx, re.I) for p in pats)
-        ]
+    # ── Classes & functions ───────────────────────────────────
+
+    def _detect_cls_fn(self, fi: Dict) -> None:
+        content = fi["content"] or ""
+        ext     = fi["extension"]
+        classes: List[str] = []
+        funcs:   List[str] = []
+
+        if ext == ".py":
+            classes = re.findall(r"^\s*class\s+(\w+)", content, re.M)
+            funcs   = re.findall(r"^\s*(?:async\s+)?def\s+(\w+)", content, re.M)
+        elif ext in (".js", ".ts", ".jsx", ".tsx"):
+            classes = re.findall(r"\bclass\s+(\w+)", content)
+            raw_fn  = re.findall(
+                r"(?:function\s+(\w+)|const\s+(\w+)\s*=\s*(?:async\s+)?\()", content)
+            funcs   = [f[0] or f[1] for f in raw_fn if f[0] or f[1]]
+        elif ext == ".java":
+            classes = re.findall(r"\bclass\s+(\w+)", content)
+            funcs   = re.findall(r"\b(?:public|private|protected)\b[^(]+\b(\w+)\s*\(", content)
+
+        fi["classes"]   = classes[:25]
+        fi["functions"] = funcs[:35]
+        self.stats["total_classes"]   += len(classes)
+        self.stats["total_functions"] += len(funcs)
+
+    # ── Tests ─────────────────────────────────────────────────
+
+    def _detect_tests(self, fi: Dict) -> None:
+        fn = fi["filename"].lower()
+        c  = fi["content"] or ""
+        fi["has_tests"] = bool(
+            fn.startswith("test_") or
+            fn.endswith(("_test.py", ".test.js", ".test.ts", ".spec.js", ".spec.ts")) or
+            re.search(r"def test_\w+|@pytest\.mark|unittest\.TestCase|"
+                      r"describe\s*\(|it\s*\(|beforeEach\s*\(", c)
+        )
+        if fi["has_tests"]:
+            fi["category"] = "test"
+
+    # ── Category refinement ───────────────────────────────────
+
+    def _refine_category(self, fi: Dict) -> None:
+        if fi["is_ai_related"]:
+            fi["category"] = "ai"
+        elif fi["has_tests"]:
+            fi["category"] = "test"
+        elif fi["purpose"] in ("Docker", "Terraform", "Kubernetes", "CI/CD / Deployment"):
+            fi["category"] = "infrastructure"
+        elif fi["purpose"] == "Documentation":
+            fi["category"] = "documentation"
+
+    # ── Reference graph ───────────────────────────────────────
+
+    def _build_ref_graph(self) -> None:
+        for fi in self.files:
+            content = fi["content"] or ""
+            for other in self.files:
+                if other["rel_path"] == fi["rel_path"]:
+                    continue
+                stem = Path(other["filename"]).stem
+                if stem and len(stem) > 2 and stem in content:
+                    other["is_referenced"] = True
+                    other["is_used"]       = True
+
+    # ── Aggregate statistics ──────────────────────────────────
+
+    def _compute_stats(self) -> None:
+        cats = Counter(f["category"] for f in self.files)
+        agents_dedup = len(set(
+            (a["name"], a["file"]) for a in self.agents
+        ))
+        self.stats.update({
+            "total_files":           len(self.files),
+            "total_dirs":            len(self.dirs),
+            "total_source_files":    cats.get("source", 0),
+            "total_config_files":    cats.get("config", 0),
+            "total_doc_files":       cats.get("documentation", 0),
+            "total_test_files":      sum(1 for f in self.files if f["has_tests"]),
+            "total_infra_files":     cats.get("infrastructure", 0),
+            "total_ai_files":        sum(1 for f in self.files if f["is_ai_related"]),
+            "total_agents":          agents_dedup,
+            "total_models":          len(self.models),
+            "total_providers":       len(self.providers),
+            "total_prompts":         len(self.prompts),
+            "total_sdks":            len(self.sdks),
+            "total_routes":          len(self.routes),
+            "total_blueprints":      len(self.blueprints),
+            "total_lines":           sum(f["lines"] for f in self.files),
+            "total_size":            sum(f["size"]  for f in self.files),
+            "total_docker_files":    sum(1 for f in self.files if f["extension"] == ".dockerfile"),
+            "total_yaml_files":      sum(1 for f in self.files if f["extension"] in (".yaml",".yml")),
+            "total_terraform_files": sum(1 for f in self.files if f["extension"] in (".tf",".tfvars",".hcl")),
+            "total_k8s_files":       sum(1 for f in self.files
+                                         if f["extension"] in (".yaml",".yml")
+                                         and any(k in f["rel_path"].lower()
+                                                 for k in ("k8s","kubernetes","helm","kube"))),
+            "languages": dict(Counter(f["language"] for f in self.files).most_common(15)),
+        })
 
 
-# ══════════════════════════════════════════════════════════════
-# SCAN STATE  —  thread-safe module-level singleton
-# ══════════════════════════════════════════════════════════════
+# ──────────────────────────────────────────────────────────────
+# HTML REPORT
+# ──────────────────────────────────────────────────────────────
 
-_scan_lock:    Lock              = Lock()
-_last_result:  ScanResult | None = None
-_scan_running: bool              = False
-_scan_start:   float             = 0.0
-
-
-def _run_scan_background(path: str) -> None:
-    global _last_result, _scan_running, _scan_start
-    _scan_start   = time.time()
-    _scan_running = True
-    try:
-        _last_result = RepoScanner(path).scan()
-    except Exception as exc:
-        if _last_result is None:
-            _last_result = ScanResult(errors=[str(exc)])
-        else:
-            _last_result.errors.append(str(exc))
-    finally:
-        _scan_running = False
-
-
-# ══════════════════════════════════════════════════════════════
-# HTML DASHBOARD
-# ══════════════════════════════════════════════════════════════
-
-_DASHBOARD_HTML = r"""
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>SentinelOps · AI Scanner</title>
-<style>
-*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+# ── CSS (complete, self-contained) ───────────────────────────
+_CSS = r"""
 :root{
-  --bg:#0d1117;--surface:#161b22;--border:#30363d;
-  --text:#e6edf3;--muted:#8b949e;--blue:#58a6ff;
-  --green:#3fb950;--red:#f85149;--orange:#d29922;
-  --purple:#bc8cff;--teal:#39d353;
-  --shadow:0 4px 24px rgba(0,0,0,.4);--r:10px;
-  --font:'Segoe UI',-apple-system,sans-serif;
-  --mono:'Cascadia Code','Fira Code',monospace;
+  --bg:#f0f4f8;--card:#fff;--text:#1a202c;--muted:#718096;
+  --border:#e2e8f0;--primary:#4f46e5;--primary-d:#3730a3;
+  --success:#10b981;--warn:#f59e0b;--danger:#ef4444;--info:#3b82f6;
+  --purple:#8b5cf6;--teal:#14b8a6;--orange:#f97316;--gray:#6b7280;
+  --nav:#1e1b4b;--nav-t:#e0e7ff;
+  --hero:linear-gradient(135deg,#1e1b4b 0%,#312e81 50%,#4338ca 100%);
+  --th:#f7fafc;--stripe:#f9fafb;--hover:#eef2ff;
+  --sh:0 4px 6px -1px rgba(0,0,0,.1);
+  --sh-lg:0 10px 25px -5px rgba(0,0,0,.15);
+  --r:12px;--r-sm:8px;
+  --font:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+  --mono:'SFMono-Regular',Consolas,'Liberation Mono',monospace;
 }
-body{font-family:var(--font);background:var(--bg);color:var(--text);
-     display:flex;min-height:100vh}
-/* sidebar */
-.sb{width:230px;min-height:100vh;background:#0d1117;
-    border-right:1px solid var(--border);position:fixed;
-    left:0;top:0;bottom:0;display:flex;flex-direction:column;
-    z-index:50;overflow-y:auto}
-.sb-logo{padding:18px 14px 10px;border-bottom:1px solid var(--border)}
-.sb-logo h2{color:var(--blue);font-size:14px;font-weight:700}
-.sb-logo p{color:var(--muted);font-size:10px;margin-top:2px}
-.sb-nav{flex:1;padding:6px 0}
-.nav-a{display:flex;align-items:center;gap:7px;padding:8px 14px;
-       color:var(--muted);text-decoration:none;font-size:12px;
-       border-left:3px solid transparent;transition:all .15s}
-.nav-a:hover,.nav-a.active{color:var(--text);
-  border-left-color:var(--blue);background:rgba(88,166,255,.07)}
-.sb-foot{padding:10px 14px;border-top:1px solid var(--border)}
-.dk-btn{width:100%;padding:7px;background:rgba(255,255,255,.06);
-        color:var(--muted);border:1px solid var(--border);
-        border-radius:6px;cursor:pointer;font-size:11px}
-/* main */
-.main{margin-left:230px;flex:1;padding:20px;
-      max-width:calc(100vw - 230px)}
-.topbar{display:flex;justify-content:space-between;
-        align-items:center;margin-bottom:16px}
-.topbar h1{font-size:18px;color:var(--blue)}
-.topbar-r{display:flex;gap:7px;align-items:center}
-/* buttons */
-.btn{padding:6px 13px;border:none;border-radius:6px;cursor:pointer;
-     font-size:12px;font-weight:600;transition:all .15s;
-     display:inline-flex;align-items:center;gap:5px}
-.btn-g{background:#238636;color:#fff}
-.btn-b{background:#1f6feb;color:#fff}
-.btn-gr{background:rgba(255,255,255,.08);color:var(--text);
-        border:1px solid var(--border)}
-.btn:hover{opacity:.85;transform:translateY(-1px)}
-/* search bar */
-.sb-bar{display:flex;gap:9px;flex-wrap:wrap;margin-bottom:16px;
-        background:var(--surface);padding:12px;
-        border-radius:var(--r);border:1px solid var(--border)}
-.sb-bar input,.sb-bar select{
-  padding:6px 10px;background:var(--bg);color:var(--text);
-  border:1px solid var(--border);border-radius:6px;font-size:12px}
-.sb-bar input{flex:1;min-width:180px}
-/* stats */
-.sg{display:grid;grid-template-columns:repeat(auto-fill,minmax(130px,1fr));
-    gap:10px;margin-bottom:16px}
-.sc{background:var(--surface);border:1px solid var(--border);
-    border-radius:var(--r);padding:14px;text-align:center;border-top:3px solid;
-    transition:transform .15s}
-.sc:hover{transform:translateY(-2px)}
-.si{font-size:22px;margin-bottom:5px}
-.sv{font-size:22px;font-weight:800;margin-bottom:2px}
-.sl{font-size:9px;color:var(--muted);text-transform:uppercase;
-    letter-spacing:.5px}
-.cb{border-color:var(--blue)}.cb .sv{color:var(--blue)}
-.cg{border-color:var(--green)}.cg .sv{color:var(--green)}
-.cr{border-color:var(--red)}.cr .sv{color:var(--red)}
-.co{border-color:var(--orange)}.co .sv{color:var(--orange)}
-.cp{border-color:var(--purple)}.cp .sv{color:var(--purple)}
-.ct{border-color:var(--teal)}.ct .sv{color:var(--teal)}
-/* section */
-section{margin-bottom:32px;scroll-margin-top:14px}
-.st{font-size:15px;font-weight:700;margin-bottom:12px;
-    padding-bottom:7px;border-bottom:1px solid var(--border);
-    display:flex;align-items:center;gap:8px}
-.bdg{display:inline-flex;align-items:center;padding:2px 7px;
-     border-radius:10px;font-size:10px;font-weight:600}
-.bdg-b{background:rgba(88,166,255,.15);color:var(--blue)}
-.bdg-r{background:rgba(248,81,73,.15);color:var(--red)}
-.bdg-g{background:rgba(63,185,80,.15);color:var(--green)}
-.bdg-o{background:rgba(210,153,34,.15);color:var(--orange)}
-.bdg-p{background:rgba(188,140,255,.15);color:var(--purple)}
-/* tables */
-.tw{overflow-x:auto;border-radius:var(--r);border:1px solid var(--border)}
-table{width:100%;border-collapse:collapse;font-size:11px;
-      background:var(--surface)}
-thead{position:sticky;top:0;z-index:5}
-th{background:#161b22;color:var(--muted);padding:9px 11px;
-   text-align:left;font-size:9px;text-transform:uppercase;
-   letter-spacing:.5px;border-bottom:1px solid var(--border);
-   cursor:pointer;white-space:nowrap;user-select:none}
-th:hover{color:var(--text)}
-td{padding:7px 11px;border-bottom:1px solid var(--border);
-   vertical-align:middle}
-tbody tr:last-child td{border-bottom:none}
-tbody tr:hover{background:rgba(88,166,255,.04)}
-tbody tr.air{background:rgba(248,81,73,.03)}
-tbody tr.hid{display:none}
-.mono{font-family:var(--mono);font-size:10px}
-.pth{font-family:var(--mono);font-size:9px;color:var(--muted);
-     max-width:200px;overflow:hidden;text-overflow:ellipsis;
-     white-space:nowrap;display:block}
-.pill{display:inline-block;padding:1px 6px;border-radius:8px;
-      font-size:9px;font-weight:600;white-space:nowrap}
-.pai{background:rgba(248,81,73,.15);color:var(--red)}
-.pbl{background:rgba(88,166,255,.12);color:var(--blue)}
-.pgr{background:rgba(63,185,80,.12);color:var(--green)}
-.por{background:rgba(210,153,34,.12);color:var(--orange)}
-.ppu{background:rgba(188,140,255,.12);color:var(--purple)}
-.pgy{background:rgba(255,255,255,.08);color:var(--muted)}
-/* tree */
-.tree{background:#0d1117;border:1px solid var(--border);
-      border-radius:var(--r);padding:16px;
-      font-family:var(--mono);font-size:11px;line-height:1.8;
-      color:#a8b2d8;overflow-x:auto;max-height:400px;overflow-y:auto}
-/* info boxes */
-.ib{padding:10px 14px;border-radius:7px;font-size:12px;
-    margin-bottom:12px;border-left:3px solid}
-.iw{background:rgba(210,153,34,.1);border-color:var(--orange);
-    color:var(--orange)}
-.ii{background:rgba(88,166,255,.08);border-color:var(--blue);
-    color:var(--blue)}
-/* cards */
-.cg2{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));
-     gap:12px}
-.pc{background:var(--surface);border:1px solid var(--border);
-    border-radius:var(--r);padding:14px;border-left:4px solid var(--blue)}
-.pn{font-size:14px;font-weight:700;color:var(--blue);margin-bottom:7px}
-.pr{display:flex;justify-content:space-between;font-size:10px;
-    padding:2px 0;color:var(--muted)}
-.pr span:last-child{color:var(--text)}
-.evl{margin-top:7px;display:flex;flex-wrap:wrap;gap:3px}
-.evt{background:rgba(210,153,34,.1);color:var(--orange);
-     padding:1px 5px;border-radius:3px;font-size:9px;
-     font-family:var(--mono)}
-/* chips */
-.chg{display:flex;flex-wrap:wrap;gap:7px}
-.ch{background:var(--surface);border:1px solid var(--border);
-    border-radius:7px;padding:9px 12px;font-size:11px;font-weight:600;
-    display:flex;flex-direction:column;gap:2px}
-.ch small{color:var(--muted);font-size:9px;font-weight:400}
-/* spinner */
-.sp{display:none;align-items:center;gap:7px;color:var(--blue);font-size:12px}
-.spin{width:14px;height:14px;border:2px solid var(--border);
-      border-top-color:var(--blue);border-radius:50%;
-      animation:spin .7s linear infinite}
-@keyframes spin{to{transform:rotate(360deg)}}
-.empty{padding:32px;text-align:center;color:var(--muted);font-size:12px;
-       background:var(--surface);border-radius:var(--r);
-       border:1px solid var(--border)}
+[data-theme=dark]{
+  --bg:#0f172a;--card:#1e293b;--text:#f1f5f9;--muted:#94a3b8;
+  --border:#334155;--nav:#020617;--th:#1e293b;--stripe:#162032;
+  --hover:#1e3a5f;--sh:0 4px 6px -1px rgba(0,0,0,.4);
+}
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:var(--font);background:var(--bg);color:var(--text);line-height:1.6;transition:background .3s,color .3s}
+/* ─ NAV ─ */
+.nav{position:sticky;top:0;z-index:1000;background:var(--nav);color:var(--nav-t);
+     display:flex;align-items:center;padding:0 20px;height:52px;gap:16px;
+     box-shadow:var(--sh-lg);overflow:hidden}
+.nav-brand{font-weight:800;font-size:1rem;white-space:nowrap;flex-shrink:0}
+.nav-links{display:flex;gap:2px;flex:1;overflow-x:auto;scrollbar-width:none}
+.nav-links::-webkit-scrollbar{display:none}
+.nav-links a{color:#c7d2fe;text-decoration:none;padding:5px 9px;border-radius:6px;
+             font-size:.78rem;white-space:nowrap;transition:background .2s,color .2s}
+.nav-links a:hover{background:rgba(255,255,255,.1);color:#fff}
+.nav-right{display:flex;gap:8px;flex-shrink:0}
+/* ─ BUTTONS ─ */
+.btn{padding:7px 14px;border:none;border-radius:var(--r-sm);cursor:pointer;
+     font-size:.82rem;font-weight:600;transition:all .2s;display:inline-flex;align-items:center;gap:5px}
+.btn-export{background:#10b981;color:#fff}.btn-export:hover{background:#059669}
+.btn-theme{background:rgba(255,255,255,.1);color:var(--nav-t);border:1px solid rgba(255,255,255,.2)}
+.btn-theme:hover{background:rgba(255,255,255,.2)}
+.btn-sm{padding:6px 12px;font-size:.78rem;background:var(--primary);color:#fff}
+.btn-sm:hover{background:var(--primary-d)}
+/* ─ HERO ─ */
+.hero{background:var(--hero);color:#fff;padding:44px 24px;text-align:center}
+.hero h1{font-size:1.9rem;font-weight:800;margin-bottom:14px;text-shadow:0 2px 4px rgba(0,0,0,.3)}
+.hero-chips{display:flex;justify-content:center;flex-wrap:wrap;gap:12px}
+.chip{background:rgba(255,255,255,.12);padding:6px 14px;border-radius:20px;
+      font-size:.85rem;border:1px solid rgba(255,255,255,.2)}
+/* ─ LAYOUT ─ */
+.wrap{max-width:1600px;margin:0 auto;padding:24px 20px}
+.sec{background:var(--card);border-radius:var(--r);padding:26px;margin-bottom:26px;
+     box-shadow:var(--sh);border:1px solid var(--border)}
+.sec-title{font-size:1.3rem;font-weight:700;margin-bottom:20px;
+           border-bottom:3px solid var(--primary);padding-bottom:10px}
+.sub-title{font-size:.95rem;font-weight:600;margin:20px 0 12px;color:var(--muted)}
+/* ─ STAT CARDS ─ */
+.card-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(145px,1fr));gap:12px;margin-bottom:12px}
+.sc{background:var(--card);border-radius:var(--r-sm);padding:16px 12px;text-align:center;
+    border:1px solid var(--border);transition:transform .2s,box-shadow .2s;position:relative;overflow:hidden}
+.sc:hover{transform:translateY(-2px);box-shadow:var(--sh-lg)}
+.sc::before{content:'';position:absolute;top:0;left:0;right:0;height:3px}
+.sc.blue::before{background:var(--info)}.sc.green::before{background:var(--success)}
+.sc.orange::before{background:var(--orange)}.sc.purple::before{background:var(--purple)}
+.sc.teal::before{background:var(--teal)}.sc.gray::before{background:var(--gray)}
+.sc.red::before{background:var(--danger)}
+.sc-icon{font-size:1.6rem;display:block;margin-bottom:5px}
+.sc-val{font-size:1.4rem;font-weight:800;display:block}
+.sc-lbl{font-size:.68rem;color:var(--muted);font-weight:600;text-transform:uppercase;
+        letter-spacing:.05em;display:block;margin-top:3px}
+/* ─ CHARTS ─ */
+.chart-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:16px}
+.chart-box{background:var(--card);border-radius:var(--r-sm);padding:16px;border:1px solid var(--border)}
+.chart-box h3{font-size:.9rem;font-weight:600;margin-bottom:10px;text-align:center}
+canvas{max-width:100%;height:260px!important}
+/* ─ TABLE CONTROLS ─ */
+.tbl-ctrls{display:flex;align-items:center;gap:10px;margin-bottom:12px;flex-wrap:wrap}
+.search-box{flex:1;min-width:200px;padding:8px 12px;border:2px solid var(--border);
+            border-radius:var(--r-sm);background:var(--bg);color:var(--text);
+            font-size:.86rem;transition:border-color .2s}
+.search-box:focus{outline:none;border-color:var(--primary)}
+.sel{padding:8px 11px;border:2px solid var(--border);border-radius:var(--r-sm);
+     background:var(--bg);color:var(--text);font-size:.82rem;cursor:pointer}
+.sel:focus{outline:none;border-color:var(--primary)}
+.tbl-info{font-size:.8rem;color:var(--muted);margin-left:auto}
+/* ─ TABLES ─ */
+.tbl-wrap{overflow-x:auto;border-radius:var(--r-sm);border:1px solid var(--border)}
+.tbl{width:100%;border-collapse:collapse;font-size:.8rem}
+.tbl thead th{background:var(--th);padding:10px 12px;text-align:left;font-weight:700;
+              border-bottom:2px solid var(--border);white-space:nowrap;position:sticky;top:0}
+.tbl thead th.sort{cursor:pointer;user-select:none}
+.tbl thead th.sort:hover{background:var(--hover);color:var(--primary)}
+.tbl thead th.sort::after{content:' ⇅';opacity:.3;font-size:.7em}
+.tbl tbody tr{border-bottom:1px solid var(--border);transition:background .15s}
+.tbl tbody tr:nth-child(even){background:var(--stripe)}
+.tbl tbody tr:hover{background:var(--hover)}
+.tbl tbody td{padding:9px 12px;vertical-align:middle;max-width:240px}
+/* ─ BADGES ─ */
+.b{display:inline-flex;align-items:center;padding:2px 8px;border-radius:20px;
+   font-size:.68rem;font-weight:700;white-space:nowrap}
+.b-blue{background:#dbeafe;color:#1e40af}.b-green{background:#dcfce7;color:#166534}
+.b-red{background:#fee2e2;color:#991b1b}.b-orange{background:#ffedd5;color:#9a3412}
+.b-purple{background:#ede9fe;color:#5b21b6}.b-teal{background:#ccfbf1;color:#115e59}
+.b-gray{background:#f3f4f6;color:#374151}.b-yellow{background:#fef9c3;color:#713f12}
+.b-pink{background:#fce7f3;color:#9d174d}
+.b-yes{background:#dcfce7;color:#166534}.b-no{background:#f3f4f6;color:#9ca3af}
+[data-theme=dark] .b-blue{background:#1e3a5f;color:#93c5fd}
+[data-theme=dark] .b-green{background:#052e16;color:#86efac}
+[data-theme=dark] .b-red{background:#450a0a;color:#fca5a5}
+[data-theme=dark] .b-orange{background:#431407;color:#fdba74}
+[data-theme=dark] .b-purple{background:#2e1065;color:#c4b5fd}
+[data-theme=dark] .b-teal{background:#022c22;color:#5eead4}
+[data-theme=dark] .b-gray{background:#1f2937;color:#d1d5db}
+[data-theme=dark] .b-yes{background:#052e16;color:#86efac}
+[data-theme=dark] .b-no{background:#1f2937;color:#9ca3af}
+/* ─ AGENT CARDS ─ */
+.agent-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(310px,1fr));gap:16px}
+.agent-card{background:var(--card);border:1px solid var(--border);border-radius:var(--r);
+            padding:16px;position:relative;overflow:hidden;transition:transform .2s,box-shadow .2s}
+.agent-card:hover{transform:translateY(-2px);box-shadow:var(--sh-lg)}
+.agent-card::before{content:'';position:absolute;top:0;left:0;bottom:0;width:4px;
+                    background:linear-gradient(to bottom,var(--primary),var(--purple))}
+.ac-head{display:flex;align-items:flex-start;gap:10px;margin-bottom:10px}
+.ac-icon{font-size:1.8rem;width:40px;height:40px;display:flex;align-items:center;
+         justify-content:center;background:var(--bg);border-radius:var(--r-sm);
+         border:1px solid var(--border);flex-shrink:0}
+.ac-name{font-size:.92rem;font-weight:700}
+.ac-type{font-size:.75rem;color:var(--muted)}
+.ac-file{margin-top:9px;padding:6px 10px;background:var(--bg);border-radius:6px;
+         font-family:var(--mono);font-size:.7rem;color:var(--muted);
+         border:1px solid var(--border);word-break:break-all}
+.lbl{font-size:.66rem;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.05em}
+.val{font-size:.8rem;color:var(--text);font-weight:600;margin-top:2px}
+/* ─ PROVIDERS ─ */
+.prov-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:12px}
+.prov-card{background:var(--card);border:1px solid var(--border);border-radius:var(--r);
+           padding:16px;text-align:center;transition:transform .2s}
+.prov-card:hover{transform:translateY(-2px)}
+.prov-icon{font-size:2rem;margin-bottom:7px}
+.prov-name{font-size:.95rem;font-weight:700;margin-bottom:7px}
+.prov-stats{display:flex;justify-content:center;gap:18px;margin:8px 0}
+/* ─ ROUTES ─ */
+.route-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:10px}
+.route-card{background:var(--bg);border:1px solid var(--border);border-radius:var(--r-sm);
+            padding:12px 14px;display:flex;align-items:center;gap:10px}
+.route-method{font-family:var(--mono);font-size:.75rem;font-weight:800;padding:3px 8px;
+              border-radius:4px;flex-shrink:0}
+.GET   {background:#dcfce7;color:#166534}
+.POST  {background:#dbeafe;color:#1e40af}
+.PUT   {background:#fef9c3;color:#713f12}
+.DELETE{background:#fee2e2;color:#991b1b}
+.PATCH {background:#ede9fe;color:#5b21b6}
+.route-method.ROUTE{background:#f3f4f6;color:#374151}
+[data-theme=dark] .GET   {background:#052e16;color:#86efac}
+[data-theme=dark] .POST  {background:#1e3a5f;color:#93c5fd}
+[data-theme=dark] .PUT   {background:#292524;color:#fcd34d}
+[data-theme=dark] .DELETE{background:#450a0a;color:#fca5a5}
+[data-theme=dark] .PATCH {background:#2e1065;color:#c4b5fd}
+[data-theme=dark] .route-method.ROUTE{background:#1f2937;color:#d1d5db}
+.route-path{font-family:var(--mono);font-size:.82rem;font-weight:600;color:var(--text)}
+.route-file{font-size:.7rem;color:var(--muted);margin-top:3px}
+/* ─ SDK ─ */
+.sdk-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(175px,1fr));gap:10px}
+.sdk-card{background:var(--card);border:1px solid var(--border);border-radius:var(--r-sm);
+          padding:13px;text-align:center;transition:transform .2s}
+.sdk-card:hover{transform:translateY(-2px)}
+.sdk-icon{font-size:1.7rem;margin-bottom:6px}
+.sdk-name{font-weight:700;font-size:.84rem;margin-bottom:3px}
+/* ─ PROMPTS ─ */
+.prompt-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:10px}
+.prompt-card{background:var(--bg);border:1px solid var(--border);border-radius:var(--r-sm);
+             padding:12px;border-left:4px solid var(--purple)}
+.pname{font-weight:700;margin:6px 0 3px;font-size:.84rem}
+/* ─ TOOLS / WORKFLOWS ─ */
+.tool-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(175px,1fr));gap:10px}
+.tool-card{background:var(--card);border:1px solid var(--border);border-radius:var(--r-sm);padding:12px}
+.wf-card{background:var(--card);border:1px solid var(--border);border-radius:var(--r-sm);
+         padding:12px;border-top:3px solid var(--teal)}
+.tool-name{font-weight:700;font-size:.84rem;margin-bottom:4px}
+/* ─ MISC ─ */
+.tag-row{display:flex;flex-wrap:wrap;gap:4px}
+.mt4{margin-top:4px}.mt8{margin-top:8px}
+.sm{font-size:.76rem}.grey{color:var(--muted)}
+.mono{font-family:var(--mono)}
+.blue-t{color:var(--primary)}
+.big-num{font-size:1.7rem;font-weight:800;color:var(--primary);display:block}
+.big-num.sm2{font-size:1.1rem}
+.big-lbl{font-size:.72rem;opacity:.85;text-transform:uppercase;letter-spacing:.05em}
+.banner{display:flex;gap:20px;flex-wrap:wrap;
+        background:linear-gradient(135deg,var(--primary),var(--purple));
+        border-radius:var(--r-sm);padding:16px 20px;color:#fff;margin-bottom:18px}
+.banner-item{text-align:center}
+.info-box{background:#fef9c3;border:1px solid #fbbf24;border-radius:var(--r-sm);
+          padding:13px 16px;margin-bottom:14px;font-size:.86rem;color:#78350f}
+[data-theme=dark] .info-box{background:#292524;border-color:#d97706;color:#fde68a}
+.na{display:inline-flex;align-items:center;padding:2px 9px;background:#fef3c7;
+    color:#92400e;border-radius:6px;font-size:.75rem;font-weight:600}
+[data-theme=dark] .na{background:#292524;color:#fcd34d}
+.empty{text-align:center;padding:32px;color:var(--muted);font-size:.86rem}
+.tree-bar{display:flex;gap:8px;margin-bottom:10px}
+.tree-pre{font-family:var(--mono);font-size:.8rem;color:var(--text);line-height:1.7;
+          white-space:pre;background:var(--bg);border:1px solid var(--border);
+          border-radius:var(--r-sm);padding:14px;overflow:auto;max-height:550px}
+.unused-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:7px}
+.unused-item{padding:9px 12px;background:#fff7ed;border:1px solid #fed7aa;
+             border-radius:var(--r-sm);font-family:var(--mono);font-size:.76rem;
+             color:#9a3412;word-break:break-all}
+[data-theme=dark] .unused-item{background:#1c0a00;border-color:#7c2d12;color:#fdba74}
+.env-list{display:flex;flex-direction:column;gap:6px}
+.env-item{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;
+          gap:8px;padding:10px 14px;background:var(--bg);border:1px solid var(--border);
+          border-radius:var(--r-sm)}
+.env-key{font-family:var(--mono);font-size:.78rem;font-weight:700}
+/* ─ FOOTER ─ */
+.footer{background:var(--nav);color:#a5b4fc;text-align:center;padding:20px;font-size:.8rem}
+.footer p{margin-bottom:4px}
+.footer code{background:rgba(255,255,255,.1);padding:2px 6px;border-radius:4px;font-family:var(--mono)}
+/* ─ MODAL ─ */
+.modal-bg{position:fixed;inset:0;background:rgba(0,0,0,.55);display:flex;
+          align-items:center;justify-content:center;z-index:2000}
+.modal-box{background:var(--card);border-radius:var(--r);padding:26px;
+           max-width:370px;width:90%;box-shadow:var(--sh-lg)}
+.modal-box h3{margin-bottom:16px;font-size:1rem}
+.exp-list{display:flex;flex-direction:column;gap:8px;margin-bottom:12px}
+.exp-btn{padding:10px 16px;background:var(--bg);border:2px solid var(--border);
+         color:var(--text);border-radius:var(--r-sm);cursor:pointer;font-size:.86rem;
+         font-weight:600;text-align:left;transition:border-color .2s,background .2s}
+.exp-btn:hover{border-color:var(--primary);background:var(--hover)}
+.btn-close{width:100%;background:var(--danger);color:#fff;border:none;
+           border-radius:var(--r-sm);padding:9px;cursor:pointer;font-weight:600}
 @media(max-width:768px){
-  .sb{width:0;overflow:hidden}.main{margin-left:0;max-width:100vw;padding:14px}
+  .nav{flex-wrap:wrap;height:auto;padding:8px}
+  .nav-links{order:3;width:100%}
+  .hero h1{font-size:1.3rem}
+  .chart-grid{grid-template-columns:1fr}
+  .agent-grid{grid-template-columns:1fr}
+  .card-grid{grid-template-columns:repeat(2,1fr)}
 }
-@media print{.sb,.topbar-r,.sb-bar{display:none!important}.main{margin-left:0}}
-</style>
-</head>
-<body>
-<aside class="sb">
-  <div class="sb-logo">
-    <h2>🔍 AI Scanner</h2>
-    <p>SentinelOps-Lite</p>
-  </div>
-  <nav class="sb-nav">
-    <a href="#overview"  class="nav-a active">📊 Overview</a>
-    <a href="#tree"      class="nav-a">📁 Directory Tree</a>
-    <a href="#files"     class="nav-a">📄 File Inventory</a>
-    <a href="#agents"    class="nav-a">🤖 AI Agents</a>
-    <a href="#providers" class="nav-a">☁️ Providers</a>
-    <a href="#models"    class="nav-a">🧠 Models</a>
-    <a href="#sdks"      class="nav-a">🛠️ SDKs</a>
-    <a href="#prompts"   class="nav-a">💬 Prompts</a>
-    <a href="#apikeys"   class="nav-a">🔑 API Keys</a>
-    <a href="#tools"     class="nav-a">⚙️ Tools</a>
-    <a href="#workflows" class="nav-a">🔄 Workflows</a>
-    <a href="#tokens"    class="nav-a">🪙 Token Config</a>
-    <a href="#unused"    class="nav-a">🗑️ Unused Files</a>
-  </nav>
-  <div class="sb-foot">
-    <button class="dk-btn" onclick="toggleDark()">🌙 Toggle theme</button>
-  </div>
-</aside>
-
-<div class="main">
-  <div class="topbar">
-    <h1>🔍 AI Repository Scanner</h1>
-    <div class="topbar-r">
-      <div class="sp" id="spinner"><div class="spin"></div>Scanning…</div>
-      <button class="btn btn-g" onclick="triggerScan()">▶ Scan Repo</button>
-      <button class="btn btn-gr" onclick="exportJSON()">⬇ JSON</button>
-      <button class="btn btn-gr" onclick="exportCSV()">⬇ CSV</button>
-    </div>
-  </div>
-
-  <div class="sb-bar">
-    <input id="gs" type="text"
-           placeholder="🔍 Search files, agents, models…"
-           oninput="globalSearch(this.value)">
-    <select id="fc" onchange="applyFilters()">
-      <option value="">All Categories</option>
-      <option>AI</option><option>Source</option><option>Test</option>
-      <option>Configuration</option><option>Documentation</option>
-      <option>Infrastructure</option><option>Other</option>
-    </select>
-    <select id="fa" onchange="applyFilters()">
-      <option value="">All Files</option>
-      <option value="true">AI Related</option>
-      <option value="false">Non-AI</option>
-    </select>
-    <select id="fl" onchange="applyFilters()">
-      <option value="">All Languages</option>
-    </select>
-  </div>
-
-  <section id="overview">
-    <div class="st">📊 Repository Overview</div>
-    <div id="meta" style="font-size:11px;color:var(--muted);margin-bottom:12px">
-      No scan yet — click <strong>▶ Scan Repo</strong> to start.
-    </div>
-    <div class="sg" id="sg"></div>
-  </section>
-
-  <section id="tree">
-    <div class="st">📁 Directory Tree</div>
-    <pre class="tree" id="tree-box">Run a scan to see the directory tree.</pre>
-  </section>
-
-  <section id="files">
-    <div class="st">📄 File Inventory
-      <span class="bdg bdg-b" id="fc-bdg"></span>
-    </div>
-    <div class="tw">
-      <table id="ft">
-        <thead><tr>
-          <th onclick="srt('ft',0)">#</th>
-          <th onclick="srt('ft',1)">Path</th>
-          <th onclick="srt('ft',2)">File</th>
-          <th onclick="srt('ft',3)">Ext</th>
-          <th onclick="srt('ft',4)">Language</th>
-          <th onclick="srt('ft',5)">Category</th>
-          <th onclick="srt('ft',6)">Purpose</th>
-          <th onclick="srt('ft',7)">Lines</th>
-          <th onclick="srt('ft',8)">Size</th>
-          <th onclick="srt('ft',9)">AI</th>
-          <th onclick="srt('ft',10)">Used</th>
-        </tr></thead>
-        <tbody id="ftb"><tr><td colspan="11" class="empty">Run a scan first.</td></tr></tbody>
-      </table>
-    </div>
-  </section>
-
-  <section id="agents">
-    <div class="st">🤖 AI Agents
-      <span class="bdg bdg-r" id="ag-bdg"></span>
-    </div>
-    <div class="tw">
-      <table id="at">
-        <thead><tr>
-          <th>#</th><th>Name</th><th>File</th><th>Type</th>
-          <th>Provider</th><th>SDK</th><th>Model</th>
-          <th>Tools</th><th>Workflows</th><th>Line</th>
-        </tr></thead>
-        <tbody id="atb"><tr><td colspan="10" class="empty">Run a scan first.</td></tr></tbody>
-      </table>
-    </div>
-  </section>
-
-  <section id="providers">
-    <div class="st">☁️ Providers
-      <span class="bdg bdg-b" id="pv-bdg"></span>
-    </div>
-    <div class="cg2" id="pv-grid"><div class="empty">Run a scan first.</div></div>
-  </section>
-
-  <section id="models">
-    <div class="st">🧠 Models
-      <span class="bdg bdg-p" id="md-bdg"></span>
-    </div>
-    <div class="tw">
-      <table id="mt">
-        <thead><tr>
-          <th onclick="srt('mt',0)">#</th>
-          <th onclick="srt('mt',1)">Model</th>
-          <th onclick="srt('mt',2)">Provider</th>
-          <th onclick="srt('mt',3)">Files</th>
-          <th onclick="srt('mt',4)">References</th>
-        </tr></thead>
-        <tbody id="mtb"><tr><td colspan="5" class="empty">Run a scan first.</td></tr></tbody>
-      </table>
-    </div>
-  </section>
-
-  <section id="sdks">
-    <div class="st">🛠️ SDKs &amp; Frameworks
-      <span class="bdg bdg-g" id="sdk-bdg"></span>
-    </div>
-    <div class="tw">
-      <table id="skt">
-        <thead><tr>
-          <th>#</th><th>SDK / Framework</th>
-          <th>Files</th><th>Imports</th>
-        </tr></thead>
-        <tbody id="sktb"><tr><td colspan="4" class="empty">Run a scan first.</td></tr></tbody>
-      </table>
-    </div>
-  </section>
-
-  <section id="prompts">
-    <div class="st">💬 Prompts
-      <span class="bdg bdg-o" id="pr-bdg"></span>
-    </div>
-    <div class="tw">
-      <table id="prt">
-        <thead><tr>
-          <th>#</th><th>Type</th><th>Location</th>
-          <th>Line</th><th>Preview</th>
-        </tr></thead>
-        <tbody id="prtb"><tr><td colspan="5" class="empty">Run a scan first.</td></tr></tbody>
-      </table>
-    </div>
-  </section>
-
-  <section id="apikeys">
-    <div class="st">🔑 API Keys &amp; Env Vars
-      <span class="bdg bdg-r" id="kv-bdg"></span>
-    </div>
-    <div class="ib ii">
-      ℹ️ These are variable <strong>references</strong> in source code.
-      Actual secret values are never stored or displayed.
-    </div>
-    <div class="tw">
-      <table id="kvt">
-        <thead><tr>
-          <th>#</th><th>Variable</th><th>Provider</th>
-          <th>Loaded From</th><th>Files</th>
-        </tr></thead>
-        <tbody id="kvtb"><tr><td colspan="5" class="empty">Run a scan first.</td></tr></tbody>
-      </table>
-    </div>
-  </section>
-
-  <section id="tools">
-    <div class="st">⚙️ Agent Tools</div>
-    <div class="chg" id="tl-grid"><div class="empty">Run a scan first.</div></div>
-  </section>
-
-  <section id="workflows">
-    <div class="st">🔄 Workflow Patterns</div>
-    <div class="chg" id="wf-grid"><div class="empty">Run a scan first.</div></div>
-  </section>
-
-  <section id="tokens">
-    <div class="st">🪙 Token Configuration</div>
-    <div class="ib iw">
-      ⚠️ Runtime token usage is <strong>Not Available from Source Code</strong>.
-      Only static values configured in source are shown.
-    </div>
-    <div class="tw">
-      <table id="tkt">
-        <thead><tr>
-          <th>Agent</th><th>File</th><th>Model</th>
-          <th>Parameter</th><th>Value</th>
-          <th>Runtime Usage</th><th>Remaining</th>
-        </tr></thead>
-        <tbody id="tktb"><tr><td colspan="7" class="empty">Run a scan first.</td></tr></tbody>
-      </table>
-    </div>
-  </section>
-
-  <section id="unused">
-    <div class="st">🗑️ Potentially Unused Files</div>
-    <div class="tw">
-      <table id="ut">
-        <thead><tr>
-          <th>#</th><th>File</th><th>Language</th>
-          <th>Lines</th><th>Size</th>
-        </tr></thead>
-        <tbody id="utb"><tr><td colspan="5" class="empty">Run a scan first.</td></tr></tbody>
-      </table>
-    </div>
-  </section>
-</div>
-
-<script>
-let _d=null,_ss={},_scanning=false;
-
-function toggleDark(){
-  document.documentElement.style.setProperty('--bg',
-    getComputedStyle(document.documentElement).getPropertyValue('--bg').trim()==='#0d1117'
-    ?'#ffffff':'#0d1117');
+@media print{
+  .nav,.nav-right{display:none!important}
+  .sec{break-inside:avoid}
 }
+"""
 
-// sidebar active
-const _secs=document.querySelectorAll('section[id]');
-const _navs=document.querySelectorAll('.nav-a');
-window.addEventListener('scroll',()=>{
-  let cur='';
-  _secs.forEach(s=>{if(window.scrollY>=s.offsetTop-80)cur=s.id;});
-  _navs.forEach(a=>a.classList.toggle('active',a.getAttribute('href')==='#'+cur));
-},{passive:true});
-
-async function triggerScan(){
-  if(_scanning)return;
-  _scanning=true;
-  document.getElementById('spinner').style.display='flex';
-  try{
-    await fetch('/scanner/api/scan',{
-      method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({path:'.'})
-    });
-    let attempts=0;
-    while(attempts<120){
-      await new Promise(r=>setTimeout(r,1500));
-      const r=await fetch('/scanner/api/report');
-      if(r.ok){const j=await r.json();if(!j.scanning){_d=j;renderAll();break;}}
-      attempts++;
-    }
-  }catch(e){alert('Scan error: '+e);}
-  finally{_scanning=false;document.getElementById('spinner').style.display='none';}
+# ── JavaScript (complete, self-contained) ─────────────────────
+_JS = r"""
+/* ── CHARTS ── */
+const PAL=['#4f46e5','#10b981','#f59e0b','#ef4444','#8b5cf6',
+           '#14b8a6','#f97316','#3b82f6','#ec4899','#06b6d4',
+           '#84cc16','#a855f7','#22c55e','#fb923c','#64748b'];
+function tc(){
+  const d=document.documentElement.getAttribute('data-theme')==='dark';
+  return{text:d?'#f1f5f9':'#1a202c',muted:d?'#94a3b8':'#718096',
+         grid:d?'#334155':'#e2e8f0',bg:d?'#1e293b':'#ffffff'};
 }
-
-async function loadReport(){
-  try{
-    const r=await fetch('/scanner/api/report');
-    if(r.ok){const j=await r.json();if(!j.scanning&&j.total_files>0){_d=j;renderAll();}}
-  }catch(_){}
-}
-
-function renderAll(){
-  if(!_d)return;
-  rMeta();rStats();rTree();rFiles();rAgents();rProviders();
-  rModels();rSDKs();rPrompts();rAPIKeys();rTools();rWorkflows();
-  rTokens();rUnused();
-}
-
-function rMeta(){
-  document.getElementById('meta').innerHTML=
-    `📂 <strong>${e(_d.root_path)}</strong> &nbsp;|&nbsp;
-     📅 <strong>${e(_d.scan_date)}</strong> &nbsp;|&nbsp;
-     📦 <strong>${e(_d.repo_name)}</strong>`;
-}
-
-function rStats(){
-  const cards=[
-    ['📁','Directories',_d.total_dirs,'cb'],
-    ['📄','Total Files',_d.total_files,'cb'],
-    ['💻','Source',_d.source_files,'cg'],
-    ['⚙️','Config',_d.config_files,'co'],
-    ['📚','Docs',_d.doc_files,'cb'],
-    ['🧪','Tests',_d.test_files,'ct'],
-    ['🏗️','Infra',_d.infra_files,'co'],
-    ['🤖','AI Files',_d.ai_files,'cr'],
-    ['🤖','Agents',_d.total_agents,'cr'],
-    ['☁️','Providers',_d.total_providers,'cb'],
-    ['🧠','Models',_d.total_models,'cp'],
-    ['💬','Prompts',_d.total_prompts,'co'],
-    ['🛠️','SDKs',_d.total_sdks,'cg'],
-    ['⚙️','Tools',_d.total_tools,'ct'],
-    ['🔑','API Keys',_d.total_api_keys,'cr'],
-    ['🏛️','Classes',_d.total_classes,'cb'],
-    ['⚡','Functions',_d.total_functions,'cg'],
-    ['🌐','Endpoints',_d.total_endpoints,'co'],
-  ];
-  document.getElementById('sg').innerHTML=cards.map(
-    ([icon,lbl,val,cls])=>
-    `<div class="sc ${cls}">
-       <div class="si">${icon}</div>
-       <div class="sv">${(val||0).toLocaleString()}</div>
-       <div class="sl">${lbl}</div>
-     </div>`
-  ).join('');
-}
-
-function rTree(){
-  document.getElementById('tree-box').textContent=_d.directory_tree||'No data.';
-}
-
-function rFiles(){
-  const files=_d.files||[];
-  document.getElementById('fc-bdg').textContent=files.length+' files';
-  const langs=[...new Set(files.map(f=>f.language).filter(Boolean))].sort();
-  const sel=document.getElementById('fl');
-  langs.forEach(l=>{
-    if(!sel.querySelector(`option[value="${l}"]`)){
-      const o=document.createElement('option');o.value=l;o.textContent=l;sel.appendChild(o);
-    }
+function barChart(id,labels,values){
+  const el=document.getElementById(id);if(!el)return;
+  const ctx=el.getContext('2d'),W=el.width,H=el.height,c=tc();
+  ctx.clearRect(0,0,W,H);ctx.fillStyle=c.bg;ctx.fillRect(0,0,W,H);
+  if(!labels.length){ctx.fillStyle=c.muted;ctx.font='12px sans-serif';
+    ctx.textAlign='center';ctx.fillText('No data',W/2,H/2);return;}
+  const pad={t:14,r:14,b:64,l:42};
+  const cW=W-pad.l-pad.r,cH=H-pad.t-pad.b;
+  const mx=Math.max(...values,1),bW=cW/labels.length,bp=bW*.14;
+  for(let i=0;i<=5;i++){
+    const y=pad.t+cH-(i/5)*cH;
+    ctx.strokeStyle=c.grid;ctx.lineWidth=1;ctx.setLineDash([3,3]);
+    ctx.beginPath();ctx.moveTo(pad.l,y);ctx.lineTo(pad.l+cW,y);ctx.stroke();
+    ctx.setLineDash([]);ctx.fillStyle=c.muted;ctx.font='9px sans-serif';
+    ctx.textAlign='right';ctx.fillText(Math.round(mx*i/5),pad.l-3,y+3);
+  }
+  labels.forEach((lbl,i)=>{
+    const bH=(values[i]/mx)*cH,x=pad.l+i*bW+bp,y=pad.t+cH-bH,w=bW-bp*2;
+    const g=ctx.createLinearGradient(x,y,x,pad.t+cH);
+    const col=PAL[i%PAL.length];
+    g.addColorStop(0,col);g.addColorStop(1,col+'70');
+    ctx.fillStyle=g;
+    ctx.beginPath();
+    if(ctx.roundRect)ctx.roundRect(x,y,w,Math.max(bH,1),[3,3,0,0]);
+    else ctx.rect(x,y,w,Math.max(bH,1));
+    ctx.fill();
+    ctx.fillStyle=c.text;ctx.font='bold 9px sans-serif';ctx.textAlign='center';
+    if(values[i])ctx.fillText(values[i],x+w/2,y-3);
+    ctx.save();ctx.translate(x+w/2,pad.t+cH+5);ctx.rotate(-Math.PI/4);
+    ctx.fillStyle=c.muted;ctx.font='8px sans-serif';ctx.textAlign='right';
+    ctx.fillText(lbl.length>14?lbl.slice(0,12)+'..':lbl,0,0);ctx.restore();
   });
-  document.getElementById('ftb').innerHTML=files.map(f=>`
-    <tr class="${f.is_ai_related?'air':''}"
-        data-cat="${e(f.category)}" data-ai="${f.is_ai_related}"
-        data-lang="${e(f.language)}">
-      <td>${f.serial}</td>
-      <td><span class="pth" title="${e(f.relative_path)}">${e(f.relative_path)}</span></td>
-      <td><strong>${e(f.file_name)}</strong></td>
-      <td><code class="mono">${e(f.extension)}</code></td>
-      <td><span class="pill pbl">${e(f.language)}</span></td>
-      <td><span class="pill ${cp(f.category)}">${e(f.category)}</span></td>
-      <td>${e(f.purpose)}</td>
-      <td>${(f.lines_of_code||0).toLocaleString()}</td>
-      <td>${fsz(f.size_bytes)}</td>
-      <td>${f.is_ai_related?'<span class="pill pai">AI</span>':''}</td>
-      <td><span class="pill ${f.is_used==='Yes'?'pgr':f.is_used==='Likely'?'por':'pgy'}">${e(f.is_used)}</span></td>
-    </tr>`).join('');
+  ctx.strokeStyle=c.grid;ctx.lineWidth=2;ctx.setLineDash([]);
+  ctx.beginPath();ctx.moveTo(pad.l,pad.t);ctx.lineTo(pad.l,pad.t+cH);
+  ctx.lineTo(pad.l+cW,pad.t+cH);ctx.stroke();
 }
-
-function rAgents(){
-  const agents=_d.agents||[];
-  document.getElementById('ag-bdg').textContent=agents.length+' detected';
-  const seen=new Set();
-  const rows=agents.filter(a=>{
-    const k=a.file+':'+a.name+':'+a.line_number;
-    if(seen.has(k))return false;seen.add(k);return true;
+function donut(id,labels,values){
+  const el=document.getElementById(id);if(!el)return;
+  const ctx=el.getContext('2d'),W=el.width,H=el.height,c=tc();
+  ctx.clearRect(0,0,W,H);ctx.fillStyle=c.bg;ctx.fillRect(0,0,W,H);
+  const tot=values.reduce((a,b)=>a+b,0);
+  if(!tot){ctx.fillStyle=c.muted;ctx.font='12px sans-serif';
+    ctx.textAlign='center';ctx.fillText('No data',W/2,H/2);return;}
+  const cx=W*.37,cy=H*.5,or=Math.min(cx,cy)*.82,ir=or*.54;
+  let sa=-Math.PI/2;
+  labels.forEach((lbl,i)=>{
+    if(!values[i])return;
+    const sl=(values[i]/tot)*Math.PI*2,col=PAL[i%PAL.length];
+    ctx.beginPath();ctx.moveTo(cx,cy);ctx.arc(cx,cy,or,sa,sa+sl);
+    ctx.closePath();ctx.fillStyle=col;ctx.fill();
+    ctx.strokeStyle=c.bg;ctx.lineWidth=2;ctx.stroke();sa+=sl;
   });
-  document.getElementById('atb').innerHTML=rows.length?rows.map((a,i)=>`
-    <tr>
-      <td>${i+1}</td>
-      <td><strong>${e(a.name)}</strong></td>
-      <td><span class="pth">${e(a.file)}</span></td>
-      <td><span class="pill ppu">${e(a.agent_type)}</span></td>
-      <td><span class="pill pbl">${e(a.provider)}</span></td>
-      <td>${e(a.sdk)}</td>
-      <td><code class="mono">${e(a.model)}</code></td>
-      <td>${(a.tools||[]).slice(0,3).map(t=>`<span class="pill pgr">${e(t)}</span>`).join(' ')}</td>
-      <td>${(a.workflows||[]).slice(0,2).map(w=>`<span class="pill pbl">${e(w)}</span>`).join(' ')}</td>
-      <td>${a.line_number}</td>
-    </tr>`).join('')
-    :'<tr><td colspan="10" class="empty">No AI agents detected.</td></tr>';
-}
-
-function rProviders(){
-  const provs=Object.values(_d.providers||{});
-  document.getElementById('pv-bdg').textContent=provs.length+' detected';
-  document.getElementById('pv-grid').innerHTML=provs.length?provs.map(p=>`
-    <div class="pc">
-      <div class="pn">${e(p.name)}</div>
-      <div class="pr"><span>SDK</span><span>${e(p.sdk)}</span></div>
-      <div class="pr"><span>Auth</span><span>${e(p.auth_method||'API Key')}</span></div>
-      <div class="pr"><span>Files</span><span>${(p.files||[]).length}</span></div>
-      <div class="evl">${(p.env_vars||[]).map(v=>`<span class="evt">${e(v)}</span>`).join('')||'<span style="font-size:10px;color:var(--muted)">None detected</span>'}</div>
-    </div>`).join('')
-    :'<div class="empty">No providers detected.</div>';
-}
-
-function rModels(){
-  const models=Object.values(_d.models||{}).sort((a,b)=>b.reference_count-a.reference_count);
-  document.getElementById('md-bdg').textContent=models.length+' detected';
-  document.getElementById('mtb').innerHTML=models.length?models.map((m,i)=>`
-    <tr>
-      <td>${i+1}</td>
-      <td><code class="mono">${e(m.name)}</code></td>
-      <td><span class="pill pbl">${e(m.provider)}</span></td>
-      <td>${(m.files||[]).length}</td>
-      <td><strong>${m.reference_count}</strong></td>
-    </tr>`).join('')
-    :'<tr><td colspan="5" class="empty">No models detected.</td></tr>';
-}
-
-function rSDKs(){
-  const sdks=Object.values(_d.sdks||{}).sort((a,b)=>b.import_count-a.import_count);
-  document.getElementById('sdk-bdg').textContent=sdks.length+' detected';
-  document.getElementById('sktb').innerHTML=sdks.length?sdks.map((s,i)=>`
-    <tr>
-      <td>${i+1}</td><td><strong>${e(s.name)}</strong></td>
-      <td>${(s.files||[]).length}</td><td>${s.import_count}</td>
-    </tr>`).join('')
-    :'<tr><td colspan="4" class="empty">No SDKs detected.</td></tr>';
-}
-
-function rPrompts(){
-  const prompts=_d.prompts||[];
-  document.getElementById('pr-bdg').textContent=prompts.length+' detected';
-  document.getElementById('prtb').innerHTML=prompts.length?prompts.slice(0,100).map((p,i)=>`
-    <tr>
-      <td>${i+1}</td>
-      <td><span class="pill por">${e(p.prompt_type)}</span></td>
-      <td><span class="pth">${e(p.location)}</span></td>
-      <td>${p.line_number}</td>
-      <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--muted)"
-          title="${e(p.content_preview)}">${e(p.content_preview||'')}</td>
-    </tr>`).join('')
-    :'<tr><td colspan="5" class="empty">No prompts detected.</td></tr>';
-}
-
-function rAPIKeys(){
-  const keys=Object.values(_d.api_keys||{});
-  document.getElementById('kv-bdg').textContent=keys.length+' detected';
-  document.getElementById('kvtb').innerHTML=keys.length?keys.map((k,i)=>`
-    <tr>
-      <td>${i+1}</td>
-      <td><code class="mono" style="color:var(--orange)">${e(k.variable_name)}</code></td>
-      <td><span class="pill pbl">${e(k.provider)}</span></td>
-      <td>${e(k.loaded_from)}</td>
-      <td>${(k.used_in||[]).length}</td>
-    </tr>`).join('')
-    :'<tr><td colspan="5" class="empty">No API keys detected.</td></tr>';
-}
-
-function rTools(){
-  const tools=Object.values(_d.tools||{});
-  document.getElementById('tl-grid').innerHTML=tools.length?tools.map(t=>`
-    <div class="ch">⚙️ ${e(t.name)}<small>${(t.files||[]).length} file(s)</small></div>`).join('')
-    :'<div class="empty">No tools detected.</div>';
-}
-
-function rWorkflows(){
-  const wfs=Object.values(_d.workflows||{});
-  document.getElementById('wf-grid').innerHTML=wfs.length?wfs.map(w=>`
-    <div class="ch">🔄 ${e(w.name)}<small>${(w.files||[]).length} file(s)</small></div>`).join('')
-    :'<div class="empty">No workflow patterns detected.</div>';
-}
-
-function rTokens(){
-  const rows=[];
-  (_d.agents||[]).forEach(a=>{
-    Object.entries(a.token_config||{}).forEach(([k,v])=>{
-      rows.push(`<tr>
-        <td>${e(a.name)}</td>
-        <td><span class="pth">${e(a.file)}</span></td>
-        <td><code class="mono">${e(a.model)}</code></td>
-        <td>${e(k)}</td><td><strong>${e(v)}</strong></td>
-        <td style="color:var(--muted);font-style:italic;font-size:10px">Not Available from Source Code</td>
-        <td style="color:var(--muted);font-style:italic;font-size:10px">Not Available from Source Code</td>
-      </tr>`);
-    });
-  });
-  document.getElementById('tktb').innerHTML=rows.length?rows.join('')
-    :'<tr><td colspan="7" class="empty">No static token configuration found.</td></tr>';
-}
-
-function rUnused(){
-  const unused=(_d.files||[]).filter(
-    f=>f.is_referenced==='No'&&f.is_used==='Unknown'&&
-       ['Source','AI'].includes(f.category)
-  );
-  document.getElementById('utb').innerHTML=unused.length?unused.slice(0,50).map((f,i)=>`
-    <tr>
-      <td>${i+1}</td>
-      <td><span class="pth">${e(f.relative_path)}</span></td>
-      <td>${e(f.language)}</td>
-      <td>${(f.lines_of_code||0).toLocaleString()}</td>
-      <td>${fsz(f.size_bytes)}</td>
-    </tr>`).join('')
-    :'<tr><td colspan="5" class="empty">No obviously unused files detected.</td></tr>';
-}
-
-function globalSearch(q){
-  q=q.toLowerCase();
-  document.querySelectorAll('#ftb tr').forEach(r=>{
-    r.classList.toggle('hid',q.length>0&&!r.textContent.toLowerCase().includes(q));
+  ctx.beginPath();ctx.arc(cx,cy,ir,0,Math.PI*2);ctx.fillStyle=c.bg;ctx.fill();
+  ctx.fillStyle=c.text;ctx.font='bold 15px sans-serif';ctx.textAlign='center';
+  ctx.fillText(tot.toLocaleString(),cx,cy+4);
+  ctx.font='9px sans-serif';ctx.fillStyle=c.muted;ctx.fillText('total',cx,cy+17);
+  const lx=W*.73,ly0=20,lh=18;
+  labels.forEach((lbl,i)=>{
+    if(!values[i])return;
+    const y=ly0+i*lh;if(y>H-10)return;
+    ctx.fillStyle=PAL[i%PAL.length];
+    ctx.beginPath();
+    if(ctx.roundRect)ctx.roundRect(lx-35,y-6,10,10,[2]);else ctx.rect(lx-35,y-6,10,10);
+    ctx.fill();
+    ctx.fillStyle=c.muted;ctx.font='8px sans-serif';ctx.textAlign='left';
+    const pct=((values[i]/tot)*100).toFixed(1);
+    const ll=lbl.length>12?lbl.slice(0,10)+'..':lbl;
+    ctx.fillText(`${ll} (${pct}%)`,lx-22,y+3);
   });
 }
-
-function applyFilters(){
-  const cat=document.getElementById('fc').value.toLowerCase();
-  const ai=document.getElementById('fa').value.toLowerCase();
-  const lang=document.getElementById('fl').value.toLowerCase();
-  document.querySelectorAll('#ftb tr').forEach(r=>{
-    const show=(!cat||(r.dataset.cat||'').toLowerCase()===cat)
-            &&(!ai||(r.dataset.ai||'').toLowerCase()===ai)
-            &&(!lang||(r.dataset.lang||'').toLowerCase()===lang);
-    r.classList.toggle('hid',!show);
-  });
+function renderCharts(){
+  barChart('cLang',langLabels,langValues);
+  donut   ('cCat', catLabels, catValues);
+  barChart('cAI',  aiLabels,  aiValues);
+  barChart('cDir', dirLabels, dirValues);
 }
 
-function srt(tid,col){
-  const tbl=document.getElementById(tid);if(!tbl)return;
-  const tb=tbl.querySelector('tbody');
-  const rows=Array.from(tb.querySelectorAll('tr'));
-  const key=tid+'_'+col;const asc=!_ss[key];_ss[key]=asc;
+/* ── THEME ── */
+function toggleTheme(){
+  const h=document.documentElement;
+  const d=h.getAttribute('data-theme')==='dark';
+  h.setAttribute('data-theme',d?'light':'dark');
+  document.getElementById('themeBtn').textContent=d?'🌙 Dark':'☀️ Light';
+  localStorage.setItem('aiAuditTheme',d?'light':'dark');
+  setTimeout(renderCharts,80);
+}
+
+/* ── FILE TABLE FILTER ── */
+function filterFiles(){
+  const q  =(document.getElementById('fileQ') ?.value||'').toLowerCase();
+  const cat= document.getElementById('catSel')?.value||'';
+  const ai = document.getElementById('aiSel') ?.value||'';
+  const rows=document.querySelectorAll('#fileTbl tbody tr');
+  let vis=0;
+  rows.forEach(r=>{
+    let ok=r.textContent.toLowerCase().includes(q);
+    if(ok&&cat)ok=r.getAttribute('data-cat')===cat;
+    if(ok&&ai) ok=r.getAttribute('data-ai') ===ai;
+    r.style.display=ok?'':'none';if(ok)vis++;
+  });
+  const el=document.getElementById('fCount');
+  if(el)el.textContent=`${vis} of ${rows.length} files`;
+}
+
+/* ── SORT ── */
+const _ss={};
+function sortTbl(id,col){
+  const t=document.getElementById(id);if(!t)return;
+  const k=`${id}-${col}`;_ss[k]=_ss[k]==='asc'?'desc':'asc';
+  const asc=_ss[k]==='asc';
+  const rows=Array.from(t.querySelectorAll('tbody tr'));
   rows.sort((a,b)=>{
-    const av=a.cells[col]?.textContent.trim()||'';
-    const bv=b.cells[col]?.textContent.trim()||'';
-    const an=parseFloat(av.replace(/[^\d.-]/g,''));
-    const bn=parseFloat(bv.replace(/[^\d.-]/g,''));
+    const at=a.cells[col]?.textContent.trim()||'';
+    const bt=b.cells[col]?.textContent.trim()||'';
+    const an=parseFloat(at.replace(/[^0-9.-]/g,''));
+    const bn=parseFloat(bt.replace(/[^0-9.-]/g,''));
     if(!isNaN(an)&&!isNaN(bn))return asc?an-bn:bn-an;
-    return asc?av.localeCompare(bv):bv.localeCompare(av);
+    return asc?at.localeCompare(bt):bt.localeCompare(at);
   });
-  rows.forEach(r=>tb.appendChild(r));
+  const tb=t.querySelector('tbody');rows.forEach(r=>tb.appendChild(r));
 }
 
-function exportJSON(){
-  if(!_d)return;
-  dl(new Blob([JSON.stringify(_d,null,2)],{type:'application/json'}),'audit.json');
-}
-
-function exportCSV(){
-  if(!_d)return;
-  const hdr=['#','path','file','ext','language','category',
-             'purpose','lines','size','ai_related','used'];
-  const rows=(_d.files||[]).map(f=>
-    [f.serial,f.relative_path,f.file_name,f.extension,f.language,
-     f.category,f.purpose,f.lines_of_code,f.size_bytes,
-     f.is_ai_related,f.is_used].map(v=>'"'+String(v).replace(/"/g,'""')+'"')
-  );
-  dl(new Blob([[hdr,...rows].map(r=>r.join(',')).join('\n')],
-             {type:'text/csv'}),'audit.csv');
-}
-
+/* ── EXPORT ── */
+function showExport(){document.getElementById('exportModal').style.display='flex'}
+function hideExport(){document.getElementById('exportModal').style.display='none'}
+document.getElementById('exportModal').addEventListener('click',e=>{
+  if(e.target===e.currentTarget)hideExport();});
 function dl(blob,name){
-  const a=document.createElement('a');a.href=URL.createObjectURL(blob);
-  a.download=name;a.click();URL.revokeObjectURL(a.href);
+  const a=document.createElement('a');
+  a.href=URL.createObjectURL(blob);a.download=name;a.click();URL.revokeObjectURL(a.href);
+}
+function exportHTML(){
+  dl(new Blob([document.documentElement.outerHTML],{type:'text/html'}),'repository_audit.html');
+  hideExport();
+}
+function exportJSON(){
+  dl(new Blob([JSON.stringify({summary:auditSummary,files:allFiles},null,2)],
+     {type:'application/json'}),'repository_audit.json');hideExport();
+}
+function exportCSV(){
+  const h=['#','Path','Filename','Ext','Language','Category','Purpose',
+           'Size','Lines','AI','Used','Models','Providers','SDKs'];
+  const rows=allFiles.map(f=>[
+    f.serial,f.rel_path,f.filename,f.extension,f.language,f.category,
+    f.purpose,f.size,f.lines,f.is_ai,f.is_used,
+    (f.models||[]).join(';'),(f.providers||[]).join(';'),(f.sdks||[]).join(';')]);
+  const csv=[h,...rows].map(r=>r.map(c=>`"${String(c).replace(/"/g,'""')}"`).join(',')).join('\n');
+  dl(new Blob([csv],{type:'text/csv'}),'repository_audit.csv');hideExport();
 }
 
-function e(s){
-  return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;')
-    .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
-}
-function fsz(b){
-  b=b||0;
-  if(b<1024)return b+' B';
-  if(b<1048576)return (b/1024).toFixed(1)+' KB';
-  return (b/1048576).toFixed(1)+' MB';
-}
-function cp(cat){
-  return{AI:'pai',Source:'pgr',Test:'por',
-         Configuration:'ppu',Documentation:'pbl',Infrastructure:'por'}[cat]||'pgy';
-}
+/* ── SMOOTH SCROLL ── */
+document.querySelectorAll('a[href^="#"]').forEach(a=>{
+  a.addEventListener('click',e=>{
+    e.preventDefault();
+    document.querySelector(a.getAttribute('href'))?.scrollIntoView({behavior:'smooth',block:'start'});
+  });
+});
 
-loadReport();
-</script>
-</body>
-</html>
+/* ── INIT ── */
+document.addEventListener('DOMContentLoaded',()=>{
+  const t=localStorage.getItem('aiAuditTheme')||'light';
+  document.documentElement.setAttribute('data-theme',t);
+  document.getElementById('themeBtn').textContent=t==='dark'?'☀️ Light':'🌙 Dark';
+  renderCharts();
+  window.addEventListener('resize',()=>{
+    clearTimeout(window._rt);window._rt=setTimeout(renderCharts,200);});
+});
 """
 
 
-# ══════════════════════════════════════════════════════════════
-# SCANNER BLUEPRINT  —  /scanner/*
-# ══════════════════════════════════════════════════════════════
+class HTMLReport:
+    """Builds the complete standalone HTML audit report."""
 
-scanner_bp = Blueprint("scanner", __name__, url_prefix="/scanner")
+    def __init__(self, s: RepoScanner) -> None:
+        self.s = s
 
+    # ── Entry ─────────────────────────────────────────────────
 
-@scanner_bp.get("/")
-def scanner_dashboard() -> str:
-    """HTML dashboard — no external template file required."""
-    return render_template_string(_DASHBOARD_HTML)
+    def build(self) -> str:
+        s   = self.s
+        st  = s.stats
+        dt  = datetime.datetime.fromisoformat(s.scan_date)
+        dts = dt.strftime("%B %d, %Y  %H:%M:%S")
 
+        agents = self._dedup_agents()
+        unused = [f for f in s.files
+                  if not f["is_referenced"] and f["category"] in ("source", "ai")
+                  and f["lines"] > 0]
 
-@scanner_bp.get("/api/health")
-def scanner_health() -> tuple[Response, int]:
-    return jsonify(
-        status=   "ok",
-        scanner=  "loaded",
-        has_data= _last_result is not None,
-        scanning= _scan_running,
-    ), 200
+        lang_labels = list(st.get("languages", {}).keys())[:12]
+        lang_values = list(st.get("languages", {}).values())[:12]
+        cat_data    = Counter(f["category"] for f in s.files)
 
+        return f"""<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>AI Audit — {esc(s.repo_name)}</title>
+<style>{_CSS}</style>
+</head>
+<body>
 
-@scanner_bp.get("/api/status")
-def scanner_api_status() -> Response:
-    if _last_result is None:
-        return jsonify(
-            status=   "idle",
-            message=  "No scan yet. POST /scanner/api/scan to start.",
-            scanning= _scan_running,
+<!-- NAV -->
+<nav class="nav">
+  <div class="nav-brand">🤖 AI Repo Audit</div>
+  <div class="nav-links">
+    <a href="#overview">Overview</a>
+    <a href="#charts">Charts</a>
+    <a href="#routes">Routes</a>
+    <a href="#files">Files</a>
+    <a href="#agents">Agents</a>
+    <a href="#providers">Providers</a>
+    <a href="#models">Models</a>
+    <a href="#prompts">Prompts</a>
+    <a href="#sdks">SDKs</a>
+    <a href="#apikeys">API Keys</a>
+    <a href="#tokens">Tokens</a>
+    <a href="#tools">Tools</a>
+    <a href="#workflows">Workflows</a>
+    <a href="#deps">Deps</a>
+    <a href="#unused">Unused</a>
+    <a href="#tree">Tree</a>
+  </div>
+  <div class="nav-right">
+    <button class="btn btn-export" onclick="showExport()">⬇ Export</button>
+    <button class="btn btn-theme"  onclick="toggleTheme()" id="themeBtn">🌙 Dark</button>
+  </div>
+</nav>
+
+<!-- HERO -->
+<header class="hero">
+  <h1>🔍 AI Repository Audit Report</h1>
+  <div class="hero-chips">
+    <span class="chip">📁 {esc(s.repo_name)}</span>
+    <span class="chip">📅 {esc(dts)}</span>
+    <span class="chip">📂 {esc(s.root)}</span>
+    <span class="chip">🌐 Flask / AWS Elastic Beanstalk</span>
+  </div>
+</header>
+
+<main class="wrap">
+
+<!-- ======================================================
+     OVERVIEW
+======================================================= -->
+<section id="overview" class="sec">
+  <h2 class="sec-title">📊 Repository Overview</h2>
+
+  <h3 class="sub-title">Repository Metrics</h3>
+  <div class="card-grid">
+    {self._sc("📁","Directories",    st.get("total_dirs",0),          "blue")}
+    {self._sc("📄","Total Files",    st.get("total_files",0),         "blue")}
+    {self._sc("💻","Source Files",   st.get("total_source_files",0),  "green")}
+    {self._sc("⚙️","Config Files",  st.get("total_config_files",0),  "orange")}
+    {self._sc("📚","Doc Files",      st.get("total_doc_files",0),     "purple")}
+    {self._sc("🧪","Test Files",     st.get("total_test_files",0),    "teal")}
+    {self._sc("🏗️","Infra Files",  st.get("total_infra_files",0),   "gray")}
+    {self._sc("🤖","AI Files",       st.get("total_ai_files",0),      "red")}
+  </div>
+
+  <h3 class="sub-title">AI Components</h3>
+  <div class="card-grid">
+    {self._sc("🤖","AI Agents",   st.get("total_agents",0),    "red")}
+    {self._sc("🏢","Providers",   st.get("total_providers",0), "blue")}
+    {self._sc("🧩","Models",      st.get("total_models",0),    "green")}
+    {self._sc("💬","Prompts",     st.get("total_prompts",0),   "purple")}
+    {self._sc("📦","SDKs",        st.get("total_sdks",0),      "orange")}
+    {self._sc("🔑","API Key Refs",len(s.api_keys),             "teal")}
+    {self._sc("🔧","Tools",       len(s.tools),                "gray")}
+    {self._sc("🔄","Workflows",   len(s.workflows),            "red")}
+  </div>
+
+  <h3 class="sub-title">Web / API Metrics</h3>
+  <div class="card-grid">
+    {self._sc("🌐","Routes",      st.get("total_routes",0),      "blue")}
+    {self._sc("📋","Blueprints",  st.get("total_blueprints",0),  "green")}
+    {self._sc("🏛️","Classes",   f"{st.get('total_classes',0):,}","orange")}
+    {self._sc("⚡","Functions",   f"{st.get('total_functions',0):,}","purple")}
+    {self._sc("📝","Lines",       f"{st.get('total_lines',0):,}", "teal")}
+    {self._sc("💾","Size",        fmt_size(st.get("total_size",0)),"gray")}
+    {self._sc("🐳","Docker",      st.get("total_docker_files",0), "blue")}
+    {self._sc("☸️","K8s",        st.get("total_k8s_files",0),   "orange")}
+  </div>
+</section>
+
+<!-- ======================================================
+     CHARTS
+======================================================= -->
+<section id="charts" class="sec">
+  <h2 class="sec-title">📈 Visual Analytics</h2>
+  <div class="chart-grid">
+    <div class="chart-box"><h3>Language Distribution</h3>
+      <canvas id="cLang" width="400" height="280"></canvas></div>
+    <div class="chart-box"><h3>File Categories</h3>
+      <canvas id="cCat"  width="400" height="280"></canvas></div>
+    <div class="chart-box"><h3>AI Components</h3>
+      <canvas id="cAI"   width="400" height="280"></canvas></div>
+    <div class="chart-box"><h3>Top Directories</h3>
+      <canvas id="cDir"  width="400" height="280"></canvas></div>
+  </div>
+</section>
+
+<!-- ======================================================
+     FLASK ROUTES
+======================================================= -->
+<section id="routes" class="sec">
+  <h2 class="sec-title">🌐 Flask Routes &amp; Blueprints</h2>
+  {self._routes_html()}
+</section>
+
+<!-- ======================================================
+     FILE INVENTORY
+======================================================= -->
+<section id="files" class="sec">
+  <h2 class="sec-title">📋 Complete File Inventory</h2>
+  <div class="tbl-ctrls">
+    <input id="fileQ" class="search-box" placeholder="🔍 Search files…" oninput="filterFiles()">
+    <select id="catSel" class="sel" onchange="filterFiles()">
+      <option value="">All Categories</option>
+      <option value="source">Source</option>
+      <option value="config">Config</option>
+      <option value="ai">AI</option>
+      <option value="test">Test</option>
+      <option value="infrastructure">Infrastructure</option>
+      <option value="documentation">Documentation</option>
+      <option value="frontend">Frontend</option>
+      <option value="other">Other</option>
+    </select>
+    <select id="aiSel" class="sel" onchange="filterFiles()">
+      <option value="">All Files</option>
+      <option value="1">AI Related Only</option>
+      <option value="0">Non-AI Only</option>
+    </select>
+    <span id="fCount" class="tbl-info">{len(s.files)} files</span>
+  </div>
+  <div class="tbl-wrap">
+    <table class="tbl" id="fileTbl">
+      <thead>
+        <tr>
+          <th class="sort" onclick="sortTbl('fileTbl',0)">#</th>
+          <th class="sort" onclick="sortTbl('fileTbl',1)">Path</th>
+          <th class="sort" onclick="sortTbl('fileTbl',2)">File Name</th>
+          <th class="sort" onclick="sortTbl('fileTbl',3)">Ext</th>
+          <th class="sort" onclick="sortTbl('fileTbl',4)">Language</th>
+          <th class="sort" onclick="sortTbl('fileTbl',5)">Category</th>
+          <th class="sort" onclick="sortTbl('fileTbl',6)">Purpose</th>
+          <th>Description</th>
+          <th class="sort" onclick="sortTbl('fileTbl',8)">Size</th>
+          <th class="sort" onclick="sortTbl('fileTbl',9)">Lines</th>
+          <th>Used</th>
+          <th>Ref'd</th>
+          <th>AI</th>
+          <th>Imports</th>
+        </tr>
+      </thead>
+      <tbody>
+        {self._file_rows()}
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ======================================================
+     AI AGENTS
+======================================================= -->
+<section id="agents" class="sec">
+  <h2 class="sec-title">🤖 AI Agents Detected</h2>
+  <div class="banner">
+    <div class="banner-item">
+      <span class="big-num">{st.get("total_agents",0)}</span>
+      <span class="big-lbl">Total AI Agents</span>
+    </div>
+    <div class="banner-item">
+      <span class="big-num">{st.get("total_providers",0)}</span>
+      <span class="big-lbl">Providers</span>
+    </div>
+    <div class="banner-item">
+      <span class="big-num">{st.get("total_models",0)}</span>
+      <span class="big-lbl">Models</span>
+    </div>
+    <div class="banner-item">
+      <span class="big-num">{st.get("total_sdks",0)}</span>
+      <span class="big-lbl">SDKs</span>
+    </div>
+  </div>
+  {self._agents_html(agents)}
+</section>
+
+<!-- ======================================================
+     PROVIDERS
+======================================================= -->
+<section id="providers" class="sec">
+  <h2 class="sec-title">🏢 AI Providers</h2>
+  {self._providers_html()}
+</section>
+
+<!-- ======================================================
+     MODELS
+======================================================= -->
+<section id="models" class="sec">
+  <h2 class="sec-title">🧩 AI Models</h2>
+  {self._models_html()}
+</section>
+
+<!-- ======================================================
+     PROMPTS
+======================================================= -->
+<section id="prompts" class="sec">
+  <h2 class="sec-title">💬 Prompt Inventory</h2>
+  {self._prompts_html()}
+</section>
+
+<!-- ======================================================
+     SDKs
+======================================================= -->
+<section id="sdks" class="sec">
+  <h2 class="sec-title">📦 AI SDKs &amp; Frameworks</h2>
+  {self._sdks_html()}
+</section>
+
+<!-- ======================================================
+     API KEYS
+======================================================= -->
+<section id="apikeys" class="sec">
+  <h2 class="sec-title">🔑 API Key &amp; Environment Variable References</h2>
+  {self._keys_html()}
+</section>
+
+<!-- ======================================================
+     TOKEN / REQUEST USAGE
+======================================================= -->
+<section id="tokens" class="sec">
+  <h2 class="sec-title">🎯 Token &amp; Request Usage Analysis</h2>
+  {self._tokens_html()}
+</section>
+
+<!-- ======================================================
+     TOOLS
+======================================================= -->
+<section id="tools" class="sec">
+  <h2 class="sec-title">🔧 Tools Detected</h2>
+  {self._tools_html()}
+</section>
+
+<!-- ======================================================
+     WORKFLOWS
+======================================================= -->
+<section id="workflows" class="sec">
+  <h2 class="sec-title">🔄 Workflows &amp; Patterns Detected</h2>
+  {self._workflows_html()}
+</section>
+
+<!-- ======================================================
+     DEPENDENCIES
+======================================================= -->
+<section id="deps" class="sec">
+  <h2 class="sec-title">🔗 Dependency Analysis</h2>
+  {self._deps_html()}
+</section>
+
+<!-- ======================================================
+     UNUSED FILES
+======================================================= -->
+<section id="unused" class="sec">
+  <h2 class="sec-title">⚠️ Potentially Unused Files</h2>
+  {self._unused_html(unused)}
+</section>
+
+<!-- ======================================================
+     DIRECTORY TREE
+======================================================= -->
+<section id="tree" class="sec">
+  <h2 class="sec-title">🌲 Directory Structure</h2>
+  <pre class="tree-pre">{esc(self._build_tree())}</pre>
+</section>
+
+</main>
+
+<footer class="footer">
+  <p>🤖 AI Repository Audit Tool &nbsp;|&nbsp; {esc(dts)}</p>
+  <p>Repository: <strong>{esc(s.repo_name)}</strong> &nbsp;|&nbsp;
+     Root: <code>{esc(s.root)}</code></p>
+  <p>⚠️ Static analysis only — no code was executed.</p>
+</footer>
+
+<!-- EXPORT MODAL -->
+<div id="exportModal" class="modal-bg" style="display:none">
+  <div class="modal-box">
+    <h3>📤 Export Report</h3>
+    <div class="exp-list">
+      <button class="exp-btn" onclick="exportHTML()">📄 Save as HTML</button>
+      <button class="exp-btn" onclick="exportJSON()">📊 Save as JSON</button>
+      <button class="exp-btn" onclick="exportCSV()">📋 Save as CSV</button>
+      <button class="exp-btn" onclick="window.print()">🖨️ Print / PDF</button>
+    </div>
+    <button class="btn-close" onclick="hideExport()">✕ Close</button>
+  </div>
+</div>
+
+<script>
+{self._js_data(lang_labels, lang_values, cat_data)}
+{_JS}
+</script>
+</body>
+</html>"""
+
+    # ── Helpers ───────────────────────────────────────────────
+
+    def _sc(self, icon: str, label: str, value: Any, color: str) -> str:
+        return (f'<div class="sc {color}">'
+                f'<span class="sc-icon">{icon}</span>'
+                f'<span class="sc-val">{esc(str(value))}</span>'
+                f'<span class="sc-lbl">{esc(label)}</span>'
+                f'</div>')
+
+    def _dedup_agents(self) -> List[Dict]:
+        seen: set = set()
+        out:  List[Dict] = []
+        for a in self.s.agents:
+            k = (a.get("name",""), a.get("file",""))
+            if k not in seen:
+                seen.add(k)
+                out.append(a)
+        return out
+
+    # ── Flask routes ──────────────────────────────────────────
+
+    def _routes_html(self) -> str:
+        s = self.s
+        if not s.routes and not s.blueprints:
+            return '<div class="empty">🌐 No Flask routes detected.</div>'
+
+        METHOD_ORDER = {"GET":0,"POST":1,"PUT":2,"DELETE":3,"PATCH":4,"ROUTE":5}
+
+        # Blueprints
+        bp_html = ""
+        if s.blueprints:
+            bps = " ".join(f'<span class="b b-blue">{esc(b)}</span>'
+                           for b in s.blueprints)
+            bp_html = f'<div style="margin-bottom:14px;"><span class="lbl">Registered Blueprints: </span>{bps}</div>'
+
+        # Group routes by file
+        by_file: Dict[str, List[Dict]] = defaultdict(list)
+        for r in s.routes:
+            by_file[r["file"]].append(r)
+
+        cards = []
+        for filepath, routes in sorted(by_file.items()):
+            routes_sorted = sorted(routes, key=lambda r: (
+                METHOD_ORDER.get(r["method"].upper(), 5), r["path"]))
+            for r in routes_sorted:
+                m = r["method"].upper()
+                cards.append(
+                    f'<div class="route-card">'
+                    f'<span class="route-method {m}">{esc(m)}</span>'
+                    f'<div><div class="route-path">{esc(r["path"])}</div>'
+                    f'<div class="route-file">📄 {esc(r["file"])}</div></div>'
+                    f'</div>'
+                )
+
+        return (f'{bp_html}'
+                f'<div class="sub-title">Routes ({len(s.routes)} total)</div>'
+                f'<div class="route-grid">{"".join(cards)}</div>')
+
+    # ── File rows ─────────────────────────────────────────────
+
+    def _file_rows(self) -> str:
+        CAT = {
+            "source":"b-blue","config":"b-orange","ai":"b-red",
+            "test":"b-teal","infrastructure":"b-gray","documentation":"b-purple",
+            "other":"b-gray","frontend":"b-pink","database":"b-yellow",
+            "template":"b-purple","api":"b-blue",
+        }
+        rows = []
+        for f in self.s.files:
+            cat  = f.get("category","other")
+            cb   = CAT.get(cat,"b-gray")
+            ai   = f.get("is_ai_related",False)
+            used = f.get("is_used",False)
+            ref  = f.get("is_referenced",False)
+            desc = self._desc(f)
+            imps = " ".join(
+                f'<span class="b b-gray">{esc(i)}</span>'
+                for i in f.get("imports",[])[:4]
+            )
+            rows.append(
+                f'<tr data-cat="{cat}" data-ai="{"1" if ai else "0"}">'
+                f'<td>{f["serial"]}</td>'
+                f'<td class="mono sm grey" title="{esc(f["rel_path"])}">'
+                f'{esc(trunc(f["rel_path"],50))}</td>'
+                f'<td><strong>{esc(f["filename"])}</strong></td>'
+                f'<td><span class="b b-gray">{esc(f.get("extension",""))}</span></td>'
+                f'<td>{esc(f.get("language","?"))}</td>'
+                f'<td><span class="b {cb}">{esc(cat)}</span></td>'
+                f'<td><span class="b b-blue">{esc(f.get("purpose","?"))}</span></td>'
+                f'<td class="sm grey">{esc(trunc(desc,65))}</td>'
+                f'<td>{esc(f.get("size_fmt","0 B"))}</td>'
+                f'<td>{f.get("lines",0):,}</td>'
+                f'<td><span class="b {"b-yes" if used else "b-no"}">{"✓" if used else "—"}</span></td>'
+                f'<td><span class="b {"b-yes" if ref  else "b-no"}">{"✓" if ref  else "—"}</span></td>'
+                f'<td><span class="b {"b-red" if ai else "b-no"}">{"🤖" if ai else "—"}</span></td>'
+                f'<td><div class="tag-row">{imps}</div></td>'
+                f'</tr>'
+            )
+        return "\n".join(rows)
+
+    def _desc(self, f: Dict) -> str:
+        parts = [f"{f.get('language','?')} {f.get('purpose','?')}."]
+        cls = f.get("classes",  [])
+        fn  = f.get("functions",[])
+        rts = f.get("routes",   [])
+        if cls: parts.append(f"{len(cls)} class(es): {', '.join(cls[:3])}.")
+        if fn:  parts.append(f"{len(fn)} function(s).")
+        if rts: parts.append(f"{len(rts)} route(s).")
+        m = f.get("models_found",   [])
+        p = f.get("providers_found",[])
+        k = f.get("sdks_found",     [])
+        ai_p = []
+        if m: ai_p.append(f"Model: {', '.join(m[:2])}")
+        if p: ai_p.append(f"Provider: {', '.join(p[:2])}")
+        if k: ai_p.append(f"SDK: {', '.join(k[:2])}")
+        if ai_p: parts.append(" | ".join(ai_p))
+        if f.get("has_tests"): parts.append("Tests included.")
+        return " ".join(parts)
+
+    # ── Agents ────────────────────────────────────────────────
+
+    def _agents_html(self, agents: List[Dict]) -> str:
+        if not agents:
+            return '<div class="empty">🤖 No AI agents detected in this repository.</div>'
+        cards = []
+        for a in agents:
+            def tags(lst, cls):
+                return ("".join(f'<span class="b {cls}">{esc(x)}</span>'
+                                for x in (lst or [])[:3])
+                        or '<span class="b b-gray">Not Detected</span>')
+            cards.append(
+                f'<div class="agent-card">'
+                f'<div class="ac-head">'
+                f'<div class="ac-icon">🤖</div>'
+                f'<div><div class="ac-name">{esc(a.get("name","?"))}</div>'
+                f'<div class="ac-type">{esc(a.get("type","?"))}</div></div></div>'
+                f'<div class="lbl">Purpose</div>'
+                f'<div class="val mt4">{esc(a.get("purpose","?"))}</div>'
+                f'<div class="lbl mt8">🧩 Models</div>'
+                f'<div class="tag-row mt4">{tags(a.get("models"),"b-blue")}</div>'
+                f'<div class="lbl mt8">🏢 Providers</div>'
+                f'<div class="tag-row mt4">{tags(a.get("providers"),"b-green")}</div>'
+                f'<div class="lbl mt8">📦 SDKs / Frameworks</div>'
+                f'<div class="tag-row mt4">{tags(a.get("sdks"),"b-purple")}</div>'
+                f'<div class="ac-file">📄 {esc(a.get("file","?"))}</div>'
+                f'</div>'
+            )
+        return f'<div class="agent-grid">{"".join(cards)}</div>'
+
+    # ── Providers ─────────────────────────────────────────────
+
+    def _providers_html(self) -> str:
+        ICONS = {
+            "OpenAI":"🟢","Azure OpenAI":"🔵","Anthropic":"🟠",
+            "Google Gemini":"🔴","Google Vertex AI":"🔴","AWS Bedrock":"🟡",
+            "AWS":"🟡","Meta Llama":"🩵","Mistral":"🔮","Groq":"⚡",
+            "Cohere":"🌊","Ollama":"🦙","OpenRouter":"🛣️",
+            "HuggingFace":"🤗","DeepSeek":"🐋","Perplexity":"🔍",
+            "Together AI":"🤝","Replicate":"🔁","xAI":"🌟","Local LLM":"🖥️",
+            "Google":"🔴","Application":"⚙️","Database":"🗄️","Flask":"🌶️",
+        }
+        if not self.s.providers:
+            return '<div class="empty">🏢 No AI providers detected.</div>'
+        cards = []
+        for pname, pi in self.s.providers.items():
+            env = ("".join(f'<span class="b b-teal">{esc(v)}</span>'
+                           for v in pi.get("env_vars",[])[:3])
+                   or '<span class="b b-gray">Not detected</span>')
+            cards.append(
+                f'<div class="prov-card">'
+                f'<div class="prov-icon">{ICONS.get(pname,"🏢")}</div>'
+                f'<div class="prov-name">{esc(pname)}</div>'
+                f'<div class="prov-stats">'
+                f'<div><span class="big-num sm2">{pi.get("count",0)}</span>'
+                f'<div class="lbl">Refs</div></div>'
+                f'<div><span class="big-num sm2">{len(pi.get("files",[]))}</span>'
+                f'<div class="lbl">Files</div></div>'
+                f'</div>'
+                f'<div class="lbl mt8">API Key Variables</div>'
+                f'<div class="tag-row mt4">{env}</div>'
+                f'</div>'
+            )
+        return f'<div class="prov-grid">{"".join(cards)}</div>'
+
+    # ── Models ────────────────────────────────────────────────
+
+    def _models_html(self) -> str:
+        if not self.s.models:
+            return '<div class="empty">🧩 No AI models detected.</div>'
+        rows = []
+        for i,(mn,mi) in enumerate(
+                sorted(self.s.models.items(),
+                       key=lambda x: x[1]["count"], reverse=True), 1):
+            fhtml = " ".join(
+                f'<span class="b b-gray">{esc(trunc(f,35))}</span>'
+                for f in mi.get("files",[])[:3]
+            )
+            rows.append(
+                f'<tr><td>{i}</td><td><strong>{esc(mn)}</strong></td>'
+                f'<td><span class="b b-green">{esc(mi.get("provider","?"))}</span></td>'
+                f'<td><strong>{mi.get("count",0)}</strong></td>'
+                f'<td><div class="tag-row">{fhtml}</div></td></tr>'
+            )
+        return (f'<div class="tbl-wrap"><table class="tbl">'
+                f'<thead><tr><th>#</th><th>Model</th><th>Provider</th>'
+                f'<th>References</th><th>Files</th></tr></thead>'
+                f'<tbody>{"".join(rows)}</tbody></table></div>')
+
+    # ── Prompts ───────────────────────────────────────────────
+
+    def _prompts_html(self) -> str:
+        seen: set = set(); uniq: List[Dict] = []
+        for p in self.s.prompts:
+            k = (p.get("file",""), p.get("type",""))
+            if k not in seen:
+                seen.add(k); uniq.append(p)
+        if not uniq:
+            return '<div class="empty">💬 No prompts detected.</div>'
+        TYPE_CLS = {
+            "System Prompt":"b-red","User Prompt":"b-blue",
+            "Prompt Template":"b-purple","Markdown Prompt":"b-green",
+            "Prompt File":"b-orange","Inline Prompt":"b-teal",
+        }
+        cards = []
+        for p in uniq:
+            pt  = p.get("type","?")
+            cls = TYPE_CLS.get(pt,"b-gray")
+            cards.append(
+                f'<div class="prompt-card">'
+                f'<span class="b {cls}">{esc(pt)}</span>'
+                f'<div class="pname">{esc(p.get("name","?"))}</div>'
+                f'<div class="sm grey">Purpose: {esc(p.get("purpose","?"))}</div>'
+                f'<div class="mono sm blue-t mt4">📄 {esc(p.get("file","?"))}</div>'
+                f'</div>'
+            )
+        return f'<div class="prompt-grid">{"".join(cards)}</div>'
+
+    # ── SDKs ──────────────────────────────────────────────────
+
+    def _sdks_html(self) -> str:
+        ICONS = {
+            "OpenAI SDK":"🟢","LangChain":"🔗","LangGraph":"🕸️",
+            "Semantic Kernel":"🔮","AutoGen":"🤖","CrewAI":"👥",
+            "LlamaIndex":"🦙","Haystack":"🌾","DSPy":"📡",
+            "HuggingFace Transformers":"🤗","LiteLLM":"⚡","Instructor":"📐",
+            "Ollama SDK":"🦙","Anthropic SDK":"🟠","Google GenAI SDK":"🔴",
+            "Groq SDK":"⚡","Boto3 (AWS SDK)":"☁️","Cohere SDK":"🌊",
+            "Mistral SDK":"🔮","Pydantic AI":"🐍","SmolAgents":"🤗",
+            "Mem0":"🧠","Requests (HTTP client)":"🌐","HTTPX (HTTP client)":"🌐",
+            "aiohttp":"🌐","Phidata":"📊","Agno":"🔮",
+        }
+        if not self.s.sdks:
+            return '<div class="empty">📦 No AI SDKs detected.</div>'
+        cards = []
+        for sname, si in sorted(self.s.sdks.items(),
+                                 key=lambda x: x[1]["count"], reverse=True):
+            cards.append(
+                f'<div class="sdk-card">'
+                f'<div class="sdk-icon">{ICONS.get(sname,"📦")}</div>'
+                f'<div class="sdk-name">{esc(sname)}</div>'
+                f'<div class="sm grey">{esc(si.get("provider","?"))}</div>'
+                f'<span class="b b-blue">{si.get("count",0)} refs</span>'
+                f'<div class="sm grey mt4">{len(si.get("files",[]))} file(s)</div>'
+                f'</div>'
+            )
+        return f'<div class="sdk-grid">{"".join(cards)}</div>'
+
+    # ── API keys ──────────────────────────────────────────────
+
+    def _keys_html(self) -> str:
+        seen: set = set(); uniq: List[Dict] = []
+        for k in self.s.api_keys:
+            if k["variable"] not in seen:
+                seen.add(k["variable"]); uniq.append(k)
+        if not uniq:
+            return '<div class="empty">🔑 No API key or environment variable references detected.</div>'
+        rows = []
+        for i, k in enumerate(uniq, 1):
+            files = [ak["file"] for ak in self.s.api_keys
+                     if ak["variable"] == k["variable"]]
+            fhtml = " ".join(
+                f'<span class="b b-gray">{esc(trunc(f,30))}</span>'
+                for f in files[:3]
+            )
+            rows.append(
+                f'<tr><td>{i}</td>'
+                f'<td><code class="mono sm">{esc(k.get("variable",""))}</code></td>'
+                f'<td><span class="b b-blue">{esc(k.get("provider","?"))}</span></td>'
+                f'<td><div class="tag-row">{fhtml}</div></td>'
+                f'<td><span class="b b-teal">{esc(k.get("loaded_from","?"))}</span></td>'
+                f'</tr>'
+            )
+        return (f'<div class="tbl-wrap"><table class="tbl">'
+                f'<thead><tr><th>#</th><th>Variable</th><th>Provider / Purpose</th>'
+                f'<th>Files</th><th>Loaded From</th></tr></thead>'
+                f'<tbody>{"".join(rows)}</tbody></table></div>')
+
+    # ── Token analysis ────────────────────────────────────────
+
+    def _tokens_html(self) -> str:
+        tfiles = [(f, f["token_config"])
+                  for f in self.s.files if f.get("token_config")]
+
+        static = ""
+        if tfiles:
+            rows = []
+            for f, cfg in tfiles:
+                def v(k): return cfg.get(k, '<span class="na">Not Set</span>')
+                rows.append(
+                    f'<tr>'
+                    f'<td class="mono sm">{esc(trunc(f["rel_path"],45))}</td>'
+                    f'<td>{v("max_tokens")}</td>'
+                    f'<td>{v("temperature")}</td>'
+                    f'<td>{v("top_p")}</td>'
+                    f'<td>{v("context_window")}</td>'
+                    f'<td>{v("timeout")}</td>'
+                    f'<td>{v("max_retries")}</td>'
+                    f'</tr>'
+                )
+            static = (f'<h3 class="sub-title">Static Configuration Discovered</h3>'
+                      f'<div class="tbl-wrap"><table class="tbl">'
+                      f'<thead><tr><th>File</th><th>Max Tokens</th>'
+                      f'<th>Temperature</th><th>Top P</th>'
+                      f'<th>Context Window</th><th>Timeout(s)</th>'
+                      f'<th>Max Retries</th></tr></thead>'
+                      f'<tbody>{"".join(rows)}</tbody></table></div>')
+        else:
+            static = ('<div class="empty">No explicit token configuration '
+                      'found in source code. SDK defaults apply.</div>')
+
+        runtime_rows = "\n".join(
+            f'<tr><td>{m}</td>'
+            f'<td><span class="na">Not Available from Source Code</span></td>'
+            f'<td class="grey sm">{n}</td></tr>'
+            for m, n in [
+                ("Current Tokens Used",      "Requires runtime API call"),
+                ("Today's Tokens Used",      "Requires provider dashboard"),
+                ("Monthly Tokens Used",      "Requires provider dashboard"),
+                ("Remaining Token Quota",    "Requires provider dashboard"),
+                ("Token Usage Percentage",   "Requires runtime metrics"),
+                ("Estimated Cost",           "Requires token count + pricing data"),
+                ("Requests Per Minute",      "Requires runtime monitoring"),
+                ("Requests Per Day",         "Requires runtime monitoring"),
+                ("Requests Per Month",       "Requires runtime monitoring"),
+                ("Current Requests Used",    "Requires provider dashboard"),
+                ("Remaining Requests",       "Requires provider dashboard"),
+                ("Rate Limits",              "Requires provider API / dashboard"),
+                ("Retry / Backoff Logic",    "Check source for max_retries / backoff"),
+            ]
         )
-    r = _last_result
-    return jsonify(
-        status=          "ok",
-        scanning=        _scan_running,
-        scan_date=       r.scan_date,
-        repo_name=       r.repo_name,
-        root_path=       r.root_path,
-        total_files=     r.total_files,
-        total_dirs=      r.total_dirs,
-        total_agents=    r.total_agents,
-        total_providers= r.total_providers,
-        total_models=    r.total_models,
-        total_prompts=   r.total_prompts,
-        total_sdks=      r.total_sdks,
-        total_tools=     r.total_tools,
-        total_api_keys=  r.total_api_keys,
-        total_workflows= r.total_workflows,
-        total_classes=   r.total_classes,
-        total_functions= r.total_functions,
-        total_endpoints= r.total_endpoints,
-        ai_files=        r.ai_files,
-        errors=          r.errors,
+        return f"""
+<div class="info-box">
+  <strong>⚠️ Runtime Usage Note</strong><br>
+  Token counts, request counts, remaining quota, and cost estimates
+  <strong>cannot be determined from static code analysis alone</strong>.
+  They are marked as <em>Not Available from Source Code</em>.
+</div>
+{static}
+<h3 class="sub-title">Runtime Metrics</h3>
+<div class="tbl-wrap">
+  <table class="tbl">
+    <thead><tr><th>Metric</th><th>Value</th><th>Notes</th></tr></thead>
+    <tbody>{runtime_rows}</tbody>
+  </table>
+</div>"""
+
+    # ── Tools ─────────────────────────────────────────────────
+
+    def _tools_html(self) -> str:
+        ICONS = {
+            "Web Search":"🌐","Database":"🗄️","Vector Store":"📊",
+            "RAG":"📚","HTTP Calls":"🌐","Email":"📧","Slack":"💬",
+            "GitHub":"🐙","Filesystem":"📁","Shell":"⌨️","Memory":"🧠",
+            "Monitoring":"📊","AWS Services":"☁️","Flask/Web":"🌶️",
+            "Scheduling":"⏰","Code Runner":"🐍","Calculator":"🧮",
+        }
+        if not self.s.tools:
+            return '<div class="empty">🔧 No tools detected.</div>'
+        cards = []
+        for tname, files in sorted(self.s.tools.items(),
+                                    key=lambda x: len(x[1]), reverse=True):
+            uf = list(set(files))
+            fh = "".join(
+                f'<div class="mono sm grey">{esc(trunc(f,40))}</div>'
+                for f in uf[:3]
+            )
+            cards.append(
+                f'<div class="tool-card">'
+                f'<div class="tool-name">{ICONS.get(tname,"🔧")} {esc(tname)}</div>'
+                f'<div class="sm grey">{len(uf)} file(s)</div>'
+                f'{fh}'
+                f'</div>'
+            )
+        return f'<div class="tool-grid">{"".join(cards)}</div>'
+
+    # ── Workflows ─────────────────────────────────────────────
+
+    def _workflows_html(self) -> str:
+        ICONS = {
+            "Planning":"📋","Execution":"⚡","Reflection":"🪞",
+            "Retry / Backoff":"🔁","Evaluation":"⚖️","Memory":"🧠",
+            "RAG":"📚","Tool Calling":"🔧","Streaming":"📡",
+            "Multi-agent":"👥","Supervisor":"👁️",
+            "Monitoring Loop":"🔄","Webhook":"🪝","Alert":"🚨",
+        }
+        if not self.s.workflows:
+            return '<div class="empty">🔄 No workflow patterns detected.</div>'
+        cards = []
+        for wname, files in sorted(self.s.workflows.items(),
+                                    key=lambda x: len(x[1]), reverse=True):
+            uf    = list(set(files))
+            ftags = "".join(
+                f'<span class="b b-teal">{esc(trunc(f,28))}</span>'
+                for f in uf[:2]
+            )
+            cards.append(
+                f'<div class="wf-card">'
+                f'<div class="tool-name">{ICONS.get(wname,"🔄")} {esc(wname)}</div>'
+                f'<div class="sm grey">{len(uf)} file(s)</div>'
+                f'<div class="tag-row mt4">{ftags}</div>'
+                f'</div>'
+            )
+        return f'<div class="tool-grid">{"".join(cards)}</div>'
+
+    # ── Dependencies ──────────────────────────────────────────
+
+    def _deps_html(self) -> str:
+        all_imps: List[str] = []
+        for f in self.s.files:
+            all_imps.extend(f.get("imports",[]))
+        top = Counter(all_imps).most_common(20)
+
+        pkg_rows = "\n".join(
+            f'<tr><td>{i}</td>'
+            f'<td><code class="mono sm">{esc(pkg)}</code></td>'
+            f'<td><strong>{cnt}</strong></td>'
+            f'<td><div style="background:var(--primary);height:7px;border-radius:4px;'
+            f'width:{min(100,cnt*6)}%;max-width:160px;"></div></td></tr>'
+            for i,(pkg,cnt) in enumerate(top,1)
+        ) or '<tr><td colspan="4">No imports detected</td></tr>'
+
+        heavy = sorted(
+            [(f, len(f.get("imports",[])))
+             for f in self.s.files if f.get("imports")],
+            key=lambda x: x[1], reverse=True
+        )[:10]
+        heavy_rows = "\n".join(
+            f'<tr>'
+            f'<td class="mono sm">{esc(trunc(f["rel_path"],45))}</td>'
+            f'<td><strong>{cnt}</strong></td>'
+            f'<td><div class="tag-row">'
+            f'{"".join(f"<span class=&quot;b b-gray&quot;>{esc(i)}</span>" for i in f.get("imports",[])[:5])}'
+            f'</div></td></tr>'
+            for f,cnt in heavy
+        ) or '<tr><td colspan="3">—</td></tr>'
+
+        return f"""
+<h3 class="sub-title">Most Used Packages</h3>
+<div class="tbl-wrap">
+  <table class="tbl">
+    <thead><tr><th>#</th><th>Package</th><th>Uses</th><th>Frequency</th></tr></thead>
+    <tbody>{pkg_rows}</tbody>
+  </table>
+</div>
+<h3 class="sub-title">Files With Most Dependencies</h3>
+<div class="tbl-wrap">
+  <table class="tbl">
+    <thead><tr><th>File</th><th>Import Count</th><th>Top Imports</th></tr></thead>
+    <tbody>{heavy_rows}</tbody>
+  </table>
+</div>"""
+
+    # ── Unused ────────────────────────────────────────────────
+
+    def _unused_html(self, unused: List[Dict]) -> str:
+        if not unused:
+            return '<div class="empty">✅ No potentially unused source files detected.</div>'
+        note = (f'<p class="grey sm" style="margin-bottom:10px;">'
+                f'⚠️ These source files have no detected static references. '
+                f'They may still be used dynamically. Manual verification recommended. '
+                f'Showing {min(60,len(unused))} of {len(unused)} file(s).</p>')
+        items = "".join(
+            f'<div class="unused-item">⚠️ {esc(f["rel_path"])}</div>'
+            for f in unused[:60]
+        )
+        return f'{note}<div class="unused-grid">{items}</div>'
+
+    # ── Directory tree ────────────────────────────────────────
+
+    def _build_tree(self) -> str:
+        s = self.s
+
+        def walk(path: str, prefix: str = "") -> List[str]:
+            lines: List[str] = []
+            try:
+                entries = sorted(
+                    os.scandir(path),
+                    key=lambda e: (not e.is_dir(), e.name.lower()),
+                )
+            except PermissionError:
+                return lines
+            entries = [e for e in entries if e.name not in IGNORED_DIRS]
+            for idx, entry in enumerate(entries):
+                last = idx == len(entries) - 1
+                conn = "└── " if last else "├── "
+                ext  = "    " if last else "│   "
+                if entry.is_dir():
+                    lines.append(f"{prefix}{conn}📁 {entry.name}/")
+                    sub = walk(entry.path, prefix + ext)
+                    lines.extend(sub[:70])
+                    if len(sub) > 70:
+                        lines.append(f"{prefix}{ext}    … ({len(sub)-70} more)")
+                else:
+                    sfx  = Path(entry.name).suffix.lower()
+                    lang = EXTENSION_MAP.get(sfx, ("?",""))[0]
+                    try:
+                        sz = fmt_size(entry.stat().st_size)
+                    except Exception:
+                        sz = "?"
+                    lines.append(f"{prefix}{conn}{entry.name}  [{lang}] ({sz})")
+            return lines
+
+        tree = [f"📂 {s.repo_name}/"] + walk(s.root)
+        if len(tree) > 500:
+            tree = tree[:500]
+            tree.append(
+                f"\n… truncated at 500 lines "
+                f"({s.stats.get('total_files',0)} total files)"
+            )
+        return "\n".join(tree)
+
+    # ── Embedded JS data ──────────────────────────────────────
+
+    def _js_data(self, lang_labels: List, lang_values: List,
+                 cat_data: Counter) -> str:
+        s  = self.s
+        st = s.stats
+
+        cat_labels = list(cat_data.keys())
+        cat_values = list(cat_data.values())
+
+        ai_labels = ["Agents","Providers","Models","Prompts","SDKs","API Keys","Tools","Routes"]
+        ai_values = [
+            st.get("total_agents",0),    st.get("total_providers",0),
+            st.get("total_models",0),    st.get("total_prompts",0),
+            st.get("total_sdks",0),      len(set(k["variable"] for k in s.api_keys)),
+            len(s.tools),                st.get("total_routes",0),
+        ]
+
+        dir_cnt: Counter = Counter()
+        for f in s.files:
+            parts = f["rel_path"].replace("\\", "/").split("/")
+            dir_cnt[parts[0] if len(parts) > 1 else "(root)"] += 1
+        top_dirs  = dir_cnt.most_common(8)
+        dir_labels = [d[0] for d in top_dirs]
+        dir_values = [d[1] for d in top_dirs]
+
+        slim = [{
+            "serial":    f["serial"],
+            "rel_path":  f["rel_path"],
+            "filename":  f["filename"],
+            "extension": f["extension"],
+            "language":  f["language"],
+            "category":  f["category"],
+            "purpose":   f["purpose"],
+            "size":      f["size"],
+            "lines":     f["lines"],
+            "is_ai":     f["is_ai_related"],
+            "is_used":   f["is_used"],
+            "models":    f.get("models_found", []),
+            "providers": f.get("providers_found", []),
+            "sdks":      f.get("sdks_found", []),
+        } for f in s.files]
+
+        summary = {
+            "repository":  s.repo_name,
+            "root":        s.root,
+            "scan_date":   s.scan_date,
+            "stats":       {k: v for k, v in st.items() if not isinstance(v, dict)},
+            "agents":      s.agents[:50],
+            "providers":   {k: {"count": v["count"], "env_vars": v["env_vars"]}
+                            for k, v in s.providers.items()},
+            "models":      {k: {"provider": v["provider"], "count": v["count"]}
+                            for k, v in s.models.items()},
+            "sdks":        {k: {"provider": v["provider"], "count": v["count"]}
+                            for k, v in s.sdks.items()},
+            "routes":      s.routes[:100],
+            "blueprints":  s.blueprints,
+        }
+
+        return (
+            f"const langLabels={json.dumps(lang_labels)};\n"
+            f"const langValues={json.dumps(lang_values)};\n"
+            f"const catLabels={json.dumps(cat_labels)};\n"
+            f"const catValues={json.dumps(cat_values)};\n"
+            f"const aiLabels={json.dumps(ai_labels)};\n"
+            f"const aiValues={json.dumps(ai_values)};\n"
+            f"const dirLabels={json.dumps(dir_labels)};\n"
+            f"const dirValues={json.dumps(dir_values)};\n"
+            f"const allFiles={json.dumps(slim)};\n"
+            f"const auditSummary={json.dumps(summary, default=str)};\n"
+        )
+
+
+# ──────────────────────────────────────────────────────────────
+# ADDITIONAL EXPORTERS
+# ──────────────────────────────────────────────────────────────
+
+class Exporters:
+
+    def __init__(self, s: RepoScanner) -> None:
+        self.s = s
+
+    def to_json(self, path: str) -> None:
+        s = self.s
+        data = {
+            "repository": {
+                "name": s.repo_name, "root": s.root, "scan_date": s.scan_date,
+            },
+            "statistics": {k: v for k, v in s.stats.items()
+                           if not isinstance(v, dict)},
+            "files": [{
+                "serial":       f["serial"],
+                "path":         f["rel_path"],
+                "filename":     f["filename"],
+                "extension":    f["extension"],
+                "language":     f["language"],
+                "category":     f["category"],
+                "purpose":      f["purpose"],
+                "size":         f["size"],
+                "lines":        f["lines"],
+                "is_ai":        f["is_ai_related"],
+                "is_used":      f["is_used"],
+                "is_referenced":f["is_referenced"],
+                "classes":      f.get("classes",[])[:10],
+                "functions":    f.get("functions",[])[:10],
+                "imports":      f.get("imports",[])[:10],
+                "routes":       f.get("routes",[]),
+                "models":       f.get("models_found",[]),
+                "providers":    f.get("providers_found",[]),
+                "sdks":         f.get("sdks_found",[]),
+                "token_config": f.get("token_config",{}),
+            } for f in s.files],
+            "ai_agents":   s.agents,
+            "ai_providers":{k: {"count": v["count"], "files": v["files"][:5],
+                                "env_vars": v["env_vars"]}
+                            for k,v in s.providers.items()},
+            "ai_models":   {k: {"provider": v["provider"], "count": v["count"],
+                                "files": v["files"][:5]}
+                            for k,v in s.models.items()},
+            "ai_sdks":     {k: {"provider": v["provider"], "count": v["count"],
+                                "files": v["files"][:5]}
+                            for k,v in s.sdks.items()},
+            "prompts":     s.prompts[:100],
+            "api_keys":    s.api_keys[:80],
+            "routes":      s.routes[:200],
+            "blueprints":  s.blueprints,
+        }
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2, default=str)
+        print(f"[✓] JSON → {path}")
+
+    def to_csv(self, path: str) -> None:
+        fields = [
+            "Serial","Relative Path","File Name","Extension","Language",
+            "Category","Purpose","Size (bytes)","Lines",
+            "Is Used","Is Referenced","Is AI Related",
+            "Classes","Functions","Routes","Models","Providers","SDKs","Imports",
+            "Token Config",
+        ]
+        with open(path, "w", newline="", encoding="utf-8") as fh:
+            w = csv.DictWriter(fh, fieldnames=fields)
+            w.writeheader()
+            for f in self.s.files:
+                w.writerow({
+                    "Serial":        f["serial"],
+                    "Relative Path": f["rel_path"],
+                    "File Name":     f["filename"],
+                    "Extension":     f["extension"],
+                    "Language":      f["language"],
+                    "Category":      f["category"],
+                    "Purpose":       f["purpose"],
+                    "Size (bytes)":  f["size"],
+                    "Lines":         f["lines"],
+                    "Is Used":       f["is_used"],
+                    "Is Referenced": f["is_referenced"],
+                    "Is AI Related": f["is_ai_related"],
+                    "Classes":       "; ".join(f.get("classes",[])),
+                    "Functions":     "; ".join(f.get("functions",[])[:10]),
+                    "Routes":        "; ".join(
+                        f'{r["method"]} {r["path"]}'
+                        for r in f.get("routes",[])
+                    ),
+                    "Models":        "; ".join(f.get("models_found",[])),
+                    "Providers":     "; ".join(f.get("providers_found",[])),
+                    "SDKs":          "; ".join(f.get("sdks_found",[])),
+                    "Imports":       "; ".join(f.get("imports",[])[:10]),
+                    "Token Config":  json.dumps(f.get("token_config",{})),
+                })
+        print(f"[✓] CSV  → {path}")
+
+    def to_markdown(self, path: str) -> None:
+        s  = self.s
+        st = s.stats
+        dt = datetime.datetime.fromisoformat(s.scan_date).strftime(
+            "%B %d, %Y %H:%M:%S")
+
+        lines = [
+            "# AI Repository Audit Report", "",
+            f"**Repository:** {s.repo_name}  ",
+            f"**Root:** `{s.root}`  ",
+            f"**Date:** {dt}  ",
+            f"**Framework:** Flask / AWS Elastic Beanstalk  ", "",
+            "---", "", "## Repository Summary", "",
+            "| Metric | Value |", "|--------|-------|",
+        ]
+        for k, v in [
+            ("Total Directories",    st.get("total_dirs",0)),
+            ("Total Files",          st.get("total_files",0)),
+            ("Source Files",         st.get("total_source_files",0)),
+            ("Config Files",         st.get("total_config_files",0)),
+            ("Documentation Files",  st.get("total_doc_files",0)),
+            ("Test Files",           st.get("total_test_files",0)),
+            ("Infrastructure Files", st.get("total_infra_files",0)),
+            ("AI Related Files",     st.get("total_ai_files",0)),
+            ("Total Lines of Code",  f"{st.get('total_lines',0):,}"),
+            ("Total Size",           fmt_size(st.get("total_size",0))),
+        ]:
+            lines.append(f"| {k} | {v} |")
+
+        lines += ["", "## AI Components", "",
+                  "| Component | Count |", "|-----------|-------|"]
+        for k, v in [
+            ("AI Agents",    st.get("total_agents",0)),
+            ("Providers",    st.get("total_providers",0)),
+            ("Models",       st.get("total_models",0)),
+            ("Prompts",      st.get("total_prompts",0)),
+            ("SDKs",         st.get("total_sdks",0)),
+            ("API Key Refs", len(s.api_keys)),
+            ("Routes",       st.get("total_routes",0)),
+            ("Blueprints",   st.get("total_blueprints",0)),
+        ]:
+            lines.append(f"| {k} | {v} |")
+
+        if s.routes:
+            lines += ["", "## Flask Routes", "",
+                      "| Method | Path | File |",
+                      "|--------|------|------|"]
+            for r in s.routes[:50]:
+                lines.append(
+                    f"| `{r['method']}` | `{r['path']}` | `{r['file']}` |")
+
+        if s.agents:
+            lines += ["", "## AI Agents", "",
+                      "| Name | Type | Purpose | File |",
+                      "|------|------|---------|------|"]
+            seen: set = set()
+            for a in s.agents:
+                k = (a.get("name",""), a.get("file",""))
+                if k not in seen:
+                    seen.add(k)
+                    lines.append(
+                        f"| {a.get('name','')} | {a.get('type','')} | "
+                        f"{a.get('purpose','')} | `{a.get('file','')}` |")
+
+        if s.models:
+            lines += ["", "## AI Models", "",
+                      "| Model | Provider | References |",
+                      "|-------|----------|------------|"]
+            for mn,mi in sorted(s.models.items(),
+                                  key=lambda x: x[1]["count"], reverse=True):
+                lines.append(
+                    f"| {mn} | {mi.get('provider','?')} | {mi.get('count',0)} |")
+
+        lines += [
+            "", "## Runtime Usage Note", "",
+            "> Token usage, request counts, remaining quota, and cost",
+            "> **cannot be determined from static analysis alone.**",
+            "> Reported as **Not Available from Source Code**.", "",
+            "---", "",
+            "*Generated by AI Repository Audit Tool — static analysis only.*",
+        ]
+
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(lines))
+        print(f"[✓] MD   → {path}")
+
+
+# ──────────────────────────────────────────────────────────────
+# MAIN
+# ──────────────────────────────────────────────────────────────
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="AI Repository Audit Tool — HTML + JSON + CSV + MD reports",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  python ai_audit.py .\n"
+            "  python ai_audit.py /path/to/repo\n"
+            "  python ai_audit.py /path/to/repo --output ./reports\n"
+            "  python ai_audit.py . --no-open\n"
+        ),
     )
+    parser.add_argument("repo_path", nargs="?", default=".",
+                        help="Repository root (default: current directory)")
+    parser.add_argument("--output", "-o", default=".",
+                        help="Output directory (default: current directory)")
+    parser.add_argument("--no-open",     action="store_true",
+                        help="Do not open HTML in browser automatically")
+    parser.add_argument("--no-json",     action="store_true")
+    parser.add_argument("--no-csv",      action="store_true")
+    parser.add_argument("--no-markdown", action="store_true")
+    args = parser.parse_args()
+
+    repo = os.path.abspath(args.repo_path)
+    out  = os.path.abspath(args.output)
+
+    if not os.path.isdir(repo):
+        print(f"[ERROR] Not a directory: {repo}")
+        sys.exit(1)
+
+    os.makedirs(out, exist_ok=True)
+
+    print("=" * 65)
+    print("  AI Repository Audit Tool")
+    print("=" * 65)
+    print(f"  Repo   : {repo}")
+    print(f"  Output : {out}")
+    print("=" * 65)
+
+    # Scan
+    scanner = RepoScanner(repo)
+    scanner.scan()
+
+    # HTML (primary)
+    html_path = os.path.join(out, "repository_audit.html")
+    print("[*] Building HTML dashboard…")
+    html_content = HTMLReport(scanner).build()
+    with open(html_path, "w", encoding="utf-8") as fh:
+        fh.write(html_content)
+    print(f"[✓] HTML → {html_path}  ({fmt_size(len(html_content.encode()))})")
+
+    # Other formats
+    exp = Exporters(scanner)
+    if not args.no_json:
+        exp.to_json(os.path.join(out, "repository_audit.json"))
+    if not args.no_csv:
+        exp.to_csv(os.path.join(out,  "repository_audit.csv"))
+    if not args.no_markdown:
+        exp.to_markdown(os.path.join(out, "repository_audit.md"))
+
+    # Summary
+    st = scanner.stats
+    print("\n" + "=" * 65)
+    print("  AUDIT COMPLETE — SUMMARY")
+    print("=" * 65)
+    print(f"  Directories   : {st.get('total_dirs',0)}")
+    print(f"  Total Files   : {st.get('total_files',0)}")
+    print(f"  AI Files      : {st.get('total_ai_files',0)}")
+    print(f"  AI Agents     : {st.get('total_agents',0)}")
+    print(f"  AI Providers  : {st.get('total_providers',0)}")
+    print(f"  AI Models     : {st.get('total_models',0)}")
+    print(f"  Prompts       : {st.get('total_prompts',0)}")
+    print(f"  SDKs          : {st.get('total_sdks',0)}")
+    print(f"  Flask Routes  : {st.get('total_routes',0)}")
+    print(f"  Blueprints    : {st.get('total_blueprints',0)}")
+    print(f"  Lines of Code : {st.get('total_lines',0):,}")
+    print("=" * 65)
+
+    if scanner.routes:
+        print("\n  FLASK ROUTES:")
+        for r in scanner.routes[:15]:
+            print(f"    {r['method']:<7} {r['path']}")
+        if len(scanner.routes) > 15:
+            print(f"    … and {len(scanner.routes)-15} more")
+
+    if scanner.providers:
+        print("\n  AI PROVIDERS:")
+        for p in scanner.providers:
+            print(f"    🏢 {p}")
+
+    if scanner.models:
+        print("\n  AI MODELS:")
+        for m in list(scanner.models)[:10]:
+            print(f"    🧩 {m}")
+        if len(scanner.models) > 10:
+            print(f"    … and {len(scanner.models)-10} more")
+
+    print("\n  REPORTS WRITTEN:")
+    for fn in sorted(os.listdir(out)):
+        if fn.startswith("repository_audit"):
+            fp = os.path.join(out, fn)
+            print(f"    📄 {fn}  ({fmt_size(os.path.getsize(fp))})")
+
+    print("=" * 65)
+
+    # Auto-open
+    if not args.no_open:
+        file_url = Path(os.path.abspath(html_path)).as_uri()
+        print(f"\n[*] Opening: {file_url}")
+        try:
+            webbrowser.open(file_url)
+        except Exception as e:
+            print(f"[!] Could not open browser: {e}")
+            print(f"    Manually open: {os.path.abspath(html_path)}")
+
+    print("\n✅ Done.\n")
 
 
-@scanner_bp.get("/api/agents")
-def scanner_agents() -> Response:
-    if _last_result is None:
-        return jsonify(agents=[], message="No scan yet"), 200
-    return jsonify(agents=_last_result.agents, total=len(_last_result.agents))
-
-
-@scanner_bp.get("/api/providers")
-def scanner_providers() -> Response:
-    if _last_result is None:
-        return jsonify(providers={}, message="No scan yet"), 200
-    return jsonify(providers=_last_result.providers,
-                   total=len(_last_result.providers))
-
-
-@scanner_bp.get("/api/models")
-def scanner_models() -> Response:
-    if _last_result is None:
-        return jsonify(models={}, message="No scan yet"), 200
-    return jsonify(models=_last_result.models,
-                   total=len(_last_result.models))
-
-
-@scanner_bp.get("/api/metrics")
-def scanner_metrics() -> Response:
-    if _last_result is None:
-        return jsonify(message="No scan yet", scanning=_scan_running), 200
-    r = _last_result
-    return jsonify(
-        scanning=        _scan_running,
-        scan_date=       r.scan_date,
-        total_files=     r.total_files,
-        total_agents=    r.total_agents,
-        total_providers= r.total_providers,
-        total_models=    r.total_models,
-        total_prompts=   r.total_prompts,
-        total_sdks=      r.total_sdks,
-        total_api_keys=  r.total_api_keys,
-        ai_files=        r.ai_files,
-        total_classes=   r.total_classes,
-        total_functions= r.total_functions,
-        token_configs=   [
-            {"agent": a["name"], "file": a["file"],
-             "model": a["model"], "config": a["token_config"]}
-            for a in r.agents if a.get("token_config")
-        ],
-    )
-
-
-@scanner_bp.post("/api/scan")
-def scanner_trigger() -> tuple[Response, int]:
-    """
-    Trigger a background scan.
-    Body (JSON, optional): { "path": "/path/to/repo" }
-    Defaults to current working directory.
-    """
-    global _scan_running
-    if _scan_running:
-        return jsonify(message="Scan already in progress",
-                       scanning=True), 202
-
-    body      = request.get_json(silent=True) or {}
-    scan_path = str(Path(body.get("path", ".")).resolve())
-
-    if not os.path.isdir(scan_path):
-        return jsonify(
-            error=f"Path does not exist or is not a directory: {scan_path}"
-        ), 400
-
-    Thread(
-        target= _run_scan_background,
-        args=   (scan_path,),
-        daemon= True,
-        name=   "repo-scanner",
-    ).start()
-
-    return jsonify(message="Scan started", path=scan_path,
-                   scanning=True), 202
-
-
-@scanner_bp.get("/api/report")
-def scanner_report() -> tuple[Response, int]:
-    """Full last scan report — dashboard polls this after triggering scan."""
-    if _scan_running:
-        return jsonify(scanning=True, message="Scan in progress…"), 202
-
-    if _last_result is None:
-        return jsonify(
-            scanning=    False,
-            message=     "No scan yet. POST /scanner/api/scan to start.",
-            total_files= 0,
-        ), 200
-
-    r = _last_result
-    return jsonify(
-        scanning=        False,
-        scan_date=       r.scan_date,
-        root_path=       r.root_path,
-        repo_name=       r.repo_name,
-        total_dirs=      r.total_dirs,
-        total_files=     r.total_files,
-        source_files=    r.source_files,
-        config_files=    r.config_files,
-        doc_files=       r.doc_files,
-        test_files=      r.test_files,
-        infra_files=     r.infra_files,
-        ai_files=        r.ai_files,
-        total_agents=    r.total_agents,
-        total_providers= r.total_providers,
-        total_models=    r.total_models,
-        total_prompts=   r.total_prompts,
-        total_sdks=      r.total_sdks,
-        total_tools=     r.total_tools,
-        total_api_keys=  r.total_api_keys,
-        total_workflows= r.total_workflows,
-        total_classes=   r.total_classes,
-        total_functions= r.total_functions,
-        total_endpoints= r.total_endpoints,
-        directory_tree=  r.directory_tree,
-        files=           r.files,
-        agents=          r.agents,
-        providers=       r.providers,
-        models=          r.models,
-        prompts=         r.prompts,
-        api_keys=        r.api_keys,
-        sdks=            r.sdks,
-        tools=           r.tools,
-        workflows=       r.workflows,
-        errors=          r.errors,
-    ), 200
-
-
-# ══════════════════════════════════════════════════════════════
-# STARTUP  —  initialise metrics once after all objects defined
-# ══════════════════════════════════════════════════════════════
-
-_init_static_metrics()
-_update_dynamic_metrics()
+if __name__ == "__main__":
+    main()
