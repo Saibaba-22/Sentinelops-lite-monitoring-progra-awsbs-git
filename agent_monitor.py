@@ -1,1389 +1,1661 @@
 """
-agent_monitor.py
-================
-Complete standalone monitoring and scanning system for SentinelOps-Lite.
-Integrates AI agents, CI/CD pipeline monitoring, and security scanning.
-
-This file contains:
-- Flask application setup
-- Blueprint definitions for monitoring and scanning
-- HTML/CSS/JS templates embedded
-- AI agent integration
-- Pipeline detection and monitoring
-- All logic and UI components
+SentinelOps Agent Monitor - Production-Ready AI Agent Observability Dashboard
+Standalone module for Flask projects with embedded frontend, pipeline detection, and AI-agent scanning.
 """
 
 import os
-import sys
 import json
+import ast
+import hashlib
+import hmac
+import threading
 import time
-from datetime import datetime
+import logging
+from datetime import datetime, timedelta
 from pathlib import Path
-from functools import wraps
-from typing import Dict, List, Tuple, Any
+from typing import Dict, List, Any, Optional, Set, Tuple
+from collections import defaultdict
+from functools import lru_cache
+import re
 
-from flask import Flask, Blueprint, render_template_string, jsonify, request, Response
+from flask import Flask, Blueprint, jsonify, request, render_template_string
+from jinja2 import DictLoader, ChoiceLoader, FileSystemLoader
 
-# ══════════════════════════════════════════════════════════════
-# FLASK APPLICATION SETUP
-# ══════════════════════════════════════════════════════════════
+# ============================================================================
+# CONFIGURATION & CONSTANTS
+# ============================================================================
 
-application = Flask(__name__)
-application.config['JSON_SORT_KEYS'] = False
+PROJECT_ROOT = Path(os.getenv("SENTINELOPS_PROJECT_ROOT") or Path(__file__).parent).resolve()
+TIMEZONE = os.getenv("SENTINELOPS_TIMEZONE", "Asia/Kolkata")
+WEBHOOK_TOKEN = os.getenv("SENTINELOPS_WEBHOOK_TOKEN", "")
+AGENT_LIMITS_JSON = os.getenv("SENTINELOPS_AGENT_LIMITS_JSON", "{}")
 
-# ══════════════════════════════════════════════════════════════
-# BLUEPRINT DEFINITIONS
-# ══════════════════════════════════════════════════════════════
+MAX_FILES_SCAN = 5000
+MAX_FILE_SIZE = 1024 * 1024  # 1 MB
+MAX_SCAN_DEPTH = 15
+MAX_PAYLOAD_SIZE = 1024 * 1024  # 1 MB
+MAX_HISTORY_EVENTS = 500
+MAX_USAGE_RECORDS = 10000
 
-monitor_bp = Blueprint('monitor', __name__, url_prefix='/monitor')
-scanner_bp = Blueprint('scanner', __name__, url_prefix='/scanner')
-
-# ══════════════════════════════════════════════════════════════
-# AI AGENT CONFIGURATION & REGISTRY
-# ══════════════════════════════════════════════════════════════
-
-class AIAgent:
-    """Represents an AI agent with its characteristics and metrics."""
-    
-    def __init__(self, name: str, provider: str, model: str, purpose: str, 
-                 tokens_limit: int, requests_per_hour: int, requests_per_day: int):
-        self.name = name
-        self.provider = provider
-        self.model = model
-        self.purpose = purpose
-        self.tokens_limit = tokens_limit
-        self.tokens_used = 0
-        self.requests_per_hour = requests_per_hour
-        self.requests_per_day = requests_per_day
-        self.requests_used_hour = 0
-        self.requests_used_day = 0
-        self.last_hour_reset = datetime.now()
-        self.last_day_reset = datetime.now()
-        self.status = "Active"
-        self.error_count = 0
-        self.success_count = 0
-    
-    def to_dict(self) -> Dict:
-        """Convert agent to dictionary."""
-        return {
-            "name": self.name,
-            "provider": self.provider,
-            "model": self.model,
-            "purpose": self.purpose,
-            "tokens_limit": self.tokens_limit,
-            "tokens_used": self.tokens_used,
-            "tokens_usage_percent": round((self.tokens_used / self.tokens_limit) * 100, 2),
-            "requests_per_hour": self.requests_per_hour,
-            "requests_used_hour": self.requests_used_hour,
-            "requests_hour_percent": round((self.requests_used_hour / self.requests_per_hour) * 100, 2),
-            "requests_per_day": self.requests_per_day,
-            "requests_used_day": self.requests_used_day,
-            "requests_day_percent": round((self.requests_used_day / self.requests_per_day) * 100, 2),
-            "status": self.status,
-            "success_count": self.success_count,
-            "error_count": self.error_count,
-            "error_rate": round((self.error_count / (self.success_count + self.error_count)) * 100, 2) if (self.success_count + self.error_count) > 0 else 0
-        }
-
-# ── AI Agents Registry ─────────────────────────────────────────
-AGENTS_REGISTRY = {
-    "security_scanner": AIAgent(
-        name="Security Scanner Agent",
-        provider="OpenAI",
-        model="gpt-4-turbo",
-        purpose="Analyze code for security vulnerabilities, SAST scanning, dependency analysis",
-        tokens_limit=100000,
-        requests_per_hour=60,
-        requests_per_day=500
-    ),
-    "code_analyzer": AIAgent(
-        name="Code Quality Analyzer Agent",
-        provider="Anthropic",
-        model="claude-3-opus",
-        purpose="Code quality analysis, pattern detection, best practices validation",
-        tokens_limit=150000,
-        requests_per_hour=80,
-        requests_per_day=600
-    ),
-    "compliance_checker": AIAgent(
-        name="Compliance Checker Agent",
-        provider="Azure OpenAI",
-        model="gpt-4-32k",
-        purpose="Check compliance with standards, regulatory requirements, policy validation",
-        tokens_limit=200000,
-        requests_per_hour=40,
-        requests_per_day=300
-    ),
-    "log_analyzer": AIAgent(
-        name="Log Analysis Agent",
-        provider="OpenAI",
-        model="gpt-3.5-turbo",
-        purpose="Parse and analyze logs, detect anomalies, pattern recognition",
-        tokens_limit=80000,
-        requests_per_hour=120,
-        requests_per_day=1000
-    )
+IGNORE_DIRS = {
+    ".git", ".venv", "venv", "env", "node_modules", "__pycache__",
+    ".pytest_cache", ".mypy_cache", "dist", "build", "*.egg-info",
+    ".tox", ".coverage", "htmlcov", ".idea", ".vscode", ".env.local"
 }
 
-# ══════════════════════════════════════════════════════════════
-# PIPELINE DETECTION & MONITORING
-# ══════════════════════════════════════════════════════════════
+IGNORE_FILES = {
+    ".env", ".env.local", ".env.*.local", ".secrets", "secrets.json",
+    "credentials.json", "private.key", "id_rsa", "id_ed25519",
+    ".aws/credentials", ".aws/config", ".ssh"
+}
+
+BINARY_EXTENSIONS = {
+    ".pyc", ".pyo", ".so", ".dll", ".exe", ".jar", ".zip", ".tar",
+    ".gz", ".png", ".jpg", ".jpeg", ".gif", ".ico", ".svg", ".pdf",
+    ".ttf", ".woff", ".woff2"
+}
+
+CI_ENV_VARS = {
+    "github": ["GITHUB_ACTIONS", "GITHUB_WORKFLOW", "GITHUB_RUN_ID"],
+    "azure": ["TF_BUILD", "BUILD_DEFINITIONNAME", "SYSTEM_TEAMPROJECT"],
+    "jenkins": ["JENKINS_URL", "JOB_NAME", "BUILD_NUMBER"],
+    "gitlab": ["GITLAB_CI", "CI_PIPELINE_ID", "CI_PROJECT_PATH"],
+    "circleci": ["CIRCLECI", "CIRCLE_BUILD_NUM", "CIRCLE_PROJECT_REPONAME"],
+    "bitbucket": ["BITBUCKET_BUILD_NUMBER", "BITBUCKET_REPO_FULL_NAME"],
+    "aws": ["CODEBUILD_BUILD_ID", "CODEBUILD_BUILD_ARN"],
+    "gcloud": ["BUILD_ID", "BUILD_STEP"],
+}
+
+PIPELINE_CONFIG_FILES = {
+    ".github/workflows/*.yml": "github",
+    ".github/workflows/*.yaml": "github",
+    "azure-pipelines.yml": "azure",
+    "azure-pipelines.yaml": "azure",
+    "Jenkinsfile": "jenkins",
+    ".gitlab-ci.yml": "gitlab",
+    ".circleci/config.yml": "circleci",
+    "bitbucket-pipelines.yml": "bitbucket",
+    "buildspec.yml": "aws",
+    "buildspec.yaml": "aws",
+    "cloudbuild.yaml": "gcloud",
+}
+
+AI_FRAMEWORKS = {
+    "langchain": ("LangChain", "General LLM/agent framework"),
+    "langgraph": ("LangGraph", "Graph-based agentic framework"),
+    "crewai": ("CrewAI", "Multi-agent orchestration"),
+    "autogen": ("AutoGen", "Multi-agent conversation framework"),
+    "semantic_kernel": ("Semantic Kernel", "MS agent framework"),
+    "llamaindex": ("LlamaIndex", "Data indexing/RAG framework"),
+    "openai": ("OpenAI SDK", "OpenAI API client"),
+    "anthropic": ("Anthropic SDK", "Claude API client"),
+    "google.generativeai": ("Google Gemini", "Google AI client"),
+    "google.cloud.aiplatform": ("Vertex AI", "Google Vertex AI client"),
+    "cohere": ("Cohere SDK", "Cohere API client"),
+    "mistralai": ("Mistral SDK", "Mistral API client"),
+    "groq": ("Groq SDK", "Groq API client"),
+    "ollama": ("Ollama", "Local LLM framework"),
+}
+
+AI_PROVIDERS = {
+    "openai": "OpenAI",
+    "azure": "Azure OpenAI",
+    "anthropic": "Anthropic",
+    "google": "Google Gemini",
+    "vertex": "Google Vertex AI",
+    "cohere": "Cohere",
+    "mistral": "Mistral",
+    "groq": "Groq",
+    "huggingface": "Hugging Face",
+    "bedrock": "AWS Bedrock",
+    "ollama": "Ollama",
+}
+
+# ============================================================================
+# LOGGING & OBSERVABILITY
+# ============================================================================
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
+
+# ============================================================================
+# SHARED STATE & PERSISTENCE
+# ============================================================================
+
+class AtomicHistory:
+    """Thread-safe bounded history with atomic JSON persistence."""
+
+    def __init__(self, max_records: int = MAX_HISTORY_EVENTS):
+        self.max_records = max_records
+        self.records = []
+        self.lock = threading.RLock()
+
+    def add(self, record: Dict[str, Any]):
+        """Add record, maintaining bounded size."""
+        with self.lock:
+            record_copy = dict(record)
+            record_copy.setdefault("timestamp", datetime.utcnow().isoformat())
+            self.records.insert(0, record_copy)
+            self.records = self.records[:self.max_records]
+
+    def get_all(self) -> List[Dict[str, Any]]:
+        """Return all records safely."""
+        with self.lock:
+            return list(self.records)
+
+    def clear(self):
+        """Clear all records."""
+        with self.lock:
+            self.records = []
+
+webhook_history = AtomicHistory(MAX_HISTORY_EVENTS)
+usage_history = AtomicHistory(MAX_USAGE_RECORDS)
+scan_cache = {"data": None, "timestamp": 0, "lock": threading.RLock()}
+SCAN_CACHE_TTL = 60  # seconds
+
+# ============================================================================
+# PIPELINE DETECTION
+# ============================================================================
 
 class PipelineDetector:
-    """Detects and identifies CI/CD pipeline type."""
-    
-    PIPELINE_INDICATORS = {
-        "GitHub Actions": [
-            "GITHUB_ACTIONS",
-            "GITHUB_RUN_ID",
-            "GITHUB_WORKFLOW",
-            "GITHUB_REF"
-        ],
-        "Azure DevOps": [
-            "SYSTEM_TEAMFOUNDATIONCOLLECTIONURI",
-            "SYSTEM_TEAMPROJECT",
-            "BUILD_BUILDID",
-            "AGENT_ID"
-        ],
-        "Jenkins": [
-            "JENKINS_URL",
-            "BUILD_ID",
-            "BUILD_NUMBER",
-            "JOB_NAME",
-            "WORKSPACE"
-        ],
-        "GitLab CI": [
-            "GITLAB_CI",
-            "CI_PIPELINE_ID",
-            "CI_JOB_ID",
-            "CI_COMMIT_SHA"
-        ],
-        "CircleCI": [
-            "CIRCLECI",
-            "CIRCLE_BUILD_NUM",
-            "CIRCLE_WORKFLOW_ID",
-            "CIRCLE_PROJECT_USERNAME"
-        ]
-    }
-    
-    PIPELINE_MEANINGS = {
-        "GitHub Actions": "GitHub's native CI/CD platform that automates builds, tests, and deployments using workflows defined in YAML files.",
-        "Azure DevOps": "Microsoft's comprehensive DevOps platform providing CI/CD pipelines, artifact management, testing, and deployment capabilities across cloud and on-premises.",
-        "Jenkins": "Open-source automation server widely used for continuous integration and continuous delivery with extensive plugin ecosystem for build automation.",
-        "GitLab CI": "GitLab's integrated CI/CD solution built into the platform for automating testing, building, and deployment of code with parallel execution support.",
-        "CircleCI": "Cloud-native CI/CD platform providing automated testing and deployment with support for Docker, parallelization, and workflow orchestration."
-    }
-    
+    """Detects CI/CD pipeline provider using multiple evidence sources."""
+
     @staticmethod
-    def detect() -> Tuple[str, str, Dict]:
-        """
-        Detect which pipeline is running.
-        Returns: (pipeline_name, description, environment_vars)
-        """
-        env_vars = dict(os.environ)
+    def detect_from_env() -> Tuple[Optional[str], Dict[str, Any]]:
+        """Detect pipeline from runtime environment variables."""
+        evidence = {}
+        for provider, vars_list in CI_ENV_VARS.items():
+            matched = [v for v in vars_list if os.getenv(v)]
+            if matched:
+                evidence[provider] = matched
+                return provider, {"source": "runtime_env", "evidence": matched}
+        return None, {}
+
+    @staticmethod
+    def detect_from_files() -> Tuple[List[str], Dict[str, Any]]:
+        """Detect pipeline config files in repository."""
+        found = []
+        try:
+            for pattern, provider in PIPELINE_CONFIG_FILES.items():
+                if "*" in pattern:
+                    base_dir = PROJECT_ROOT / pattern.split("*")[0]
+                    if base_dir.exists():
+                        for f in base_dir.glob(pattern.split("/")[-1]):
+                            if f.is_file() and f.stat().st_size < 1024 * 100:
+                                found.append((str(f.relative_to(PROJECT_ROOT)), provider))
+                else:
+                    path = PROJECT_ROOT / pattern
+                    if path.exists() and path.is_file():
+                        found.append((str(path.relative_to(PROJECT_ROOT)), provider))
+        except Exception as e:
+            logger.warning(f"Error scanning pipeline files: {e}")
+        return found, {"source": "config_files"}
+
+    @staticmethod
+    def detect_from_webhook(webhook_data: Dict[str, Any]) -> Tuple[Optional[str], Dict[str, Any]]:
+        """Detect pipeline from webhook payload."""
+        # GitHub Actions
+        if "github" in str(webhook_data).lower() or "workflow" in webhook_data:
+            return "github", {"source": "webhook"}
+        # Azure DevOps
+        if "resource" in webhook_data and "definition" in str(webhook_data).lower():
+            return "azure", {"source": "webhook"}
+        # GitLab
+        if "project" in webhook_data and "pipeline" in webhook_data:
+            return "gitlab", {"source": "webhook"}
+        # Jenkins
+        if "build" in webhook_data and "jobName" in str(webhook_data).lower():
+            return "jenkins", {"source": "webhook"}
+        return None, {}
+
+    @staticmethod
+    def get_pipeline_summary() -> Dict[str, Any]:
+        """Compile pipeline detection summary."""
+        env_provider, env_evidence = PipelineDetector.detect_from_env()
+        config_files, config_evidence = PipelineDetector.detect_from_files()
         
-        for pipeline, indicators in PipelineDetector.PIPELINE_INDICATORS.items():
-            if any(indicator in env_vars for indicator in indicators):
-                description = PipelineDetector.PIPELINE_MEANINGS.get(
-                    pipeline, 
-                    "Unknown CI/CD Pipeline"
-                )
-                return pipeline, description, env_vars
+        providers_found = {}
+        if env_provider:
+            providers_found[env_provider] = {"source": "runtime", "evidence": env_evidence.get("evidence", [])}
         
-        return "Local Development", "Running on local machine outside CI/CD pipeline", env_vars
+        for config_file, provider in config_files:
+            if provider not in providers_found:
+                providers_found[provider] = {"files": []}
+            if "files" not in providers_found[provider]:
+                providers_found[provider]["files"] = []
+            providers_found[provider]["files"].append(config_file)
 
-# ── Global Pipeline Info ───────────────────────────────────────
-PIPELINE_NAME, PIPELINE_DESCRIPTION, PIPELINE_ENV = PipelineDetector.detect()
+        latest_webhook = webhook_history.get_all()[0] if webhook_history.get_all() else None
 
-# ══════════════════════════════════════════════════════════════
-# MONITORING STATE & STORAGE
-# ══════════════════════════════════════════════════════════════
-
-class MonitoringState:
-    """Maintains state of monitoring activities."""
-    
-    def __init__(self):
-        self.build_history = []
-        self.scan_results = []
-        self.alerts = []
-        self.metrics = {
-            "total_builds": 0,
-            "passed_builds": 0,
-            "failed_builds": 0,
-            "total_scans": 0,
-            "vulnerabilities_found": 0,
-            "critical_issues": 0
+        return {
+            "configured": list(providers_found.keys()),
+            "runtime": env_provider,
+            "config_files": config_files,
+            "latest_webhook": latest_webhook,
+            "confidence": _calculate_confidence(env_provider, config_files, latest_webhook),
         }
-    
-    def add_build(self, status: str, commit_hash: str = ""):
-        """Add build record."""
-        record = {
-            "timestamp": datetime.now().isoformat(),
-            "status": status,
-            "commit": commit_hash[:8] if commit_hash else "N/A"
-        }
-        self.build_history.append(record)
-        self.metrics["total_builds"] += 1
+
+def _calculate_confidence(env_provider, config_files, webhook):
+    """Calculate detection confidence: High, Medium, Low."""
+    score = 0
+    if env_provider:
+        score += 2
+    if config_files:
+        score += 1
+    if webhook:
+        score += 1
+    if score >= 3:
+        return "High"
+    elif score >= 2:
+        return "Medium"
+    else:
+        return "Low"
+
+# ============================================================================
+# FILE SCANNING & INVENTORY
+# ============================================================================
+
+class FileScanner:
+    """Scans project files and builds inventory with AST analysis."""
+
+    @staticmethod
+    def should_ignore(path: Path) -> bool:
+        """Check if path should be ignored."""
+        name = path.name
+        for pattern in IGNORE_DIRS:
+            if pattern.startswith("."):
+                if name == pattern:
+                    return True
+            else:
+                if pattern in path.parts:
+                    return True
+        for pattern in IGNORE_FILES:
+            if pattern == name or (pattern.startswith(".") and name.startswith(pattern)):
+                return True
+        return False
+
+    @staticmethod
+    def scan_files(max_files=MAX_FILES_SCAN, max_depth=MAX_SCAN_DEPTH) -> Dict[str, Any]:
+        """Recursively scan project files."""
+        files_data = []
+        file_count = 0
         
-        if status == "passed":
-            self.metrics["passed_builds"] += 1
-        elif status == "failed":
-            self.metrics["failed_builds"] += 1
-    
-    def add_scan(self, scan_type: str, vulnerabilities: int, critical: int):
-        """Add scan result."""
-        record = {
-            "timestamp": datetime.now().isoformat(),
-            "type": scan_type,
-            "vulnerabilities": vulnerabilities,
-            "critical": critical
+        try:
+            for path in PROJECT_ROOT.rglob("*"):
+                if file_count >= max_files:
+                    break
+                if FileScanner.should_ignore(path):
+                    continue
+                if path.is_file() and path.relative_to(PROJECT_ROOT).parts.__len__() <= max_depth:
+                    try:
+                        rel_path = str(path.relative_to(PROJECT_ROOT))
+                        size = path.stat().st_size
+                        if size > MAX_FILE_SIZE:
+                            continue
+                        
+                        file_ext = path.suffix.lower()
+                        if file_ext in BINARY_EXTENSIONS or file_ext.startswith("."):
+                            continue
+                        
+                        file_info = FileScanner.analyze_file(path, rel_path)
+                        files_data.append(file_info)
+                        file_count += 1
+                    except Exception as e:
+                        logger.debug(f"Error analyzing {path}: {e}")
+        except Exception as e:
+            logger.warning(f"Error scanning directory: {e}")
+
+        files_data = FileScanner.prioritize_files(files_data)
+        return {"files": files_data, "total": len(files_data)}
+
+    @staticmethod
+    def analyze_file(path: Path, rel_path: str) -> Dict[str, Any]:
+        """Analyze a single file."""
+        file_type = FileScanner.determine_file_type(path)
+        purpose = "Unknown"
+        imports = []
+        classes = []
+        functions = []
+        
+        if path.suffix == ".py":
+            try:
+                with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                    content = f.read(MAX_FILE_SIZE)
+                    tree = ast.parse(content)
+                    
+                    imports = FileScanner.extract_imports(tree)
+                    classes = FileScanner.extract_classes(tree)
+                    functions = FileScanner.extract_functions(tree)
+                    purpose = FileScanner.infer_purpose(path, content, imports, classes, functions)
+            except Exception as e:
+                logger.debug(f"Error parsing {path}: {e}")
+
+        return {
+            "path": rel_path,
+            "name": path.name,
+            "type": file_type,
+            "purpose": purpose,
+            "imports": imports[:10],
+            "classes": classes[:10],
+            "functions": functions[:10],
+            "size": path.stat().st_size,
         }
-        self.scan_results.append(record)
-        self.metrics["total_scans"] += 1
-        self.metrics["vulnerabilities_found"] += vulnerabilities
-        self.metrics["critical_issues"] += critical
-    
-    def add_alert(self, level: str, message: str):
-        """Add alert."""
-        self.alerts.append({
-            "timestamp": datetime.now().isoformat(),
-            "level": level,
-            "message": message
-        })
 
-# ── Global State Instance ──────────────────────────────────────
-monitoring_state = MonitoringState()
+    @staticmethod
+    def determine_file_type(path: Path) -> str:
+        """Determine file type category."""
+        name = path.name
+        suffix = path.suffix.lower()
+        
+        if name in ["app.py", "application.py", "main.py", "wsgi.py", "run.py"]:
+            return "main_app"
+        if name in ["agent_monitor.py"]:
+            return "monitoring"
+        if "agent" in name.lower():
+            return "ai_agent"
+        if name.startswith("test_") or name.endswith("_test.py"):
+            return "test"
+        if ".github/workflows" in str(path) or name in ["Jenkinsfile", "azure-pipelines.yml", ".gitlab-ci.yml"]:
+            return "pipeline"
+        if suffix in [".html", ".jinja", ".jinja2"]:
+            return "template"
+        if suffix in [".css", ".js"]:
+            return "static"
+        if suffix in [".yml", ".yaml", ".json", ".toml", ".ini", ".conf"]:
+            return "config"
+        if suffix == ".py":
+            return "python"
+        return "other"
 
-# ══════════════════════════════════════════════════════════════
-# HANDLER FUNCTIONS
-# ══════════════════════════════════════════════════════════════
+    @staticmethod
+    def extract_imports(tree: ast.AST) -> List[str]:
+        """Extract top-level imports from AST."""
+        imports = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    imports.append(alias.name)
+            elif isinstance(node, ast.ImportFrom):
+                if node.module:
+                    imports.append(node.module)
+        return sorted(set(imports))
 
-def handle_monitor_status():
-    """
-    Handle CI/CD monitoring webhook from pipeline.
-    Processes build status and triggers agents.
-    """
+    @staticmethod
+    def extract_classes(tree: ast.AST) -> List[str]:
+        """Extract class names from AST."""
+        classes = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef):
+                classes.append(node.name)
+        return classes
+
+    @staticmethod
+    def extract_functions(tree: ast.AST) -> List[str]:
+        """Extract function names from AST."""
+        functions = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef):
+                functions.append(node.name)
+        return functions
+
+    @staticmethod
+    def infer_purpose(path: Path, content: str, imports: List[str], classes: List[str], functions: List[str]) -> str:
+        """Infer file purpose from metadata."""
+        name = path.name.lower()
+        
+        if "agent" in name:
+            return "AI agent implementation or helper"
+        if "monitor" in name or "observ" in name:
+            return "Monitoring or observability utility"
+        if "config" in name or "settings" in name:
+            return "Configuration file"
+        if "test" in name:
+            return "Test file"
+        if "model" in name:
+            return "Data model or database schema"
+        if "route" in name or "handler" in name:
+            return "Request handler or routing"
+        if "util" in name or "helper" in name:
+            return "Utility or helper functions"
+        
+        if "langchain" in imports or "crewai" in imports or "autogen" in imports:
+            return "AI agent orchestration or integration"
+        if "openai" in imports or "anthropic" in imports:
+            return "LLM API integration"
+        if any(kw in content.lower() for kw in ["@app.route", "@application.route", "blueprint", "@bp."]):
+            return "Flask route handler"
+        
+        return "Application module"
+
+    @staticmethod
+    def prioritize_files(files: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Sort files by priority."""
+        priority_order = {
+            "main_app": 0,
+            "pipeline": 1,
+            "ai_agent": 2,
+            "config": 3,
+            "monitoring": 4,
+            "python": 5,
+            "template": 6,
+            "static": 7,
+            "test": 8,
+            "other": 9,
+        }
+        
+        files.sort(key=lambda f: (
+            priority_order.get(f["type"], 99),
+            f["name"]
+        ))
+        return files
+
+# ============================================================================
+# AI AGENT DETECTION
+# ============================================================================
+
+class AIAgentDetector:
+    """Detects and analyzes AI agents in the project."""
+
+    CHARACTERISTICS = {
+        "llm_sdk": "LLM/model-provider SDK usage",
+        "model_config": "Model configuration or model-name reference",
+        "system_prompt": "System or instruction prompts",
+        "goal_oriented": "Goal/task-oriented behavior",
+        "planning": "Planning or reasoning loops",
+        "tool_calling": "Tool or function calling",
+        "autonomous": "Autonomous decision-making",
+        "memory": "Memory, state, history, or checkpoints",
+        "retrieval": "Retrieval/RAG or vector-store usage",
+        "external_action": "External action execution",
+        "multi_step": "Multi-step workflows",
+        "framework": "Agent frameworks",
+        "token_accounting": "Token accounting",
+        "rate_limiting": "Rate-limit handling",
+        "guardrails": "Human approval or guardrails",
+    }
+
+    @staticmethod
+    def detect_agents(files_data: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """Detect all agents and separate used vs. unused."""
+        all_agents = []
+        
+        for file_info in files_data.get("files", []):
+            if file_info["path"].endswith(".py"):
+                agent = AIAgentDetector.analyze_python_file(file_info)
+                if agent and agent["classification"] in ["Confirmed AI agent", "Probable AI agent"]:
+                    all_agents.append(agent)
+
+        used_agents = AIAgentDetector.filter_used_agents(all_agents)
+        return all_agents, used_agents
+
+    @staticmethod
+    def analyze_python_file(file_info: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Analyze a Python file for AI agent characteristics."""
+        path = PROJECT_ROOT / file_info["path"]
+        
+        if not path.exists():
+            return None
+
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read(MAX_FILE_SIZE)
+            
+            characteristics = AIAgentDetector.extract_characteristics(content)
+            confidence_score = AIAgentDetector.calculate_confidence(characteristics)
+            classification = AIAgentDetector.classify_agent(confidence_score, file_info["name"])
+
+            if confidence_score < 0.2:
+                return None
+
+            detected_provider = AIAgentDetector.detect_provider(content)
+            detected_model = AIAgentDetector.detect_model(content)
+
+            return {
+                "name": file_info["name"].replace(".py", ""),
+                "path": file_info["path"],
+                "classification": classification,
+                "confidence": round(confidence_score, 2),
+                "provider": detected_provider,
+                "model": detected_model,
+                "framework": AIAgentDetector.detect_framework(content),
+                "characteristics": characteristics,
+                "tools": AIAgentDetector.extract_tools(content),
+                "memory_mechanism": AIAgentDetector.detect_memory(content),
+                "evidence": AIAgentDetector.extract_evidence(content),
+                "used": False,
+            }
+        except Exception as e:
+            logger.debug(f"Error analyzing agent {file_info['path']}: {e}")
+            return None
+
+    @staticmethod
+    def extract_characteristics(content: str) -> List[str]:
+        """Extract detected characteristics from code."""
+        detected = []
+        
+        # LLM SDK
+        if any(lib in content for lib in ["openai", "anthropic", "google.generativeai", "cohere", "groq"]):
+            detected.append("llm_sdk")
+        
+        # Model config
+        if any(kw in content for kw in ["model=", "model_name", "gpt-", "claude-", "gemini-", "llama"]):
+            detected.append("model_config")
+        
+        # System prompt
+        if any(kw in content for kw in ["system_prompt", "system_message", "instructions", "role"]):
+            detected.append("system_prompt")
+        
+        # Goal-oriented
+        if any(kw in content for kw in ["goal", "objective", "task", "purpose"]):
+            detected.append("goal_oriented")
+        
+        # Planning
+        if any(kw in content for kw in ["think", "plan", "step", "reason", "reason_action_observation"]):
+            detected.append("planning")
+        
+        # Tool calling
+        if any(kw in content for kw in ["tool", "function_call", "tools=", "functions="]):
+            detected.append("tool_calling")
+        
+        # Autonomous
+        if any(kw in content for kw in ["while", "loop", "autonomous", "continuous"]):
+            detected.append("autonomous")
+        
+        # Memory
+        if any(kw in content for kw in ["memory", "state", "history", "checkpoint", "cache"]):
+            detected.append("memory")
+        
+        # Retrieval/RAG
+        if any(kw in content for kw in ["retrieval", "rag", "vector", "embedding", "similarity", "retriever"]):
+            detected.append("retrieval")
+        
+        # External action
+        if any(kw in content for kw in ["http", "request", "api", "execute", "run", "subprocess"]):
+            detected.append("external_action")
+        
+        # Multi-step
+        if any(kw in content for kw in ["step", "stage", "phase", "workflow", "pipeline"]):
+            detected.append("multi_step")
+        
+        # Frameworks
+        if any(fw in content for fw in ["langchain", "crewai", "autogen", "llamaindex", "semantic_kernel"]):
+            detected.append("framework")
+        
+        # Token accounting
+        if any(kw in content for kw in ["token", "usage", "cost", "limit"]):
+            detected.append("token_accounting")
+        
+        # Rate limiting
+        if any(kw in content for kw in ["rate_limit", "quota", "throttle", "backoff"]):
+            detected.append("rate_limiting")
+        
+        # Guardrails
+        if any(kw in content for kw in ["approval", "human", "verify", "validate", "guard"]):
+            detected.append("guardrails")
+        
+        return detected
+
+    @staticmethod
+    def calculate_confidence(characteristics: List[str]) -> float:
+        """Calculate confidence score (0-1)."""
+        if not characteristics:
+            return 0.0
+        score = len(characteristics) / len(AIAgentDetector.CHARACTERISTICS)
+        return min(score, 1.0)
+
+    @staticmethod
+    def classify_agent(confidence: float, filename: str) -> str:
+        """Classify agent based on confidence and evidence."""
+        if confidence >= 0.6:
+            return "Confirmed AI agent"
+        elif confidence >= 0.4:
+            return "Probable AI agent"
+        elif confidence >= 0.2:
+            return "AI integration/helper"
+        else:
+            return "Not enough evidence"
+
+    @staticmethod
+    def detect_provider(content: str) -> str:
+        """Detect AI provider from content."""
+        for key, name in AI_PROVIDERS.items():
+            if key in content.lower():
+                return name
+        return "Unknown / not exposed"
+
+    @staticmethod
+    def detect_model(content: str) -> str:
+        """Detect model name from content."""
+        model_patterns = [
+            r"gpt-[0-9a-z-]+",
+            r"claude-[0-9a-z-]+",
+            r"gemini-[0-9a-z-]+",
+            r"llama-[0-9]+",
+            r"mistral-[0-9a-z-]+",
+        ]
+        for pattern in model_patterns:
+            match = re.search(pattern, content.lower())
+            if match:
+                return match.group()
+        return "Unknown / not exposed"
+
+    @staticmethod
+    def detect_framework(content: str) -> str:
+        """Detect AI framework."""
+        for key, (name, desc) in AI_FRAMEWORKS.items():
+            if key in content.lower():
+                return name
+        return "None detected"
+
+    @staticmethod
+    def extract_tools(content: str) -> List[str]:
+        """Extract available tools."""
+        tools = []
+        if "tool" in content.lower():
+            # Simple heuristic: look for tool definitions
+            tool_pattern = r"(?:tool|func|function)[\s_]*=[\s]*.*?(?:def|class|Tool)"
+            tools.extend(re.findall(r"def\s+(\w+)\s*\(", content)[:5])
+        return tools
+
+    @staticmethod
+    def detect_memory(content: str) -> str:
+        """Detect memory/state mechanism."""
+        if "langchain" in content.lower() and "memory" in content.lower():
+            return "LangChain memory"
+        if "vectorstore" in content.lower() or "vector_store" in content.lower():
+            return "Vector store"
+        if "conversation" in content.lower():
+            return "Conversation history"
+        if "cache" in content.lower():
+            return "Cache/local storage"
+        return "None detected"
+
+    @staticmethod
+    def extract_evidence(content: str) -> List[str]:
+        """Extract evidence snippets (safely)."""
+        evidence = []
+        for line in content.split("\n"):
+            if any(kw in line.lower() for kw in ["import", "agent", "model", "api_key", "endpoint"]):
+                clean_line = line.strip()[:100]
+                if not any(secret in clean_line.lower() for secret in ["password", "token", "key", "secret"]):
+                    evidence.append(clean_line)
+            if len(evidence) >= 5:
+                break
+        return evidence
+
+    @staticmethod
+    def filter_used_agents(all_agents: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Filter to agents actually used by the main application."""
+        # Check main app file
+        main_app_path = None
+        for candidate in ["app.py", "application.py", "main.py", "wsgi.py"]:
+            path = PROJECT_ROOT / candidate
+            if path.exists():
+                main_app_path = path
+                break
+
+        if not main_app_path:
+            return []
+
+        try:
+            with open(main_app_path, "r", encoding="utf-8", errors="ignore") as f:
+                main_content = f.read(MAX_FILE_SIZE)
+        except:
+            return []
+
+        used = []
+        for agent in all_agents:
+            # Check if agent is imported or referenced
+            agent_module = agent["name"]
+            if (agent_module in main_content or 
+                f"import {agent_module}" in main_content or
+                f"from {agent_module}" in main_content):
+                agent["used"] = True
+                used.append(agent)
+
+        return used
+
+# ============================================================================
+# WEBHOOK HANDLING
+# ============================================================================
+
+def normalize_webhook(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize common CI/CD webhook payloads."""
+    normalized = {
+        "received_at": datetime.utcnow().isoformat(),
+        "provider": "unknown",
+        "status": "unknown",
+        "branch": None,
+        "commit": None,
+        "repository": None,
+        "run_id": None,
+        "job_name": None,
+        "trigger": None,
+    }
+
+    # GitHub Actions
+    if "action" in data or "workflow" in data:
+        normalized["provider"] = "github"
+        normalized["status"] = data.get("action", "unknown")
+        normalized["branch"] = data.get("ref", "").replace("refs/heads/", "")
+        normalized["commit"] = data.get("head_commit", {}).get("id")
+        normalized["repository"] = data.get("repository", {}).get("full_name")
+        normalized["run_id"] = data.get("workflow_run", {}).get("id")
+        normalized["trigger"] = data.get("workflow_run", {}).get("event")
+
+    # GitLab
+    elif "project" in data and "pipeline" in data:
+        normalized["provider"] = "gitlab"
+        normalized["status"] = data.get("pipeline", {}).get("status", "unknown")
+        normalized["branch"] = data.get("ref")
+        normalized["commit"] = data.get("checkout_sha")
+        normalized["repository"] = data.get("project", {}).get("path_with_namespace")
+        normalized["run_id"] = data.get("pipeline", {}).get("id")
+        normalized["trigger"] = data.get("trigger")
+
+    # Azure DevOps
+    elif "resource" in data:
+        normalized["provider"] = "azure"
+        normalized["status"] = data.get("resourceContainers", {}).get("account", {}).get("name", "unknown")
+
+    # Jenkins
+    elif "build" in data:
+        normalized["provider"] = "jenkins"
+        normalized["status"] = data.get("build", {}).get("status")
+        normalized["run_id"] = data.get("build", {}).get("number")
+
+    webhook_history.add(normalized)
+    return normalized
+
+def validate_webhook_token(auth_header: Optional[str] = None, token_header: Optional[str] = None) -> bool:
+    """Validate webhook authentication."""
+    if not WEBHOOK_TOKEN:
+        return True
+
+    token = None
+    if auth_header and auth_header.startswith("Bearer "):
+        token = auth_header[7:]
+    elif token_header:
+        token = token_header
+
+    if not token:
+        return False
+
+    return hmac.compare_digest(token, WEBHOOK_TOKEN)
+
+# ============================================================================
+# USAGE TELEMETRY
+# ============================================================================
+
+def record_usage(agent_id: str, usage_data: Dict[str, Any]) -> bool:
+    """Record agent usage telemetry."""
     try:
-        data = request.get_json() or {}
-        status = data.get("status", "unknown")
-        commit = data.get("commit", "")
-        
-        monitoring_state.add_build(status, commit)
-        
-        # Simulate agent processing
-        for agent_key, agent in AGENTS_REGISTRY.items():
-            agent.requests_used_hour += 1
-            agent.requests_used_day += 1
-            agent.tokens_used += 5000
-            agent.success_count += 1
-        
-        return jsonify({
-            "status": "success",
-            "message": "Monitor status received and processed",
-            "pipeline": PIPELINE_NAME
-        }), 200
-    
+        record = {
+            "agent_id": agent_id,
+            "timestamp": datetime.utcnow().isoformat(),
+        }
+        record.update(usage_data)
+        usage_history.add(record)
+        return True
     except Exception as e:
-        monitoring_state.add_alert("error", f"Monitor webhook error: {str(e)}")
-        return jsonify({"status": "error", "message": str(e)}), 500
+        logger.error(f"Error recording usage: {e}")
+        return False
 
-# ══════════════════════════════════════════════════════════════
-# BLUEPRINT ROUTES - MONITOR
-# ══════════════════════════════════════════════════════════════
+def get_agent_usage_summary(agent_id: str) -> Dict[str, Any]:
+    """Get usage summary for an agent."""
+    all_usage = usage_history.get_all()
+    agent_usage = [u for u in all_usage if u.get("agent_id") == agent_id]
 
-@monitor_bp.get("/health")
-def monitor_health():
-    """Health check endpoint."""
-    return jsonify({
-        "status": "healthy",
-        "pipeline": PIPELINE_NAME,
-        "agents": {k: v.status for k, v in AGENTS_REGISTRY.items()}
-    })
+    if not agent_usage:
+        return {
+            "prompt_tokens": "No telemetry received",
+            "completion_tokens": "No telemetry received",
+            "total_tokens": "No telemetry received",
+            "request_count": "No telemetry received",
+            "hourly_limit": "Not configured",
+            "daily_limit": "Not configured",
+        }
 
-@monitor_bp.get("/agents")
-def get_agents():
-    """Get all agents information."""
-    return jsonify({
-        "agents": [agent.to_dict() for agent in AGENTS_REGISTRY.values()]
-    })
+    latest = agent_usage[0]
+    return {
+        "prompt_tokens": latest.get("prompt_tokens", "Unknown"),
+        "completion_tokens": latest.get("completion_tokens", "Unknown"),
+        "total_tokens": latest.get("total_tokens", "Unknown"),
+        "request_count": latest.get("request_count", "Unknown"),
+        "hourly_limit": latest.get("hourly_limit", "Not configured"),
+        "daily_limit": latest.get("daily_limit", "Not configured"),
+        "context_window": latest.get("context_window", "Unknown"),
+        "last_updated": latest.get("timestamp"),
+    }
 
-@monitor_bp.get("/pipeline")
-def get_pipeline_info():
-    """Get pipeline information."""
-    return jsonify({
-        "name": PIPELINE_NAME,
-        "description": PIPELINE_DESCRIPTION,
-        "detected_at": datetime.now().isoformat()
-    })
+# ============================================================================
+# CACHE MANAGEMENT
+# ============================================================================
 
-@monitor_bp.get("/metrics")
-def get_metrics():
-    """Get monitoring metrics."""
-    return jsonify({
-        "metrics": monitoring_state.metrics,
-        "build_history": monitoring_state.build_history[-10:],
-        "scan_results": monitoring_state.scan_results[-10:]
-    })
+def get_cached_scan() -> Optional[Dict[str, Any]]:
+    """Get cached scan if fresh."""
+    with scan_cache["lock"]:
+        if scan_cache["data"] and (time.time() - scan_cache["timestamp"]) < SCAN_CACHE_TTL:
+            return scan_cache["data"]
+    return None
 
-# ══════════════════════════════════════════════════════════════
-# BLUEPRINT ROUTES - SCANNER
-# ══════════════════════════════════════════════════════════════
+def cache_scan(data: Dict[str, Any]):
+    """Cache scan results."""
+    with scan_cache["lock"]:
+        scan_cache["data"] = data
+        scan_cache["timestamp"] = time.time()
 
-@scanner_bp.post("/scan")
-def run_scan():
-    """Trigger security scan."""
-    try:
-        data = request.get_json() or {}
-        scan_type = data.get("type", "general")
-        
-        # Simulate scan
-        vulnerabilities = {"critical": 2, "high": 5, "medium": 12}
-        monitoring_state.add_scan(scan_type, 19, 2)
-        
-        # Update agent metrics
-        security_agent = AGENTS_REGISTRY.get("security_scanner")
-        if security_agent:
-            security_agent.requests_used_hour += 1
-            security_agent.requests_used_day += 1
-            security_agent.tokens_used += 25000
-            security_agent.success_count += 1
-        
-        return jsonify({
-            "status": "completed",
-            "vulnerabilities": vulnerabilities
-        })
-    
-    except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
+def perform_full_scan() -> Dict[str, Any]:
+    """Perform a complete project scan."""
+    cached = get_cached_scan()
+    if cached:
+        return cached
 
-@scanner_bp.get("/results")
-def get_scan_results():
-    """Get scan results."""
-    return jsonify({
-        "results": monitoring_state.scan_results[-20:]
-    })
+    files_data = FileScanner.scan_files()
+    all_agents, used_agents = AIAgentDetector.detect_agents(files_data)
+    pipeline_info = PipelineDetector.get_pipeline_summary()
 
-# ══════════════════════════════════════════════════════════════
-# EMBEDDED HTML/CSS/JS TEMPLATE
-# ══════════════════════════════════════════════════════════════
+    result = {
+        "scanned_at": datetime.utcnow().isoformat(),
+        "project_root": str(PROJECT_ROOT),
+        "files": files_data,
+        "agents": {
+            "all": all_agents,
+            "used": used_agents,
+        },
+        "pipeline": pipeline_info,
+    }
 
-DASHBOARD_TEMPLATE = """
-<!DOCTYPE html>
+    cache_scan(result)
+    return result
+
+# ============================================================================
+# FLASK APPLICATION & BLUEPRINTS
+# ============================================================================
+
+# Create Flask app
+application = Flask(__name__)
+application.config["JSON_SORT_KEYS"] = False
+
+# Embedded HTML template
+INDEX_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>SentinelOps-Lite Dashboard</title>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/axios/dist/axios.min.js"></script>
+    <title>SentinelOps - AI Agent Monitor</title>
     <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
-        
-        :root {
-            --primary-color: #10b981;
-            --secondary-color: #06b6d4;
-            --danger-color: #ef4444;
-            --warning-color: #f59e0b;
-            --dark-bg: #f0fdf4;
-            --card-bg: #ffffff;
-            --border-color: #d1fae5;
-            --text-dark: #064e3b;
-            --text-light: #047857;
-            --shadow: 0 4px 6px rgba(16, 185, 129, 0.1);
-        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
         
         body {
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            background: linear-gradient(135deg, #f0fdf4 0%, #ecfdf5 100%);
-            color: var(--text-dark);
-            min-height: 100vh;
-            padding: 20px;
-        }
-        
-        .container {
-            max-width: 1400px;
-            margin: 0 auto;
-        }
-        
-        /* ── HEADER ─────────────────────────────── */
-        .header {
-            background: linear-gradient(135deg, var(--primary-color) 0%, var(--secondary-color) 100%);
-            color: white;
-            padding: 30px;
-            border-radius: 12px;
-            margin-bottom: 30px;
-            box-shadow: var(--shadow);
-        }
-        
-        .header h1 {
-            font-size: 2.5em;
-            margin-bottom: 10px;
-            display: flex;
-            align-items: center;
-            gap: 15px;
-        }
-        
-        .header-icon {
-            font-size: 3em;
-        }
-        
-        .header-info {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
-            gap: 20px;
-            margin-top: 20px;
-        }
-        
-        .info-box {
-            background: rgba(255, 255, 255, 0.15);
-            padding: 15px;
-            border-radius: 8px;
-            backdrop-filter: blur(10px);
-        }
-        
-        .info-box-label {
-            font-size: 0.85em;
-            opacity: 0.9;
-            margin-bottom: 5px;
-        }
-        
-        .info-box-value {
-            font-size: 1.3em;
-            font-weight: bold;
-        }
-        
-        /* ── TABS ───────────────────────────────── */
-        .tabs {
-            display: flex;
-            gap: 10px;
-            margin-bottom: 30px;
-            flex-wrap: wrap;
-        }
-        
-        .tab-btn {
-            padding: 12px 25px;
-            border: 2px solid var(--border-color);
-            background: var(--card-bg);
-            color: var(--text-dark);
-            cursor: pointer;
-            border-radius: 8px;
-            font-weight: 600;
-            transition: all 0.3s ease;
-            display: flex;
-            align-items: center;
-            gap: 8px;
-        }
-        
-        .tab-btn:hover {
-            background: var(--primary-color);
-            color: white;
-            transform: translateY(-2px);
-        }
-        
-        .tab-btn.active {
-            background: var(--primary-color);
-            color: white;
-            border-color: var(--primary-color);
-        }
-        
-        /* ── GRID LAYOUT ────────────────────────── */
-        .grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
-            gap: 25px;
-            margin-bottom: 30px;
-        }
-        
-        .grid-wide {
-            grid-column: 1 / -1;
-        }
-        
-        /* ── CARDS ──────────────────────────────── */
-        .card {
-            background: var(--card-bg);
-            border-radius: 12px;
-            padding: 25px;
-            box-shadow: var(--shadow);
-            border-left: 4px solid var(--primary-color);
-            transition: all 0.3s ease;
-        }
-        
-        .card:hover {
-            transform: translateY(-5px);
-            box-shadow: 0 8px 12px rgba(16, 185, 129, 0.15);
-        }
-        
-        .card.danger {
-            border-left-color: var(--danger-color);
-        }
-        
-        .card.warning {
-            border-left-color: var(--warning-color);
-        }
-        
-        .card-title {
-            font-size: 1.2em;
-            font-weight: 700;
-            margin-bottom: 15px;
-            color: var(--text-dark);
-            display: flex;
-            align-items: center;
-            gap: 10px;
-        }
-        
-        .card-title-icon {
-            font-size: 1.5em;
-        }
-        
-        .card-content {
-            color: var(--text-light);
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            background: #f8f9fa;
+            color: #2c3e50;
             line-height: 1.6;
         }
         
-        /* ── METRICS ────────────────────────────── */
-        .metric {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            padding: 12px 0;
-            border-bottom: 1px solid var(--border-color);
-        }
+        .container { max-width: 1400px; margin: 0 auto; padding: 20px; }
         
-        .metric:last-child {
-            border-bottom: none;
-        }
-        
-        .metric-label {
-            font-weight: 500;
-        }
-        
-        .metric-value {
-            font-weight: bold;
-            color: var(--primary-color);
-            font-size: 1.1em;
-        }
-        
-        /* ── PROGRESS BARS ──────────────────────── */
-        .progress-bar {
-            background: var(--border-color);
-            border-radius: 8px;
-            height: 8px;
-            margin: 8px 0;
-            overflow: hidden;
-        }
-        
-        .progress-fill {
-            background: linear-gradient(90deg, var(--primary-color), var(--secondary-color));
-            height: 100%;
-            border-radius: 8px;
-            transition: width 0.3s ease;
-        }
-        
-        .progress-fill.warning {
-            background: linear-gradient(90deg, var(--warning-color), var(--primary-color));
-        }
-        
-        .progress-fill.danger {
-            background: linear-gradient(90deg, var(--danger-color), var(--warning-color));
-        }
-        
-        /* ── STATUS BADGE ───────────────────────── */
-        .badge {
-            display: inline-block;
-            padding: 6px 12px;
-            border-radius: 20px;
-            font-size: 0.85em;
-            font-weight: 600;
-        }
-        
-        .badge-success {
-            background: #d1fae5;
-            color: #047857;
-        }
-        
-        .badge-warning {
-            background: #fef3c7;
-            color: #92400e;
-        }
-        
-        .badge-danger {
-            background: #fee2e2;
-            color: #991b1b;
-        }
-        
-        .badge-info {
-            background: #cffafe;
-            color: #164e63;
-        }
-        
-        /* ── AGENT CARD GRID ────────────────────── */
-        .agents-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
-            gap: 20px;
-        }
-        
-        .agent-card {
-            background: var(--card-bg);
-            border-radius: 12px;
+        header {
+            background: white;
+            border-bottom: 2px solid #10b981;
             padding: 20px;
-            box-shadow: var(--shadow);
-            border-top: 4px solid var(--primary-color);
-        }
-        
-        .agent-header {
-            margin-bottom: 15px;
-        }
-        
-        .agent-name {
-            font-size: 1.1em;
-            font-weight: bold;
-            color: var(--text-dark);
-            margin-bottom: 5px;
-        }
-        
-        .agent-provider {
-            font-size: 0.9em;
-            color: var(--text-light);
-        }
-        
-        .agent-model {
-            font-size: 0.85em;
-            background: var(--border-color);
-            color: var(--text-dark);
-            padding: 4px 8px;
-            border-radius: 4px;
-            display: inline-block;
-            margin-top: 8px;
-        }
-        
-        .agent-stats {
-            margin-top: 15px;
-            font-size: 0.9em;
-        }
-        
-        .agent-stat {
-            display: flex;
-            justify-content: space-between;
-            padding: 8px 0;
-            border-bottom: 1px solid var(--border-color);
-        }
-        
-        .agent-stat:last-child {
-            border-bottom: none;
-        }
-        
-        /* ── CHART CONTAINER ────────────────────── */
-        .chart-container {
-            position: relative;
-            height: 300px;
-            margin: 20px 0;
-        }
-        
-        /* ── TABLE ──────────────────────────────── */
-        .table-responsive {
-            overflow-x: auto;
-        }
-        
-        table {
-            width: 100%;
-            border-collapse: collapse;
-            margin-top: 15px;
-        }
-        
-        th {
-            background: var(--border-color);
-            color: var(--text-dark);
-            padding: 12px;
-            text-align: left;
-            font-weight: 600;
-        }
-        
-        td {
-            padding: 12px;
-            border-bottom: 1px solid var(--border-color);
-        }
-        
-        tr:hover {
-            background: rgba(16, 185, 129, 0.05);
-        }
-        
-        /* ── ALERTS ─────────────────────────────── */
-        .alert {
-            padding: 15px 20px;
+            margin-bottom: 30px;
             border-radius: 8px;
-            margin-bottom: 15px;
-            display: flex;
-            gap: 15px;
-            align-items: flex-start;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.08);
         }
         
-        .alert-icon {
-            font-size: 1.3em;
-            flex-shrink: 0;
-        }
-        
-        .alert-content {
-            flex: 1;
-        }
-        
-        .alert-title {
-            font-weight: 600;
+        h1 {
+            color: #059669;
+            font-size: 2em;
             margin-bottom: 5px;
         }
         
-        .alert-success {
-            background: #d1fae5;
-            color: #047857;
+        .header-subtitle {
+            color: #64748b;
+            font-size: 0.95em;
+        }
+        
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+        
+        .card {
+            background: white;
+            border-radius: 8px;
+            padding: 20px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.08);
             border-left: 4px solid #10b981;
         }
         
-        .alert-error {
-            background: #fee2e2;
-            color: #991b1b;
-            border-left: 4px solid #ef4444;
+        .card h2 {
+            font-size: 1.1em;
+            margin-bottom: 15px;
+            color: #059669;
+            display: flex;
+            align-items: center;
+            gap: 10px;
         }
         
-        .alert-warning {
-            background: #fef3c7;
-            color: #92400e;
-            border-left: 4px solid #f59e0b;
+        .card-content {
+            font-size: 0.95em;
+            line-height: 1.8;
         }
         
-        /* ── LOADING SPINNER ────────────────────── */
-        .spinner {
-            border: 4px solid var(--border-color);
-            border-top: 4px solid var(--primary-color);
+        .badge {
+            display: inline-block;
+            padding: 6px 12px;
+            border-radius: 4px;
+            font-size: 0.85em;
+            font-weight: 500;
+            margin: 4px 4px 4px 0;
+        }
+        
+        .badge.success { background: #d1fae5; color: #065f46; }
+        .badge.warning { background: #fef3c7; color: #92400e; }
+        .badge.info { background: #dbeafe; color: #0c2d6b; }
+        .badge.error { background: #fee2e2; color: #7f1d1d; }
+        
+        .status-indicator {
+            display: inline-block;
+            width: 12px;
+            height: 12px;
             border-radius: 50%;
-            width: 40px;
-            height: 40px;
-            animation: spin 1s linear infinite;
+            margin-right: 6px;
         }
         
-        @keyframes spin {
-            0% { transform: rotate(0deg); }
-            100% { transform: rotate(360deg); }
+        .status-indicator.success { background: #10b981; }
+        .status-indicator.warning { background: #f59e0b; }
+        .status-indicator.error { background: #ef4444; }
+        .status-indicator.unknown { background: #6b7280; }
+        
+        .progress-bar {
+            width: 100%;
+            height: 24px;
+            background: #e5e7eb;
+            border-radius: 4px;
+            overflow: hidden;
+            margin: 10px 0;
         }
         
-        /* ── TAB CONTENT ────────────────────────── */
+        .progress-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #10b981, #059669);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            font-size: 0.75em;
+            font-weight: bold;
+            transition: width 0.3s ease;
+        }
+        
+        .chart {
+            height: 200px;
+            background: #f3f4f6;
+            border-radius: 4px;
+            margin: 15px 0;
+            position: relative;
+            display: flex;
+            align-items: flex-end;
+            justify-content: space-around;
+            padding: 10px;
+        }
+        
+        .chart-bar {
+            width: 8%;
+            background: #10b981;
+            border-radius: 4px 4px 0 0;
+            min-height: 20px;
+            position: relative;
+        }
+        
+        .chart-bar:hover {
+            background: #059669;
+        }
+        
+        .chart-bar-label {
+            position: absolute;
+            bottom: -20px;
+            left: 0;
+            right: 0;
+            text-align: center;
+            font-size: 0.7em;
+            color: #64748b;
+        }
+        
+        .file-tree {
+            background: #f8f9fa;
+            border: 1px solid #e5e7eb;
+            border-radius: 4px;
+            padding: 15px;
+            font-family: "Monaco", "Courier New", monospace;
+            font-size: 0.9em;
+            line-height: 1.6;
+            max-height: 400px;
+            overflow-y: auto;
+        }
+        
+        .tree-item {
+            margin-left: 20px;
+            color: #475569;
+        }
+        
+        .tree-folder::before { content: "📁 "; }
+        .tree-file::before { content: "📄 "; }
+        
+        .tab-container {
+            display: flex;
+            border-bottom: 2px solid #e5e7eb;
+            margin-bottom: 20px;
+            gap: 10px;
+        }
+        
+        .tab-button {
+            padding: 10px 20px;
+            border: none;
+            background: none;
+            cursor: pointer;
+            font-size: 0.95em;
+            color: #64748b;
+            border-bottom: 3px solid transparent;
+            transition: all 0.3s ease;
+        }
+        
+        .tab-button.active {
+            color: #059669;
+            border-bottom-color: #059669;
+            font-weight: 500;
+        }
+        
+        .tab-button:hover {
+            color: #059669;
+        }
+        
         .tab-content {
             display: none;
         }
         
         .tab-content.active {
             display: block;
-            animation: fadeIn 0.3s ease;
         }
         
-        @keyframes fadeIn {
-            from { opacity: 0; transform: translateY(10px); }
-            to { opacity: 1; transform: translateY(0); }
+        button.action-btn {
+            background: #059669;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 0.95em;
+            transition: background 0.3s ease;
         }
         
-        /* ── RESPONSIVE ─────────────────────────── */
-        @media (max-width: 768px) {
-            .header h1 {
-                font-size: 1.8em;
-            }
-            
-            .grid {
-                grid-template-columns: 1fr;
-            }
-            
-            .header-info {
-                grid-template-columns: 1fr;
-            }
-            
-            .tabs {
-                flex-direction: column;
-            }
-            
-            .tab-btn {
-                width: 100%;
-            }
+        button.action-btn:hover {
+            background: #047857;
         }
         
-        /* ── UTILITY CLASSES ────────────────────── */
-        .text-center {
-            text-align: center;
-        }
-        
-        .mt-20 {
-            margin-top: 20px;
-        }
-        
-        .p-20 {
-            padding: 20px;
-        }
-        
-        .gap-20 {
-            gap: 20px;
+        button.action-btn:disabled {
+            background: #cbd5e1;
+            cursor: not-allowed;
         }
         
         .loading {
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            min-height: 300px;
-            gap: 15px;
+            display: inline-block;
+            width: 20px;
+            height: 20px;
+            border: 3px solid #e5e7eb;
+            border-top-color: #059669;
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
         }
         
-        .no-data {
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+        
+        .empty-state {
             text-align: center;
-            color: var(--text-light);
             padding: 40px 20px;
+            color: #94a3b8;
+        }
+        
+        .empty-state svg {
+            width: 60px;
+            height: 60px;
+            margin-bottom: 20px;
+            opacity: 0.5;
+        }
+        
+        .agent-card {
+            border: 1px solid #e5e7eb;
+            border-radius: 6px;
+            padding: 15px;
+            margin-bottom: 15px;
+            background: white;
+        }
+        
+        .agent-card-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 10px;
+        }
+        
+        .agent-name {
+            font-weight: 600;
+            color: #059669;
+        }
+        
+        .agent-confidence {
+            font-size: 0.85em;
+            padding: 4px 8px;
+            background: #e0f2fe;
+            color: #0369a1;
+            border-radius: 3px;
+        }
+        
+        .agent-meta {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 10px;
+            font-size: 0.9em;
+            margin: 10px 0;
+        }
+        
+        .meta-item {
+            background: #f3f4f6;
+            padding: 8px;
+            border-radius: 3px;
+        }
+        
+        .meta-label {
+            font-weight: 500;
+            color: #059669;
+        }
+        
+        .meta-value {
+            color: #475569;
+            word-break: break-all;
+        }
+        
+        @media (max-width: 768px) {
+            .grid { grid-template-columns: 1fr; }
+            .card { padding: 15px; }
+            h1 { font-size: 1.5em; }
+            .tab-container { flex-wrap: wrap; }
+        }
+        
+        .footer {
+            text-align: center;
+            padding: 20px;
+            color: #94a3b8;
+            font-size: 0.9em;
+            margin-top: 40px;
+            border-top: 1px solid #e5e7eb;
         }
     </style>
 </head>
 <body>
     <div class="container">
-        <!-- HEADER -->
-        <div class="header">
-            <h1>
-                <span class="header-icon">🛡️</span>
-                SentinelOps-Lite Dashboard
-            </h1>
-            <div class="header-info">
-                <div class="info-box">
-                    <div class="info-box-label">🔧 Pipeline</div>
-                    <div class="info-box-value" id="pipelineName">Detecting...</div>
-                </div>
-                <div class="info-box">
-                    <div class="info-box-label">📊 Total Builds</div>
-                    <div class="info-box-value" id="totalBuilds">0</div>
-                </div>
-                <div class="info-box">
-                    <div class="info-box-label">✅ Passed</div>
-                    <div class="info-box-value" id="passedBuilds">0</div>
-                </div>
-                <div class="info-box">
-                    <div class="info-box-label">❌ Failed</div>
-                    <div class="info-box-value" id="failedBuilds">0</div>
-                </div>
-            </div>
-        </div>
-        
-        <!-- TABS -->
-        <div class="tabs">
-            <button class="tab-btn active" data-tab="dashboard">📊 Dashboard</button>
-            <button class="tab-btn" data-tab="agents">🤖 AI Agents</button>
-            <button class="tab-btn" data-tab="scans">🔍 Security Scans</button>
-            <button class="tab-btn" data-tab="pipeline">🔧 Pipeline Info</button>
-            <button class="tab-btn" data-tab="alerts">🔔 Alerts</button>
-        </div>
-        
-        <!-- DASHBOARD TAB -->
-        <div id="dashboard" class="tab-content active">
-            <div class="grid">
-                <!-- Metrics Cards -->
-                <div class="card">
-                    <div class="card-title">
-                        <span class="card-title-icon">📈</span>
-                        Build Metrics
-                    </div>
-                    <div class="card-content">
-                        <div class="metric">
-                            <span class="metric-label">Total Builds</span>
-                            <span class="metric-value" id="metric-totalBuilds">0</span>
-                        </div>
-                        <div class="metric">
-                            <span class="metric-label">Success Rate</span>
-                            <span class="metric-value" id="metric-successRate">0%</span>
-                        </div>
-                        <div class="metric">
-                            <span class="metric-label">Failed Builds</span>
-                            <span class="metric-value" id="metric-failedBuilds">0</span>
-                        </div>
-                    </div>
-                </div>
-                
-                <div class="card">
-                    <div class="card-title">
-                        <span class="card-title-icon">🔍</span>
-                        Security Overview
-                    </div>
-                    <div class="card-content">
-                        <div class="metric">
-                            <span class="metric-label">Total Scans</span>
-                            <span class="metric-value" id="metric-totalScans">0</span>
-                        </div>
-                        <div class="metric">
-                            <span class="metric-label">Vulnerabilities</span>
-                            <span class="metric-value" id="metric-vulns">0</span>
-                        </div>
-                        <div class="metric">
-                            <span class="metric-label">Critical Issues</span>
-                            <span class="metric-value danger" id="metric-critical">0</span>
-                        </div>
-                    </div>
-                </div>
-                
-                <div class="card">
-                    <div class="card-title">
-                        <span class="card-title-icon">🤖</span>
-                        AI Agents Health
-                    </div>
-                    <div class="card-content">
-                        <div class="metric">
-                            <span class="metric-label">Active Agents</span>
-                            <span class="metric-value" id="metric-activeAgents">0</span>
-                        </div>
-                        <div class="metric">
-                            <span class="metric-label">Total Requests</span>
-                            <span class="metric-value" id="metric-totalRequests">0</span>
-                        </div>
-                        <div class="metric">
-                            <span class="metric-label">Avg Error Rate</span>
-                            <span class="metric-value" id="metric-errorRate">0%</span>
-                        </div>
-                    </div>
+        <header>
+            <h1>🤖 SentinelOps Agent Monitor</h1>
+            <p class="header-subtitle">AI Agent Observability Dashboard for <code id="project-name">—</code></p>
+        </header>
+
+        <div class="grid">
+            <div class="card">
+                <h2>⚙️ Pipeline Status</h2>
+                <div class="card-content" id="pipeline-status">
+                    <div class="loading"></div> Loading...
                 </div>
             </div>
             
-            <!-- Charts -->
-            <div class="grid">
-                <div class="card grid-wide">
-                    <div class="card-title">📊 Build History (Last 10)</div>
-                    <div class="chart-container">
-                        <canvas id="buildChart"></canvas>
-                    </div>
+            <div class="card">
+                <h2>🤖 AI Agents Found</h2>
+                <div class="card-content" id="agents-summary">
+                    <div class="loading"></div> Loading...
                 </div>
             </div>
             
-            <!-- Recent History -->
-            <div class="grid">
-                <div class="card grid-wide">
-                    <div class="card-title">📋 Recent Builds</div>
-                    <div class="table-responsive">
-                        <table>
-                            <thead>
-                                <tr>
-                                    <th>Timestamp</th>
-                                    <th>Status</th>
-                                    <th>Commit</th>
-                                </tr>
-                            </thead>
-                            <tbody id="buildHistoryTable">
-                                <tr>
-                                    <td colspan="3" class="text-center">No builds yet</td>
-                                </tr>
-                            </tbody>
-                        </table>
-                    </div>
+            <div class="card">
+                <h2>📊 File Inventory</h2>
+                <div class="card-content" id="files-summary">
+                    <div class="loading"></div> Loading...
                 </div>
             </div>
         </div>
-        
-        <!-- AI AGENTS TAB -->
-        <div id="agents" class="tab-content">
-            <div class="grid">
-                <div class="card grid-wide">
-                    <div class="card-title">🤖 Registered AI Agents</div>
-                </div>
+
+        <div class="card" style="margin-bottom: 30px;">
+            <h2>🔍 Project Overview</h2>
+            <div class="tab-container">
+                <button class="tab-button active" onclick="switchTab('files')">Files</button>
+                <button class="tab-button" onclick="switchTab('agents')">AI Agents</button>
+                <button class="tab-button" onclick="switchTab('pipeline')">Pipeline</button>
+                <button class="tab-button" onclick="switchTab('history')">History</button>
             </div>
-            <div class="agents-grid" id="agentsGrid">
-                <div class="loading">
-                    <div class="spinner"></div>
-                    <span>Loading agents...</span>
-                </div>
+
+            <div id="files" class="tab-content active">
+                <button class="action-btn" onclick="rescanProject()">↻ Rescan Project</button>
+                <div id="files-content" style="margin-top: 15px;"></div>
             </div>
-        </div>
-        
-        <!-- SCANS TAB -->
-        <div id="scans" class="tab-content">
-            <div class="grid">
-                <div class="card">
-                    <div class="card-title">🔍 Run Security Scan</div>
-                    <div class="card-content">
-                        <button id="runScanBtn" class="btn" style="background: var(--primary-color); color: white; padding: 10px 20px; border: none; border-radius: 6px; cursor: pointer; font-weight: 600;">
-                            Start Scan
-                        </button>
-                        <div id="scanStatus" style="margin-top: 15px; display: none;">
-                            <div class="spinner"></div>
-                            <p>Scan in progress...</p>
-                        </div>
-                    </div>
-                </div>
+
+            <div id="agents" class="tab-content">
+                <div id="agents-content"></div>
             </div>
-            
-            <div class="grid">
-                <div class="card grid-wide">
-                    <div class="card-title">📊 Scan Results</div>
-                    <div class="table-responsive">
-                        <table>
-                            <thead>
-                                <tr>
-                                    <th>Timestamp</th>
-                                    <th>Type</th>
-                                    <th>Vulnerabilities</th>
-                                    <th>Critical</th>
-                                </tr>
-                            </thead>
-                            <tbody id="scanResultsTable">
-                                <tr>
-                                    <td colspan="4" class="text-center">No scans yet</td>
-                                </tr>
-                            </tbody>
-                        </table>
-                    </div>
-                </div>
+
+            <div id="pipeline" class="tab-content">
+                <div id="pipeline-content"></div>
+            </div>
+
+            <div id="history" class="tab-content">
+                <div id="history-content"></div>
             </div>
         </div>
-        
-        <!-- PIPELINE INFO TAB -->
-        <div id="pipeline" class="tab-content">
-            <div class="grid">
-                <div class="card">
-                    <div class="card-title">🔧 Pipeline Configuration</div>
-                    <div class="card-content">
-                        <div class="metric">
-                            <span class="metric-label">Pipeline Name</span>
-                            <span class="metric-value" id="pipelineNameDetail">-</span>
-                        </div>
-                        <div class="metric">
-                            <span class="metric-label">Status</span>
-                            <span class="badge badge-success">Active</span>
-                        </div>
-                    </div>
-                </div>
-                
-                <div class="card">
-                    <div class="card-title">📖 Description</div>
-                    <div class="card-content" id="pipelineDescription">
-                        Loading...
-                    </div>
-                </div>
-            </div>
-        </div>
-        
-        <!-- ALERTS TAB -->
-        <div id="alerts" class="tab-content">
-            <div class="grid">
-                <div class="card grid-wide">
-                    <div class="card-title">🔔 System Alerts</div>
-                    <div id="alertsContainer">
-                        <div class="no-data">No alerts at this time</div>
-                    </div>
-                </div>
-            </div>
+
+        <div class="footer">
+            Last updated: <span id="last-updated">—</span> | <a href="javascript:location.reload()" style="color: #059669;">Refresh</a>
         </div>
     </div>
-    
+
     <script>
-        // ── API BASE URL ─────────────────────────────────
-        const API_BASE = '/monitor';
-        
-        // ── STATE ────────────────────────────────────────
-        let buildChart = null;
-        let refreshInterval = null;
-        
-        // ── CHART CONFIGURATION ─────────────────────────
-        function initBuildChart(data) {
-            const ctx = document.getElementById('buildChart');
-            if (!ctx) return;
+        const API_BASE = "/api/sentinelops";
+        let scanData = null;
+
+        function switchTab(tabName) {
+            document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
+            document.querySelectorAll('.tab-button').forEach(el => el.classList.remove('active'));
+            document.getElementById(tabName).classList.add('active');
+            event.target.classList.add('active');
             
-            const labels = data.build_history.map(b => 
-                new Date(b.timestamp).toLocaleTimeString()
-            );
-            const passedData = data.build_history.map(b => b.status === 'passed' ? 1 : 0);
-            const failedData = data.build_history.map(b => b.status === 'failed' ? 1 : 0);
-            
-            if (buildChart) {
-                buildChart.destroy();
-            }
-            
-            buildChart = new Chart(ctx, {
-                type: 'bar',
-                data: {
-                    labels: labels,
-                    datasets: [
-                        {
-                            label: 'Passed',
-                            data: passedData,
-                            backgroundColor: '#10b981',
-                            borderColor: '#047857',
-                            borderWidth: 1
-                        },
-                        {
-                            label: 'Failed',
-                            data: failedData,
-                            backgroundColor: '#ef4444',
-                            borderColor: '#991b1b',
-                            borderWidth: 1
-                        }
-                    ]
-                },
-                options: {
-                    responsive: true,
-                    maintainAspectRatio: false,
-                    plugins: {
-                        legend: {
-                            labels: {
-                                color: '#064e3b',
-                                font: { weight: 'bold' }
-                            }
-                        }
-                    },
-                    scales: {
-                        y: {
-                            beginAtZero: true,
-                            max: 1,
-                            ticks: { color: '#064e3b' },
-                            grid: { color: '#d1fae5' }
-                        },
-                        x: {
-                            ticks: { color: '#064e3b' },
-                            grid: { color: '#d1fae5' }
-                        }
-                    }
-                }
-            });
-        }
-        
-        // ── DATA FETCHING ────────────────────────────────
-        async function fetchPipelineInfo() {
-            try {
-                const response = await axios.get(`${API_BASE}/pipeline`);
-                document.getElementById('pipelineName').textContent = response.data.name;
-                document.getElementById('pipelineNameDetail').textContent = response.data.name;
-                document.getElementById('pipelineDescription').textContent = response.data.description;
-            } catch (error) {
-                console.error('Error fetching pipeline info:', error);
+            if (tabName === 'agents' && !document.getElementById('agents-content').innerHTML) {
+                renderAgentsTab();
+            } else if (tabName === 'pipeline' && !document.getElementById('pipeline-content').innerHTML) {
+                renderPipelineTab();
+            } else if (tabName === 'history' && !document.getElementById('history-content').innerHTML) {
+                renderHistoryTab();
             }
         }
-        
-        async function fetchAgents() {
-            try {
-                const response = await axios.get(`${API_BASE}/agents`);
-                const agentsGrid = document.getElementById('agentsGrid');
-                agentsGrid.innerHTML = '';
-                
-                response.data.agents.forEach(agent => {
-                    const agentCard = document.createElement('div');
-                    agentCard.className = 'agent-card';
-                    agentCard.innerHTML = `
-                        <div class="agent-header">
-                            <div class="agent-name">${agent.name}</div>
-                            <div class="agent-provider">
-                                <span class="badge badge-info">${agent.provider}</span>
-                            </div>
-                            <div class="agent-model">${agent.model}</div>
-                        </div>
-                        
-                        <div class="agent-stats">
-                            <div class="agent-stat">
-                                <span>Status</span>
-                                <span class="badge badge-success">${agent.status}</span>
-                            </div>
-                            
-                            <div class="agent-stat">
-                                <span>Token Usage</span>
-                                <span>${agent.tokens_used}/${agent.tokens_limit}</span>
-                            </div>
-                            <div class="progress-bar">
-                                <div class="progress-fill" style="width: ${agent.tokens_usage_percent}%"></div>
-                            </div>
-                            <div style="font-size: 0.8em; color: var(--text-light);">${agent.tokens_usage_percent.toFixed(1)}%</div>
-                            
-                            <div class="agent-stat mt-20">
-                                <span>Requests/Hour</span>
-                                <span>${agent.requests_used_hour}/${agent.requests_per_hour}</span>
-                            </div>
-                            <div class="progress-bar">
-                                <div class="progress-fill ${agent.requests_hour_percent > 80 ? 'warning' : ''}" style="width: ${agent.requests_hour_percent}%"></div>
-                            </div>
-                            <div style="font-size: 0.8em; color: var(--text-light);">${agent.requests_hour_percent.toFixed(1)}%</div>
-                            
-                            <div class="agent-stat mt-20">
-                                <span>Requests/Day</span>
-                                <span>${agent.requests_used_day}/${agent.requests_per_day}</span>
-                            </div>
-                            <div class="progress-bar">
-                                <div class="progress-fill ${agent.requests_day_percent > 80 ? 'warning' : ''}" style="width: ${agent.requests_day_percent}%"></div>
-                            </div>
-                            <div style="font-size: 0.8em; color: var(--text-light);">${agent.requests_day_percent.toFixed(1)}%</div>
-                            
-                            <div class="agent-stat mt-20">
-                                <span>Success Rate</span>
-                                <span>${(100 - agent.error_rate).toFixed(1)}%</span>
-                            </div>
-                            <div class="progress-bar">
-                                <div class="progress-fill" style="width: ${100 - agent.error_rate}%"></div>
-                            </div>
-                        </div>
-                    `;
-                    agentsGrid.appendChild(agentCard);
+
+        function formatDate(isoString) {
+            const date = new Date(isoString);
+            return date.toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+        }
+
+        function createStatusIndicator(status) {
+            const statusMap = {
+                'success': 'success',
+                'completed': 'success',
+                'passed': 'success',
+                'failure': 'error',
+                'failed': 'error',
+                'pending': 'warning',
+                'running': 'warning',
+            };
+            const type = statusMap[status?.toLowerCase()] || 'unknown';
+            return `<span class="status-indicator ${type}"></span>${status || 'Unknown'}`;
+        }
+
+        function loadDashboard() {
+            fetch(`${API_BASE}/summary`)
+                .then(r => r.json())
+                .then(data => {
+                    scanData = data;
+                    document.getElementById('project-name').textContent = data.project_root.split('/').pop();
+                    document.getElementById('last-updated').textContent = formatDate(data.scanned_at);
+                    
+                    renderPipelineStatus(data.pipeline);
+                    renderAgentsSummary(data.agents);
+                    renderFilesSummary(data.files);
+                    renderFilesTab(data.files);
+                })
+                .catch(err => {
+                    console.error('Error loading dashboard:', err);
+                    document.getElementById('pipeline-status').innerHTML = '<p style="color: red;">Error loading data</p>';
                 });
-            } catch (error) {
-                console.error('Error fetching agents:', error);
-            }
         }
-        
-        async function fetchMetrics() {
-            try {
-                const response = await axios.get(`${API_BASE}/metrics`);
-                const metrics = response.data.metrics;
-                
-                // Update header
-                document.getElementById('totalBuilds').textContent = metrics.total_builds;
-                document.getElementById('passedBuilds').textContent = metrics.passed_builds;
-                document.getElementById('failedBuilds').textContent = metrics.failed_builds;
-                
-                // Update metric cards
-                document.getElementById('metric-totalBuilds').textContent = metrics.total_builds;
-                document.getElementById('metric-failedBuilds').textContent = metrics.failed_builds;
-                
-                const successRate = metrics.total_builds > 0 
-                    ? ((metrics.passed_builds / metrics.total_builds) * 100).toFixed(1)
-                    : 0;
-                document.getElementById('metric-successRate').textContent = `${successRate}%`;
-                
-                document.getElementById('metric-totalScans').textContent = metrics.total_scans;
-                document.getElementById('metric-vulns').textContent = metrics.vulnerabilities_found;
-                document.getElementById('metric-critical').textContent = metrics.critical_issues;
-                
-                // Update build history table
-                const buildTable = document.getElementById('buildHistoryTable');
-                const buildHistory = response.data.build_history.slice().reverse();
-                
-                if (buildHistory.length === 0) {
-                    buildTable.innerHTML = '<tr><td colspan="3" class="text-center">No builds yet</td></tr>';
-                } else {
-                    buildTable.innerHTML = buildHistory.map(build => `
-                        <tr>
-                            <td>${new Date(build.timestamp).toLocaleString()}</td>
-                            <td><span class="badge ${build.status === 'passed' ? 'badge-success' : 'badge-danger'}">${build.status.toUpperCase()}</span></td>
-                            <td>${build.commit}</td>
-                        </tr>
-                    `).join('');
-                }
-                
-                // Update chart
-                initBuildChart(response.data);
-                
-                // Update AI agents metrics
-                fetchAgents();
-            } catch (error) {
-                console.error('Error fetching metrics:', error);
-            }
+
+        function renderPipelineStatus(pipeline) {
+            const html = `
+                <div>
+                    <strong>Detected:</strong><br>
+                    ${pipeline.configured.length ? pipeline.configured.map(p => `<span class="badge info">${p.toUpperCase()}</span>`).join('') : 'No pipelines configured'}
+                    <br><br>
+                    <strong>Runtime:</strong> ${pipeline.runtime ? `<span class="badge success">${pipeline.runtime.toUpperCase()}</span>` : 'Not detected'}<br>
+                    <strong>Confidence:</strong> <span class="badge ${pipeline.confidence === 'High' ? 'success' : 'warning'}">${pipeline.confidence}</span>
+                </div>
+            `;
+            document.getElementById('pipeline-status').innerHTML = html;
         }
-        
-        async function fetchScanResults() {
-            try {
-                const response = await axios.get(`${API_BASE.replace('/monitor', '/scanner')}/results`);
-                const scanTable = document.getElementById('scanResultsTable');
-                const results = response.data.results.slice().reverse();
-                
-                if (results.length === 0) {
-                    scanTable.innerHTML = '<tr><td colspan="4" class="text-center">No scans yet</td></tr>';
-                } else {
-                    scanTable.innerHTML = results.map(scan => `
-                        <tr>
-                            <td>${new Date(scan.timestamp).toLocaleString()}</td>
-                            <td>${scan.type}</td>
-                            <td>${scan.vulnerabilities}</td>
-                            <td><span class="badge badge-danger">${scan.critical}</span></td>
-                        </tr>
-                    `).join('');
-                }
-            } catch (error) {
-                console.error('Error fetching scan results:', error);
-            }
-        }
-        
-        // ── EVENT HANDLERS ───────────────────────────────
-        document.addEventListener('DOMContentLoaded', () => {
-            // Tab switching
-            document.querySelectorAll('.tab-btn').forEach(btn => {
-                btn.addEventListener('click', () => {
-                    const tabName = btn.dataset.tab;
-                    
-                    // Hide all tabs
-                    document.querySelectorAll('.tab-content').forEach(tab => {
-                        tab.classList.remove('active');
-                    });
-                    
-                    // Deactivate all buttons
-                    document.querySelectorAll('.tab-btn').forEach(b => {
-                        b.classList.remove('active');
-                    });
-                    
-                    // Show selected tab
-                    document.getElementById(tabName).classList.add('active');
-                    btn.classList.add('active');
-                });
-            });
+
+        function renderAgentsSummary(agents) {
+            const confirmed = agents.all.filter(a => a.classification === 'Confirmed AI agent').length;
+            const probable = agents.all.filter(a => a.classification === 'Probable AI agent').length;
+            const used = agents.used.length;
             
-            // Run scan button
-            document.getElementById('runScanBtn').addEventListener('click', async () => {
-                const btn = document.getElementById('runScanBtn');
-                const status = document.getElementById('scanStatus');
-                
+            const html = `
+                <div>
+                    <strong>Total Found:</strong> ${agents.all.length}<br>
+                    <strong>Confirmed:</strong> ${confirmed}<br>
+                    <strong>Probable:</strong> ${probable}<br>
+                    <strong>Actually Used:</strong> ${used}<br>
+                </div>
+            `;
+            document.getElementById('agents-summary').innerHTML = html;
+        }
+
+        function renderFilesSummary(files) {
+            const mainFiles = files.files.filter(f => f.type === 'main_app');
+            const html = `
+                <div>
+                    <strong>Total Files:</strong> ${files.total}<br>
+                    <strong>Main App:</strong> ${mainFiles.map(f => f.name).join(', ') || 'None'}<br>
+                    <strong>Python Files:</strong> ${files.files.filter(f => f.type === 'python').length}
+                </div>
+            `;
+            document.getElementById('files-summary').innerHTML = html;
+        }
+
+        function renderFilesTab(files) {
+            const mainFiles = files.files.filter(f => ['main_app', 'pipeline', 'ai_agent'].includes(f.type));
+            const html = mainFiles.length ? `
+                <table style="width: 100%; border-collapse: collapse; font-size: 0.9em;">
+                    <thead style="background: #f3f4f6; border-bottom: 2px solid #e5e7eb;">
+                        <tr>
+                            <th style="padding: 10px; text-align: left;">File</th>
+                            <th style="padding: 10px; text-align: left;">Type</th>
+                            <th style="padding: 10px; text-align: left;">Purpose</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        ${mainFiles.map(f => `
+                            <tr style="border-bottom: 1px solid #e5e7eb;">
+                                <td style="padding: 10px;"><code>${f.path}</code></td>
+                                <td style="padding: 10px;">${f.type}</td>
+                                <td style="padding: 10px;">${f.purpose}</td>
+                            </tr>
+                        `).join('')}
+                    </tbody>
+                </table>
+            ` : '<p class="empty-state">No files to display</p>';
+            document.getElementById('files-content').innerHTML = html;
+        }
+
+        function renderAgentsTab() {
+            if (!scanData) return;
+            const agents = scanData.agents.all;
+            const html = agents.length ? `
+                <div style="display: grid; gap: 15px;">
+                    ${agents.map(agent => `
+                        <div class="agent-card">
+                            <div class="agent-card-header">
+                                <span class="agent-name">${agent.name}</span>
+                                <span class="agent-confidence">${(agent.confidence * 100).toFixed(0)}%</span>
+                            </div>
+                            <div style="margin-bottom: 8px;">
+                                <span class="badge ${agent.classification.includes('Confirmed') ? 'success' : 'warning'}">${agent.classification}</span>
+                            </div>
+                            <div class="agent-meta">
+                                <div class="meta-item">
+                                    <div class="meta-label">Provider</div>
+                                    <div class="meta-value">${agent.provider}</div>
+                                </div>
+                                <div class="meta-item">
+                                    <div class="meta-label">Model</div>
+                                    <div class="meta-value">${agent.model}</div>
+                                </div>
+                                <div class="meta-item">
+                                    <div class="meta-label">Framework</div>
+                                    <div class="meta-value">${agent.framework}</div>
+                                </div>
+                                <div class="meta-item">
+                                    <div class="meta-label">Used</div>
+                                    <div class="meta-value">${agent.used ? '✓ Yes' : '✗ Repository only'}</div>
+                                </div>
+                            </div>
+                        </div>
+                    `).join('')}
+                </div>
+            ` : '<p class="empty-state">No AI agents found in this project</p>';
+            document.getElementById('agents-content').innerHTML = html;
+        }
+
+        function renderPipelineTab() {
+            if (!scanData) return;
+            const pipeline = scanData.pipeline;
+            const webhook = pipeline.latest_webhook;
+            const html = webhook ? `
+                <div style="background: #f3f4f6; padding: 15px; border-radius: 4px;">
+                    <div style="margin-bottom: 15px;">
+                        <strong>Provider:</strong> ${webhook.provider.toUpperCase()}<br>
+                        <strong>Status:</strong> ${createStatusIndicator(webhook.status)}<br>
+                        <strong>Branch:</strong> ${webhook.branch || '—'}<br>
+                        <strong>Commit:</strong> <code>${webhook.commit ? webhook.commit.substring(0, 7) : '—'}</code><br>
+                        <strong>Run ID:</strong> ${webhook.run_id || '—'}<br>
+                        <strong>Received:</strong> ${formatDate(webhook.received_at)}<br>
+                    </div>
+                </div>
+            ` : '<p class="empty-state">No webhook data received yet</p>';
+            document.getElementById('pipeline-content').innerHTML = html;
+        }
+
+        function renderHistoryTab() {
+            fetch(`${API_BASE}/history`)
+                .then(r => r.json())
+                .then(data => {
+                    const events = data.events || [];
+                    const html = events.length ? `
+                        <div style="max-height: 500px; overflow-y: auto;">
+                            ${events.slice(0, 20).map(e => `
+                                <div style="padding: 10px; border-bottom: 1px solid #e5e7eb; font-size: 0.9em;">
+                                    <strong>${formatDate(e.timestamp)}</strong> - ${e.provider?.toUpperCase() || 'unknown'} ${createStatusIndicator(e.status)}
+                                </div>
+                            `).join('')}
+                        </div>
+                    ` : '<p class="empty-state">No history available</p>';
+                    document.getElementById('history-content').innerHTML = html;
+                });
+        }
+
+        function rescanProject() {
+            if (confirm('Rescan the project? This may take a moment.')) {
+                const btn = event.target;
                 btn.disabled = true;
-                status.style.display = 'flex';
-                status.style.flexDirection = 'column';
-                status.style.alignItems = 'center';
-                status.style.gap = '15px';
+                btn.textContent = '⏳ Scanning...';
                 
-                try {
-                    await axios.post(`${API_BASE.replace('/monitor', '/scanner')}/scan`, {
-                        type: 'general'
-                    });
-                    
-                    setTimeout(() => {
-                        fetchScanResults();
-                        status.style.display = 'none';
+                fetch(`${API_BASE}/rescan`, { method: 'POST' })
+                    .then(r => r.json())
+                    .then(() => {
+                        loadDashboard();
                         btn.disabled = false;
-                    }, 2000);
-                } catch (error) {
-                    console.error('Scan error:', error);
-                    status.style.display = 'none';
-                    btn.disabled = false;
-                }
-            });
-            
-            // Initial load
-            fetchPipelineInfo();
-            fetchMetrics();
-            fetchScanResults();
-            
-            // Refresh every 5 seconds
-            refreshInterval = setInterval(() => {
-                fetchMetrics();
-                fetchScanResults();
-            }, 5000);
-        });
-        
-        // Cleanup on page unload
-        window.addEventListener('beforeunload', () => {
-            if (refreshInterval) {
-                clearInterval(refreshInterval);
+                        btn.textContent = '↻ Rescan Project';
+                    })
+                    .catch(err => {
+                        alert('Rescan failed: ' + err);
+                        btn.disabled = false;
+                        btn.textContent = '↻ Rescan Project';
+                    });
             }
-        });
+        }
+
+        // Load dashboard on page load
+        document.addEventListener('DOMContentLoaded', loadDashboard);
     </script>
 </body>
 </html>
 """
 
-@application.get("/")
-def render_dashboard():
-    """Render the dashboard template."""
-    return render_template_string(DASHBOARD_TEMPLATE)
+# Setup Jinja2 loader to serve embedded template
+def get_template_loader():
+    """Get Jinja2 template loader for embedded template."""
+    dict_loader = DictLoader({"index.html": INDEX_HTML})
+    file_loader = FileSystemLoader(os.path.join(os.path.dirname(__file__), "templates")) if os.path.exists(os.path.join(os.path.dirname(__file__), "templates")) else None
+    
+    if file_loader:
+        return ChoiceLoader([file_loader, dict_loader])
+    return dict_loader
 
-# ══════════════════════════════════════════════════════════════
-# EXPORT FOR MAIN APP
-# ══════════════════════════════════════════════════════════════
+application.jinja_loader = get_template_loader()
 
-__all__ = [
-    'application',
-    'monitor_bp',
-    'scanner_bp',
-    'handle_monitor_status',
-    'AGENTS_REGISTRY',
-    'PIPELINE_NAME',
-    'PIPELINE_DESCRIPTION'
-]
+# Create blueprints
+monitor_bp = Blueprint("monitor", __name__, url_prefix="/api/sentinelops")
+scanner_bp = Blueprint("scanner", __name__, url_prefix="/api/sentinelops")
+
+# ============================================================================
+# ROUTES - Monitor Blueprint
+# ============================================================================
+
+@monitor_bp.get("/summary")
+def get_summary():
+    """Get complete dashboard summary."""
+    try:
+        scan_result = perform_full_scan()
+        return jsonify(scan_result), 200
+    except Exception as e:
+        logger.error(f"Error generating summary: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@monitor_bp.get("/pipelines")
+def get_pipelines():
+    """Get pipeline information."""
+    try:
+        scan_result = perform_full_scan()
+        return jsonify(scan_result.get("pipeline", {})), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@monitor_bp.get("/agents")
+def get_agents():
+    """Get AI agents information."""
+    try:
+        scan_result = perform_full_scan()
+        return jsonify(scan_result.get("agents", {})), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@monitor_bp.get("/files")
+def get_files():
+    """Get file inventory."""
+    try:
+        scan_result = perform_full_scan()
+        return jsonify(scan_result.get("files", {})), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@monitor_bp.get("/history")
+def get_history():
+    """Get webhook and usage history."""
+    try:
+        return jsonify({
+            "webhooks": webhook_history.get_all()[:100],
+            "usage": usage_history.get_all()[:100],
+            "events": webhook_history.get_all()[:100],
+        }), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# ============================================================================
+# ROUTES - Scanner Blueprint
+# ============================================================================
+
+@scanner_bp.post("/rescan")
+def rescan_project():
+    """Trigger a fresh project scan."""
+    try:
+        with scan_cache["lock"]:
+            scan_cache["data"] = None
+            scan_cache["timestamp"] = 0
+        
+        result = perform_full_scan()
+        return jsonify({"status": "success", "scanned_at": result["scanned_at"]}), 200
+    except Exception as e:
+        logger.error(f"Error rescanning: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@scanner_bp.post("/usage")
+def record_agent_usage():
+    """Record agent usage telemetry."""
+    try:
+        # Check content length
+        if request.content_length and request.content_length > MAX_PAYLOAD_SIZE:
+            return jsonify({"error": "Payload too large"}), 413
+
+        # Validate webhook token
+        auth_header = request.headers.get("Authorization")
+        token_header = request.headers.get("X-SentinelOps-Token")
+        if not validate_webhook_token(auth_header, token_header):
+            return jsonify({"error": "Unauthorized"}), 401
+
+        data = request.get_json() or {}
+        agent_id = data.get("agent_id", "unknown")
+
+        # Validate and cap numeric fields
+        usage_data = {
+            "agent_id": agent_id,
+            "agent_name": data.get("agent_name", ""),
+            "provider": data.get("provider", ""),
+            "model": data.get("model", ""),
+            "prompt_tokens": min(int(data.get("prompt_tokens", 0)), 1000000),
+            "completion_tokens": min(int(data.get("completion_tokens", 0)), 1000000),
+            "total_tokens": min(int(data.get("total_tokens", 0)), 1000000),
+            "request_count": min(int(data.get("request_count", 0)), 10000),
+            "context_window": data.get("context_window"),
+            "hourly_limit": data.get("hourly_limit"),
+            "daily_limit": data.get("daily_limit"),
+        }
+
+        record_usage(agent_id, usage_data)
+        return jsonify({"status": "success"}), 200
+    except Exception as e:
+        logger.error(f"Error recording usage: {e}")
+        return jsonify({"error": str(e)}), 400
+
+# ============================================================================
+# WEBHOOK HANDLER
+# ============================================================================
+
+def handle_monitor_status():
+    """Handle incoming webhook from CI/CD pipeline."""
+    try:
+        # Check content length
+        if request.content_length and request.content_length > MAX_PAYLOAD_SIZE:
+            return jsonify({"error": "Payload too large"}), 413
+
+        # Validate webhook token
+        auth_header = request.headers.get("Authorization")
+        token_header = request.headers.get("X-SentinelOps-Token")
+        if not validate_webhook_token(auth_header, token_header):
+            return jsonify({"error": "Unauthorized"}), 401
+
+        # Parse payload
+        if request.is_json:
+            data = request.get_json() or {}
+        else:
+            data = request.form.to_dict()
+
+        # Normalize webhook
+        normalized = normalize_webhook(data)
+
+        logger.info(f"Webhook received: {normalized.get('provider')} - {normalized.get('status')}")
+        return jsonify({"status": "received", "normalized": normalized}), 200
+
+    except Exception as e:
+        logger.error(f"Error handling webhook: {e}")
+        return jsonify({"error": str(e)}), 400
+
+# ============================================================================
+# INITIALIZATION
+# ============================================================================
+
+# Perform initial scan on module load
+try:
+    logger.info(f"Initializing SentinelOps Monitor for project: {PROJECT_ROOT}")
+    perform_full_scan()
+    logger.info("Initial scan completed successfully")
+except Exception as e:
+    logger.warning(f"Initial scan failed: {e}")
+
+logger.info("SentinelOps Agent Monitor module loaded successfully")
