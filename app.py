@@ -45,7 +45,7 @@ def monitor_status():
     from agent_monitor import handle_monitor_status
     return handle_monitor_status()
 
-@application.get("/metrics")
+@application.get("/metrics", endpoint="app_prometheus_metrics")
 def prometheus_metrics():
     """Prometheus scrape endpoint."""
     return Response(

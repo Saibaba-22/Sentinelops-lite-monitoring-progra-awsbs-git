@@ -473,7 +473,6 @@ jobs:
         continue-on-error: true
         run: |
           eb deploy "$AWS_ENV_NAME" \
-            --staged \
             --label "github-${GITHUB_SHA:0:12}" \
             --timeout 30
           aws elasticbeanstalk wait environment-updated \
