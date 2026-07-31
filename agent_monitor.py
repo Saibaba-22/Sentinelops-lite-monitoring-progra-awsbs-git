@@ -33,16 +33,11 @@ import importlib
 import ast
 from pathlib import Path
 from collections import defaultdict
-
 from flask import Flask, Blueprint, request, jsonify, Response
 from prometheus_flask_exporter import PrometheusMetrics 
 
-# ══════════════════════════════════════════════════════════════════════════════
 # FLASK APPLICATION (shared with app.py)
-# ══════════════════════════════════════════════════════════════════════════════
-
 BASE_DIR = Path(__file__).resolve().parent
-
 application = Flask(
     __name__,
     template_folder=str(BASE_DIR / "templates"),
@@ -54,10 +49,7 @@ application.secret_key = os.environ.get("FLASK_SECRET", "sentinelops-lite-key")
 monitor_bp = Blueprint("monitor", __name__, url_prefix="/monitor")
 scanner_bp = Blueprint("scanner", __name__, url_prefix="/scanner")
 
-# ══════════════════════════════════════════════════════════════════════════════
 # PIPELINE DETECTOR
-# ══════════════════════════════════════════════════════════════════════════════
-
 PIPELINE_SIGNATURES = {
     "GitHub Actions": {
         "files": [".github/workflows/*.yml", ".github/workflows/*.yaml"],
