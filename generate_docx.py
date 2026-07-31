@@ -731,5 +731,5 @@ add_table_with_header(doc,
 )
 
 # ─── Save ───
-doc.save('/home/user/SentinelOps-Lite-Project-Documentation.docx')
+doc.save('SentinelOps-Lite-Project-Documentation.docx')
 print("✅ Document saved successfully!")

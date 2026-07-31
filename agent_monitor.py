@@ -24,10 +24,10 @@ from flask import render_template, Response, request
 def monitor_status():
 #    CI / monitoring webhook.
     Delegates entirely to agent_monitor.handle_monitor_status().
-    """
 #    from agent_monitor import handle_monitor_status
 #    return handle_monitor_status()
-
+"""
+# ══════════════════════════════════════════════════════════════════════════════
 # IMPORTS
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -38,12 +38,17 @@ import json
 import glob
 import datetime
 import ast
+import time as _time
 from pathlib import Path
+
 from flask import Flask, Blueprint, request, Response
+
 
 # FLASK APPLICATION
 
+
 BASE_DIR = Path(__file__).resolve().parent
+
 
 application = Flask(
     __name__,
@@ -52,20 +57,132 @@ application = Flask(
 )
 application.secret_key = os.environ.get("FLASK_SECRET", "sentinelops-lite-key")
 
+
 monitor_bp = Blueprint("monitor", __name__, url_prefix="/monitor")
 scanner_bp = Blueprint("scanner", __name__, url_prefix="/scanner")
+
 
 # ── LOAD CUSTOM METRICS ──────────────────────────────────────
 # This import registers all custom Prometheus metrics (app_*, system_*, agent_*)
 # in the default registry so generate_latest() exposes them at /metrics.
-from monitoring.metrics import start_metrics_updater, update_metrics
+from monitoring.metrics import (
+    start_metrics_updater,
+    update_metrics,
+    # Agent metrics
+    agent_state,
+    agent_last_decision,
+    agent_last_run_timestamp_seconds,
+    agent_token_usage_total,
+    agent_prompt_tokens_total,
+    agent_completion_tokens_total,
+    agent_api_calls_total,
+    agent_tasks_total,
+    agent_execution_time_seconds,
+    agent_execution_duration_seconds,
+    agent_api_key_count,
+    agent_model_info,
+)
+
 
 # Run initial metric collection immediately
 update_metrics()
 
+
 # Start background thread to refresh process/system metrics every 5 seconds
 start_metrics_updater(interval=5)
+
+
+# ── AGENT METRICS UPDATER ────────────────────────────────────
+def _update_agent_metrics(payload: dict) -> None:
+    """Update Prometheus agent metrics from a webhook payload."""
+    try:
+        agent_name = payload.get("agent_name", payload.get("pipeline", "pipeline"))
+        stage      = payload.get("stage", payload.get("step", "deploy"))
+        cloud      = payload.get("cloud", "unknown")
+        status     = payload.get("status", "unknown")
+        decision   = payload.get("decision", "none")
+        provider   = payload.get("provider", "unknown")
+        model      = payload.get("model", "unknown")
+
+        result = "success" if status in ("success", "ok", "passed") else "failed"
+
+        # Record the agent ran
+        agent_last_run_timestamp_seconds.labels(
+            agent_name=agent_name, stage=stage, cloud=cloud
+        ).set(_time.time())
+
+        # Set agent state
+        for s in ("idle", "running", "approved", "rejected", "failed", "healthy"):
+            agent_state.labels(
+                agent_name=agent_name, stage=stage, cloud=cloud, state=s
+            ).set(1 if s == ("healthy" if result == "success" else "failed") else 0)
+
+        # Count the task
+        agent_tasks_total.labels(
+            agent_name=agent_name, stage=stage, cloud=cloud, result=result
+        ).inc()
+
+        # Record decision
+        for d in ("none", "approved", "rejected", "failed", "healthy", "pass", "fail"):
+            agent_last_decision.labels(
+                agent_name=agent_name, stage=stage, cloud=cloud, decision=d
+            ).set(1 if d == decision else 0)
+
+        # Token usage
+        tokens = payload.get("tokens", {})
+        prompt_tokens     = int(tokens.get("prompt", tokens.get("prompt_tokens", 0)))
+        completion_tokens = int(tokens.get("completion", tokens.get("completion_tokens", 0)))
+        total_tokens      = prompt_tokens + completion_tokens
+
+        if total_tokens > 0:
+            agent_prompt_tokens_total.labels(
+                agent_name=agent_name, stage=stage, cloud=cloud,
+                provider=provider, model=model
+            ).inc(prompt_tokens)
+            agent_completion_tokens_total.labels(
+                agent_name=agent_name, stage=stage, cloud=cloud,
+                provider=provider, model=model
+            ).inc(completion_tokens)
+            agent_token_usage_total.labels(
+                agent_name=agent_name, stage=stage, cloud=cloud,
+                provider=provider, model=model
+            ).inc(total_tokens)
+
+        # API call
+        agent_api_calls_total.labels(
+            agent_name=agent_name, stage=stage, cloud=cloud,
+            provider=provider, model=model, status=result
+        ).inc()
+
+        # Execution time
+        exec_time = payload.get("execution_time", payload.get("duration", 0))
+        if exec_time:
+            exec_time = float(exec_time)
+            agent_execution_time_seconds.labels(
+                agent_name=agent_name, stage=stage, cloud=cloud
+            ).set(exec_time)
+            agent_execution_duration_seconds.labels(
+                agent_name=agent_name, stage=stage, cloud=cloud
+            ).observe(exec_time)
+
+        # API key count
+        api_keys = payload.get("api_keys", payload.get("api_key_count", 0))
+        if api_keys:
+            agent_api_key_count.labels(
+                agent_name=agent_name, stage=stage, cloud=cloud, provider=provider
+            ).set(int(api_keys))
+
+        # Model info
+        agent_model_info.labels(
+            agent_name=agent_name, stage=stage, cloud=cloud
+        ).info({"provider": provider, "model": model})
+
+    except Exception:
+        pass
+
+
 # ──────────────────────────────────────────────────────────────
+
 # ══════════════════════════════════════════════════════════════════════════════
 # SHARED NAV BAR + PAGE WRAPPER (used by ALL pages)
 # ══════════════════════════════════════════════════════════════════════════════
