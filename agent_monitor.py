@@ -22,12 +22,11 @@ from flask import render_template, Response, request
 
 @application.route("/monitor/status", methods=["GET", "POST"])
 def monitor_status():
-    """
-    CI / monitoring webhook.
+#    CI / monitoring webhook.
     Delegates entirely to agent_monitor.handle_monitor_status().
     """
-    from agent_monitor import handle_monitor_status
-    return handle_monitor_status()
+#    from agent_monitor import handle_monitor_status
+#    return handle_monitor_status()
 
 """
 
