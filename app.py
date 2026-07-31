@@ -45,6 +45,11 @@ def monitor_status():
     from agent_monitor import handle_monitor_status
     return handle_monitor_status()
 
+@application.get("/health")
+def health_check():
+    """Health check endpoint."""
+    return Response("Healthy", status=200, content_type="text/plain")
+
 @application.get("/metrics", endpoint="app_prometheus_metrics")
 def prometheus_metrics():
     """Prometheus scrape endpoint."""

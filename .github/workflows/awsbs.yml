@@ -405,8 +405,7 @@ jobs:
 
           for volume in manifest.setdefault("volumes", []):
               if volume.get("name") == "nginx-conf":
-                  volume.setdefault("host", {})["sourcePath"] = \
-                      "/var/app/current/docker"
+                  volume["host"]["sourcePath"] = "/var/app/current/docker/nginx-ecs"
                   print(f"  vol   [nginx-conf]: → /var/app/current/docker/nginx")
 
           path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
@@ -428,11 +427,11 @@ jobs:
           source="docker/nginx/nginx-aws.conf"
           [ -f "$source" ] || source="docker/nginx/nginx.conf"
           mkdir -p docker/nginx
-          cp "$source" docker/nginx/default.conf
+          cp "$source" docker/nginx-ecs/default.conf
           echo "Nginx config: $source → docker/nginx/default.conf"
 
           sed -i '/^[[:space:]]*Dockerrun\.aws\.json[[:space:]]*$/d' .ebignore
-          git add Dockerrun.aws.json docker/nginx/default.conf .ebignore
+          git add Dockerrun.aws.json docker/nginx-ecs/default.conf .ebignore
 
       - name: Verify AWS platform is supported
         run: |
