@@ -106,7 +106,7 @@ def home():
     return render_template("index.html")
 
 
-@application.post("/monitor/status", methods=["GET", "POST"])
+@application.route("/monitor/status", methods=["GET", "POST"])
 def monitor_status():
     """
     CI / monitoring webhook.
