@@ -657,7 +657,7 @@ jobs:
   generate_docs:
     name: Generate Project Documentation
     if: ${{ always() && needs.verify_aws.result == 'success' }}
-    needs: verify_aws                        # runs only after verify passes
+    needs: verify_aws
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -675,7 +675,7 @@ jobs:
           python -m pip install python-docx lxml
 
       - name: Generate documentation
-        run: python generate_docs.py         # your script at repo root
+        run: python generate_docs.py
 
       - name: Upload documentation artifact
         uses: actions/upload-artifact@v4
@@ -688,7 +688,7 @@ jobs:
   summary:
     name: Pipeline summary
     if: always()
-    needs: [precheck, build, deploy_aws, verify_aws, generate_docs]]
+    needs: [precheck, build, deploy_aws, verify_aws, generate_docs]
     runs-on: ubuntu-latest
     steps:
       - name: Print job results
@@ -697,7 +697,8 @@ jobs:
           echo "build      : ${{ needs.build.result }}"
           echo "aws deploy : ${{ needs.deploy_aws.result }}"
           echo "aws verify : ${{ needs.verify_aws.result }}"
-          echo "docs       : ${{ needs.generate_docs.result }}"   # ← add this
-          if [ "${{ needs.precheck.result }}" != "success" ]; then exit 1; fi
-          if [ "${{ needs.build.result }}"   != "success" ]; then exit 1; fi
-          if [ "${{ needs.deploy_aws.result }}" != "success" ]; then exit 1; fi
+          echo "docs       : ${{ needs.generate_docs.result }}"
+          if [ "${{ needs.precheck.result }}"    != "success" ]; then exit 1; fi
+          if [ "${{ needs.build.result }}"       != "success" ]; then exit 1; fi
+          if [ "${{ needs.deploy_aws.result }}"  != "success" ]; then exit 1; fi
+          if [ "${{ needs.generate_docs.result }}" != "success" ]; then exit 1; fi
