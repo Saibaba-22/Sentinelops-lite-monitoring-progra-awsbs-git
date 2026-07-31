@@ -426,9 +426,9 @@ jobs:
 
           source="docker/nginx/nginx-aws.conf"
           [ -f "$source" ] || source="docker/nginx/nginx.conf"
-          mkdir -p docker/nginx
+          mkdir -p docker/nginx-ecs
           cp "$source" docker/nginx-ecs/default.conf
-          echo "Nginx config: $source → docker/nginx/default.conf"
+          echo "Nginx config: $source → docker/nginx-ecs/default.conf"
 
           sed -i '/^[[:space:]]*Dockerrun\.aws\.json[[:space:]]*$/d' .ebignore
           git add Dockerrun.aws.json docker/nginx-ecs/default.conf .ebignore
