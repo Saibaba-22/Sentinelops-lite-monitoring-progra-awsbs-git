@@ -210,7 +210,6 @@ def start_metrics_updater(interval: int = 5) -> None:
     thread = threading.Thread(target=_metrics_loop, args=(interval,), daemon=True)
     thread.start()
 
-
 def public_ip() -> str:
     """Return a public IP only when explicitly enabled; startup never depends on a network call."""
     if os.getenv("COLLECT_PUBLIC_IP", "0") != "1":
