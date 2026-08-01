@@ -1,0 +1,383 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title> DevOps Deployment Pipeline </title>
+    <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+
+    <style>
+        body {
+            font-family: 'Plus Jakarta Sans', sans-serif;
+            background: radial-gradient(circle at 50% 50%, #111827 0%, #030712 100%);
+            overflow-x: hidden;
+        }
+
+        /* Custom glow effects */
+        .glow-card {
+            background: rgba(255, 255, 255, 0.03);
+            backdrop-filter: blur(12px);
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            transition: all 0.5s cubic-bezier(0.4, 0, 0.2, 1);
+        }
+
+        .glow-card.active {
+            background: rgba(59, 130, 246, 0.1);
+            border-color: rgba(59, 130, 246, 0.5);
+            box-shadow: 0 0 30px rgba(59, 130, 246, 0.2);
+            transform: translateY(-4px) scale(1.02);
+        }
+
+        .glow-card.completed {
+            background: rgba(16, 185, 129, 0.05);
+            border-color: rgba(16, 185, 129, 0.4);
+        }
+
+        /* Animated connecting lines */
+        .line-progress {
+            width: 0%;
+            transition: width 1.5s linear;
+            background: linear-gradient(90deg, #3b82f6, #10b981);
+            box-shadow: 0 0 10px #3b82f6;
+        }
+
+        /* Floating particles background animation */
+        @keyframes float {
+            0% { transform: translateY(0px) rotate(0deg); opacity: 0.2; }
+            50% { transform: translateY(-60px) rotate(180deg); opacity: 0.4; }
+            100% { transform: translateY(0px) rotate(360deg); opacity: 0.2; }
+        }
+
+        .bg-particle {
+            position: absolute;
+            width: 4px;
+            height: 4px;
+            background: white;
+            border-radius: 50%;
+            animation: float 12s infinite ease-in-out;
+        }
+
+        /* Live pulse indicator */
+        .pulse-dot {
+            position: relative;
+        }
+        .pulse-dot::after {
+            content: '';
+            position: absolute;
+            width: 100%;
+            height: 100%;
+            top: 0;
+            left: 0;
+            background: inherit;
+            border-radius: inherit;
+            animation: pulse 1.5s infinite ease-out;
+        }
+        @keyframes pulse {
+            0% { transform: scale(1); opacity: 1; }
+            100% { transform: scale(2.5); opacity: 0; }
+        }
+        @keyframes fadeIn{
+            from{opacity:0;transform:translateY(20px);}
+            to{opacity:1;transform:translateY(0);}
+        }
+
+        .animate-fade-in{
+            animation:fadeIn .8s ease;
+        }
+    </style>
+</head>
+<body class="text-gray-100 min-h-screen flex flex-col justify-between relative p-4 md:p-8">
+
+    <div class="absolute inset-0 z-0 overflow-hidden pointer-events-none" id="particles-container"></div>
+
+    <header class="text-center z-10 my-6">
+        <h1 class="text-4xl md:text-5xl font-extrabold tracking-tight bg-clip-text text-transparent bg-gradient-to-r from-blue-400 via-indigo-400 to-emerald-400">
+            DevOps Pipeline Automation using AI agent
+        </h1>
+        <p class="text-gray-400 mt-2 text-sm md:text-base max-w-xl mx-auto">
+            Watch your code automatically test, build, provision infrastructure, and go live instantly.
+        </p>
+    </header>
+
+    <main class="w-full max-w-6xl mx-auto z-10 flex-grow flex flex-col justify-center items-center my-8">
+
+        <div class="mb-12 flex space-x-4">
+            <button id="start-btn" class="px-6 py-3 bg-gradient-to-r from-blue-500 to-indigo-600 hover:from-blue-600 hover:to-indigo-700 font-semibold rounded-xl shadow-lg shadow-indigo-500/20 transition-all duration-300 transform active:scale-95 cursor-pointer flex items-center gap-2">
+                <i class="fas fa-play"></i> Trigger Pipeline
+            </button>
+            <button id="reset-btn" class="px-6 py-3 bg-gray-800 hover:bg-gray-700 text-gray-300 font-semibold rounded-xl border border-gray-700 transition-all duration-300 cursor-pointer flex items-center gap-2">
+                <i class="fas fa-undo"></i> Reset
+            </button>
+        </div>
+
+        <div class="hidden lg:flex w-full items-center justify-between relative px-4">
+
+            <div id="step-1" class="glow-card w-48 rounded-2xl p-5 text-center flex flex-col items-center">
+                <div class="w-14 h-14 rounded-xl bg-amber-500/10 border border-amber-500/30 text-amber-400 flex items-center justify-center text-2xl mb-3 icon-container">
+                    <i class="fab fa-python"></i>
+                </div>
+                <h3 class="font-bold text-sm text-gray-200">1. Generate Code</h3>
+                <p class="text-xs text-gray-400 mt-1 opacity-80">Creating Python files...</p>
+                <span class="status-badge text-[10px] mt-2 px-2 py-0.5 rounded-full bg-gray-800 text-gray-400 font-mono">Idle</span>
+            </div>
+
+            <div class="flex-grow h-1 bg-gray-800 mx-2 relative rounded-full">
+                <div id="line-1" class="line-progress h-full rounded-full"></div>
+            </div>
+
+            <div id="step-2" class="glow-card w-48 rounded-2xl p-5 text-center flex flex-col items-center">
+                <div class="w-14 h-14 rounded-xl bg-purple-500/10 border border-purple-500/30 text-purple-400 flex items-center justify-center text-2xl mb-3 icon-container">
+                    <i class="fas fa-key"></i>
+                </div>
+                <h3 class="font-bold text-sm text-gray-200">2. Run API Tests</h3>
+                <p class="text-xs text-gray-400 mt-1 opacity-80">Testing with API key</p>
+                <span class="status-badge text-[10px] mt-2 px-2 py-0.5 rounded-full bg-gray-800 text-gray-400 font-mono">Idle</span>
+            </div>
+
+            <div class="flex-grow h-1 bg-gray-800 mx-2 relative rounded-full">
+                <div id="line-2" class="line-progress h-full rounded-full"></div>
+            </div>
+
+            <div id="step-3" class="glow-card w-48 rounded-2xl p-5 text-center flex flex-col items-center">
+                <div class="w-14 h-14 rounded-xl bg-blue-500/10 border border-blue-500/30 text-blue-400 flex items-center justify-center text-2xl mb-3 icon-container">
+                    <i class="fas fa-cloud-upload-alt"></i>
+                </div>
+                <h3 class="font-bold text-sm text-gray-200">3. Azure DevOps</h3>
+                <p class="text-xs text-gray-400 mt-1 opacity-80">Uploading repository</p>
+                <span class="status-badge text-[10px] mt-2 px-2 py-0.5 rounded-full bg-gray-800 text-gray-400 font-mono">Idle</span>
+            </div>
+
+            <div class="flex-grow h-1 bg-gray-800 mx-2 relative rounded-full">
+                <div id="line-3" class="line-progress h-full rounded-full"></div>
+            </div>
+
+            <div id="step-4" class="glow-card w-48 rounded-2xl p-5 text-center flex flex-col items-center">
+                <div class="w-14 h-14 rounded-xl bg-orange-500/10 border border-orange-500/30 text-orange-400 flex items-center justify-center text-2xl mb-3 icon-container">
+                    <i class="fab fa-microsoft"></i>
+                </div>
+                <h3 class="font-bold text-sm text-gray-200">4. Azure App service </h3>
+                <p class="text-xs text-gray-400 mt-1 opacity-80"> Creating App Service Plan &amp; Web App </p>
+                <span class="status-badge text-[10px] mt-2 px-2 py-0.5 rounded-full bg-gray-800 text-gray-400 font-mono">Idle</span>
+            </div>
+
+            <div class="flex-grow h-1 bg-gray-800 mx-2 relative rounded-full">
+                <div id="line-4" class="line-progress h-full rounded-full"></div>
+            </div>
+
+            <div id="step-5" class="glow-card w-48 rounded-2xl p-5 text-center flex flex-col items-center">
+                <div class="w-14 h-14 rounded-xl bg-emerald-500/10 border border-emerald-500/30 text-emerald-400 flex items-center justify-center text-2xl mb-3 icon-container">
+                    <i class="fas fa-cloud"></i>
+                </div>
+                <h3 class="font-bold text-sm text-gray-200">5. Deploy to Azure App Service</h3>
+                <p class="text-xs text-gray-400 mt-1 opacity-80">Deploying Python Web App...</p>
+                <span class="status-badge text-[10px] mt-2 px-2 py-0.5 rounded-full bg-gray-800 text-gray-400 font-mono">Idle</span>
+            </div>
+        </div>
+
+        <div class="flex lg:hidden flex-col space-y-6 w-full max-w-sm px-4"></div>
+
+        <div class="w-full max-w-3xl mt-16 bg-gray-950/80 rounded-2xl border border-gray-800 overflow-hidden shadow-2xl transition-all duration-500" id="browser-window">
+            <div class="bg-gray-900 px-4 py-3 border-b border-gray-800 flex items-center justify-between">
+                <div class="flex space-x-2">
+                    <div class="w-3 h-3 rounded-full bg-red-500/70"></div>
+                    <div class="w-3 h-3 rounded-full bg-yellow-500/70"></div>
+                    <div class="w-3 h-3 rounded-full bg-green-500/70"></div>
+                </div>
+                <div class="bg-gray-950 px-3 py-1 rounded-md text-xs text-gray-500 w-1/2 text-center select-none font-mono flex items-center justify-center gap-2">
+                    <i class="fas fa-lock text-[10px] text-emerald-500"></i> <span id="browser-url"> internal : localhost:5000 or 127.0.0.1:5000 external : aws beanstalk dns url  </span>
+                </div>
+                <div class="w-4"></div>
+            </div>
+            <div class="p-8 h-48 flex flex-col items-center justify-center text-center text-gray-500" id="browser-body">
+                <i class="fas fa-server text-3xl mb-3 animate-pulse"></i>
+                <p class="font-mono text-sm">Pipeline offline. Awaiting app deployment...</p>
+            </div>
+        </div>
+
+    </main>
+
+    <footer class="text-center z-10 text-xs text-gray-600 font-mono select-none">
+        System active // Live Pipeline Monitor Dashboard
+    </footer>
+
+    <script>
+        // Background particles rendering
+        const container = document.getElementById('particles-container');
+        for (let i = 0; i < 30; i++) {
+            const particle = document.createElement('div');
+            particle.classList.add('bg-particle');
+            particle.style.left = `${Math.random() * 100}%`;
+            particle.style.top = `${Math.random() * 100}%`;
+            particle.style.animationDelay = `${Math.random() * 8}s`;
+            particle.style.transform = `scale(${Math.random() * 2})`;
+            container.appendChild(particle);
+        }
+
+        // Clone steps for responsive mobile layout on the fly safely
+        const desktopFlow = document.querySelector('.lg\\:flex');
+        const mobileFlow = document.querySelector('.lg\\:hidden');
+        desktopFlow.querySelectorAll('.glow-card').forEach((card, index) => {
+            const clone = card.cloneNode(true);
+            clone.id = `mobile-${card.id}`;
+            mobileFlow.appendChild(clone);
+
+            if (index < 4) {
+                const vertLine = document.createElement('div');
+                vertLine.className = "w-1 h-8 bg-gray-800 mx-auto relative rounded-full";
+                vertLine.innerHTML = `<div id="mobile-line-${index + 1}" class="w-full h-0 transition-all duration-1000 bg-gradient-to-b from-blue-500 to-emerald-500" style="transition: height 1.5s linear;"></div>`;
+                mobileFlow.appendChild(vertLine);
+            }
+        });
+
+        // Application State references
+        const startBtn = document.getElementById('start-btn');
+        const resetBtn = document.getElementById('reset-btn');
+        const totalSteps = 5;
+
+        // UI state utility updater
+        function updateStepUI(stepNum, status) {
+            const dCard = document.getElementById('step-' + stepNum);
+            const mCard = document.getElementById('mobile-step-' + stepNum);
+            const dBadge = dCard.querySelector('.status-badge');
+            const mBadge = mCard.querySelector('.status-badge');
+            const dIcon = dCard.querySelector('.icon-container i');
+            const mIcon = mCard.querySelector('.icon-container i');
+
+            if (status === 'active') {
+                [dCard, mCard].forEach(c => {
+                    c.classList.add('active');
+                    c.classList.remove('completed');
+                });
+                [dBadge, mBadge].forEach(b => {
+                    b.className = "status-badge text-[10px] mt-2 px-2 py-0.5 rounded-full bg-blue-500/20 text-blue-400 font-mono font-semibold pulse-dot";
+                    b.innerText = "Processing";
+                });
+                [dIcon, mIcon].forEach(i => i.classList.add('animate-bounce'));
+            } else if (status === 'completed') {
+                [dCard, mCard].forEach(c => {
+                    c.classList.remove('active');
+                    c.classList.add('completed');
+                });
+                [dBadge, mBadge].forEach(b => {
+                    b.className = "status-badge text-[10px] mt-2 px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-400 font-mono font-semibold";
+                    b.innerText = "Success ✓";
+                });
+                [dIcon, mIcon].forEach(i => i.classList.remove('animate-bounce'));
+            } else {
+                [dCard, mCard].forEach(c => {
+                    c.classList.remove('active', 'completed');
+                });
+                [dBadge, mBadge].forEach(b => {
+                    b.className = "status-badge text-[10px] mt-2 px-2 py-0.5 rounded-full bg-gray-800 text-gray-400 font-mono";
+                    b.innerText = "Idle";
+                });
+                [dIcon, mIcon].forEach(i => i.classList.remove('animate-bounce'));
+            }
+        }
+
+        function updateLineUI(lineNum, fill) {
+            const dLine = document.getElementById('line-' + lineNum);
+            const mLine = document.getElementById('mobile-line-' + lineNum);
+            if (dLine) dLine.style.width = fill ? '100%' : '0%';
+            if (mLine) mLine.style.height = fill ? '100%' : '0%';
+        }
+
+        // Live Mock Deployment Steps sequence
+        function runPipeline() {
+            startBtn.disabled = true;
+            startBtn.classList.add('opacity-50', 'pointer-events-none');
+
+            let currentStep = 1;
+
+            function executeStep() {
+                if (currentStep > totalSteps) {
+                    showFinalDeployment();
+                    return;
+                }
+
+                updateStepUI(currentStep, 'active');
+
+                // Timeouts match realistic automated step velocities
+                setTimeout(() => {
+                    updateStepUI(currentStep, 'completed');
+
+                    if (currentStep < totalSteps) {
+                        updateLineUI(currentStep, true);
+                        currentStep++;
+                        setTimeout(executeStep, 1500); // connection timeline sync
+                    } else {
+                        currentStep++;
+                        executeStep();
+                    }
+                }, 2500);
+            }
+
+            executeStep();
+        }
+
+        // Final UI Browser Rendering Simulation
+        function showFinalDeployment() {
+            const browserBody = document.getElementById('browser-body');
+            const browserUrl = document.getElementById('browser-url');
+            const browserWin = document.getElementById('browser-window');
+
+            browserWin.classList.add('border-emerald-500/40', 'shadow-emerald-500/10');
+            browserUrl.innerText = "https://python-app.azurewebsites.net";
+            browserUrl.classList.remove('text-gray-500');
+            browserUrl.classList.add('text-emerald-400');
+
+            browserBody.innerHTML = `
+                <div class="animate-fade-in flex flex-col items-center">
+                    <div class="w-12 h-12 bg-emerald-500/10 text-emerald-400 rounded-full flex items-center justify-center mb-2 text-xl shadow-lg">
+                        <i class="fas fa-check-circle"></i>
+                    </div>
+                    <h2 class="text-xl font-bold text-white tracking-wide">
+                        Application Successfully Deployed
+                    </h2>
+
+                    <p class="text-gray-400 text-sm mt-1 max-w-sm">
+                        Python Flask application is now running on Azure App Service with automated CI/CD using Azure DevOps.
+                    </p>
+                    <a href="#" onclick="window.location.href = 'https://your-app-name.azurewebsites.net'; return false;" class="mt-4 px-4 py-1.5 bg-emerald-500 hover:bg-emerald-600 text-gray-950 font-bold text-xs rounded-lg transition-colors">
+                        Browse Microservice
+                    </a>
+                </div>
+            `;
+            browserBody.classList.remove('text-gray-500');
+        }
+
+        // Reset system to pristine idle configuration
+        function resetPipeline() {
+            startBtn.disabled = false;
+            startBtn.classList.remove('opacity-50', 'pointer-events-none');
+
+            for (let i = 1; i <= totalSteps; i++) {
+                updateStepUI(i, 'idle');
+                if (i < totalSteps) updateLineUI(i, false);
+            }
+
+            const browserBody = document.getElementById('browser-body');
+            const browserUrl = document.getElementById('browser-url');
+            const browserWin = document.getElementById('browser-window');
+
+            browserWin.className = "w-full max-w-3xl mt-16 bg-gray-950/80 rounded-2xl border border-gray-800 overflow-hidden shadow-2xl transition-all duration-500";
+            browserUrl.innerText = " Live Application ";
+            browserUrl.className = "bg-gray-950 px-3 py-1 rounded-md text-xs text-gray-500 w-1/2 text-center select-none font-mono flex items-center justify-center gap-2";
+
+            browserBody.className = "p-8 h-48 flex flex-col items-center justify-center text-center text-gray-500";
+            browserBody.innerHTML = `
+                <i class="fas fa-server text-3xl mb-3 animate-pulse"></i>
+                <p class="font-mono text-sm">Pipeline offline. Awaiting app deployment...</p>
+            `;
+        }
+
+        // Event listeners
+        startBtn.addEventListener('click', runPipeline);
+        resetBtn.addEventListener('click', resetPipeline);
+    </script>
+</body>
+</html>

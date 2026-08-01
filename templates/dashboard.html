@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SentinelOps-Lite — Monitoring Dashboard</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/dashboard.css') }}" />
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+</head>
+<body>
+  <div class="dashboard-wrap">
+    <header class="topbar">
+      <div class="title-block">
+        <h1>SentinelOps-Lite · Live Monitoring</h1>
+        <p>Application · Infrastructure · AI Agent · Deployment</p>
+      </div>
+      <div style="display:flex; gap:12px; align-items:center;">
+        <span class="status-pill"><span id="conn-dot" class="dot pulsing"></span><span id="conn-text">Live</span></span>
+        <span class="status-pill" id="last-updated">Updated —</span>
+      </div>
+    </header>
+
+    <!-- Stat cards -->
+    <section class="grid">
+      <div class="glass-card col-3">
+        <p class="card-title">Requests / sec</p>
+        <div class="stat-value" id="stat-reqps">—</div>
+        <div class="progress"><span id="bar-req" style="width:0%"></span></div>
+      </div>
+      <div class="glass-card col-3">
+        <p class="card-title">Error Rate</p>
+        <div class="stat-value" id="stat-err">—</div>
+        <div class="progress"><span id="bar-err"></span></div>
+      </div>
+      <div class="glass-card col-3">
+        <p class="card-title">CPU Usage</p>
+        <div class="stat-value" id="stat-cpu">—</div>
+        <div class="progress"><span id="bar-cpu"></span></div>
+      </div>
+      <div class="glass-card col-3">
+        <p class="card-title">Memory Usage</p>
+        <div class="stat-value" id="stat-mem">—</div>
+        <div class="progress"><span id="bar-mem"></span></div>
+      </div>
+      <div class="glass-card col-3">
+        <p class="card-title">AI Agent</p>
+        <div class="stat-value" id="stat-agent">—</div>
+        <span id="badge-agent" class="badge idle">—</span>
+      </div>
+      <div class="glass-card col-3">
+        <p class="card-title">App Uptime</p>
+        <div class="stat-value" id="stat-uptime" style="font-size:20px;">—</div>
+        <div class="stat-sub">Health: <span id="badge-app" class="badge ok">ok</span></div>
+      </div>
+    </section>
+
+    <!-- Gauges -->
+    <section class="grid" style="margin-top:16px;">
+      <div class="glass-card col-3">
+        <p class="card-title">CPU Gauge</p>
+        <div class="gauge">
+          <svg width="92" height="92" viewBox="0 0 100 100">
+            <circle class="track" cx="50" cy="50" r="40" fill="none" stroke-width="9"></circle>
+            <circle id="gauge-cpu-fill" class="fill" cx="50" cy="50" r="40" fill="none" stroke-width="9" stroke-dasharray="251.3" stroke-dashoffset="251.3"></circle>
+          </svg>
+          <div><div id="gauge-cpu-value" class="gauge-value">0%</div><div class="gauge-label">CPU</div></div>
+        </div>
+      </div>
+      <div class="glass-card col-3">
+        <p class="card-title">Memory Gauge</p>
+        <div class="gauge">
+          <svg width="92" height="92" viewBox="0 0 100 100">
+            <circle class="track" cx="50" cy="50" r="40" fill="none" stroke-width="9"></circle>
+            <circle id="gauge-mem-fill" class="fill" cx="50" cy="50" r="40" fill="none" stroke-width="9" stroke-dasharray="251.3" stroke-dashoffset="251.3"></circle>
+          </svg>
+          <div><div id="gauge-mem-value" class="gauge-value">0%</div><div class="gauge-label">Memory</div></div>
+        </div>
+      </div>
+      <div class="glass-card col-3">
+        <p class="card-title">Disk Gauge</p>
+        <div class="gauge">
+          <svg width="92" height="92" viewBox="0 0 100 100">
+            <circle class="track" cx="50" cy="50" r="40" fill="none" stroke-width="9"></circle>
+            <circle id="gauge-disk-fill" class="fill" cx="50" cy="50" r="40" fill="none" stroke-width="9" stroke-dasharray="251.3" stroke-dashoffset="251.3"></circle>
+          </svg>
+          <div><div id="gauge-disk-value" class="gauge-value">0%</div><div class="gauge-label">Disk</div></div>
+        </div>
+      </div>
+      <div class="glass-card col-3">
+        <p class="card-title">Error Gauge</p>
+        <div class="gauge">
+          <svg width="92" height="92" viewBox="0 0 100 100">
+            <circle class="track" cx="50" cy="50" r="40" fill="none" stroke-width="9"></circle>
+            <circle id="gauge-err-fill" class="fill" cx="50" cy="50" r="40" fill="none" stroke-width="9" stroke-dasharray="251.3" stroke-dashoffset="251.3"></circle>
+          </svg>
+          <div><div id="gauge-err-value" class="gauge-value">0%</div><div class="gauge-label">Errors</div></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Charts -->
+    <section class="grid" style="margin-top:16px;">
+      <div class="glass-card col-6">
+        <p class="card-title">Traffic (requests / sec)</p>
+        <div class="chart-box"><canvas id="chart-traffic"></canvas></div>
+      </div>
+      <div class="glass-card col-6">
+        <p class="card-title">System CPU &amp; Memory (%)</p>
+        <div class="chart-box"><canvas id="chart-sys"></canvas></div>
+      </div>
+      <div class="glass-card col-6">
+        <p class="card-title">Avg Response Time (s)</p>
+        <div class="chart-box"><canvas id="chart-latency"></canvas></div>
+      </div>
+      <div class="glass-card col-6">
+        <p class="card-title">AI Agent State Timeline</p>
+        <div class="chart-box"><canvas id="chart-agent"></canvas></div>
+      </div>
+    </section>
+
+    <!-- Details -->
+    <section class="grid" style="margin-top:16px;">
+      <div class="glass-card col-12">
+        <p class="card-title">Deployment &amp; Agent Details</p>
+        <div style="display:flex; flex-wrap:wrap; gap:24px; font-size:13px;">
+          <div><span class="gauge-label">Version</span><div id="dep-version">—</div></div>
+          <div><span class="gauge-label">Build</span><div id="dep-build">—</div></div>
+          <div><span class="gauge-label">Environment</span><div id="dep-env">—</div></div>
+          <div><span class="gauge-label">Container</span><div><span id="badge-container" class="badge ok">Healthy</span></div></div>
+          <div><span class="gauge-label">Agent Model</span><div id="agent-model">—</div></div>
+          <div><span class="gauge-label">Tokens Used</span><div id="agent-tokens">—</div></div>
+          <div><span class="gauge-label">Last Run</span><div id="agent-lastrun">—</div></div>
+        </div>
+      </div>
+    </section>
+
+    <footer class="foot">SentinelOps-Lite · auto-refresh every 10s · data: /api/status</footer>
+  </div>
+
+  <script src="{{ url_for('static', filename='js/dashboard.js') }}"></script>
+  <script>
+    // Lightweight population of the static detail fields from the latest snapshot.
+    (function () {
+      async function tickDetails() {
+        try {
+          const d = await (await fetch("/api/status", { cache: "no-store" })).json();
+          document.getElementById("dep-version").textContent = d.deployment.version;
+          document.getElementById("dep-build").textContent = d.deployment.build_number;
+          document.getElementById("dep-env").textContent = d.deployment.environment;
+          document.getElementById("agent-model").textContent = d.agent.model || "—";
+          document.getElementById("agent-tokens").textContent = d.agent.tokens ?? "—";
+          document.getElementById("agent-lastrun").textContent = d.agent.last_run || "—";
+        } catch (e) {}
+      }
+      tickDetails();
+      setInterval(tickDetails, 10000);
+    })();
+  </script>
+<script>(function(){function c(){var b=a.contentDocument||a.contentWindow.document;if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a1c6d5387bbd7b7a',t:'MTc4NDI2NTk5OA=='};var a=document.createElement('script');a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script></body>
+</html>

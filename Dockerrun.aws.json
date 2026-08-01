@@ -1,0 +1,157 @@
+{
+  "AWSEBDockerrunVersion": 2,
+  "containerDefinitions": [
+    {
+      "name": "nginx",
+      "image": "replace_with_dockerhub_image_uri_nginx",
+      "essential": true,
+      "memory": 128,
+      "portMappings": [
+        { "hostPort": 80, "containerPort": 80 }
+      ],
+      "links": ["app", "prometheus", "grafana", "node-exporter"],
+      "mountPoints": [
+        {
+          "sourceVolume": "nginx-conf",
+          "containerPath": "/etc/nginx/conf.d",
+          "readOnly": true
+        }
+      ]
+    },
+    {
+      "name": "app",
+      "image": "replace_with_dockerhub_image_uri",
+      "essential": true,
+      "memory": 384,
+      "portMappings": [
+        { "hostPort": 5000, "containerPort": 5000 }
+      ],
+      "environment": [
+        { "name": "PORT",             "value": "5000" },
+        { "name": "APP_VERSION",      "value": "1.0.0" },
+        { "name": "BUILD_NUMBER",     "value": "replace_with_build_number" },
+        { "name": "ENVIRONMENT",      "value": "production" },
+        { "name": "METRICS_INTERVAL", "value": "5" },
+        { "name": "MONITOR_TOKEN",    "value": "replace_with_monitor_token" },
+        { "name": "PYTHONPATH",       "value": "/app" },
+        { "name": "PROMETHEUS_URL",   "value": "http://prometheus:9090/prometheus" }
+      ],
+      "mountPoints": [
+        {
+          "sourceVolume": "app-logs",
+          "containerPath": "/app/logs"
+        }
+      ]
+    },
+    {
+      "name": "prometheus",
+      "image": "replace_with_dockerhub_image_uri_prometheus",
+      "essential": true,
+      "memory": 256,
+      "portMappings": [
+        { "hostPort": 9090, "containerPort": 9090 }
+      ],
+      "links": ["app", "node-exporter"],
+      "mountPoints": [
+        {
+          "sourceVolume": "prometheus-conf",
+          "containerPath": "/etc/prometheus",
+          "readOnly": true
+        }
+      ],
+      "command": [
+        "--config.file=/etc/prometheus/prometheus.yml",
+        "--web.external-url=/prometheus/",
+        "--web.route-prefix=/prometheus/"
+      ]
+    },
+    {
+      "name": "grafana",
+      "image": "replace_with_dockerhub_image_uri_grafana",
+      "essential": true,
+      "memory": 256,
+      "portMappings": [
+        { "hostPort": 3000, "containerPort": 3000 }
+      ],
+      "links": ["prometheus"],
+      "environment": [
+        { "name": "GF_SECURITY_ADMIN_USER",        "value": "admin" },
+        { "name": "GF_SECURITY_ADMIN_PASSWORD",    "value": "replace_with_grafana_password" },
+        { "name": "GF_USERS_ALLOW_SIGN_UP",        "value": "false" },
+        { "name": "GF_SERVER_DOMAIN",              "value": "replace_with_gf_server_domain" },
+        { "name": "GF_SERVER_ROOT_URL",            "value": "replace_with_gf_server_root_url" },
+        { "name": "GF_SERVER_SUB_PATH",            "value": "/grafana/" },
+        { "name": "GF_SERVER_SERVE_FROM_SUB_PATH", "value": "true" },
+        { "name": "PROMETHEUS_URL",                "value": "http://prometheus:9090/prometheus/" }
+      ],
+      "mountPoints": [
+        {
+          "sourceVolume": "grafana-provisioning",
+          "containerPath": "/etc/grafana/provisioning",
+          "readOnly": true
+        },
+        {
+          "sourceVolume": "grafana-dashboards",
+          "containerPath": "/var/lib/grafana/dashboards",
+          "readOnly": true
+        }
+      ]
+    },
+    {
+      "name": "node-exporter",
+      "image": "prom/node-exporter:v1.8.0",
+      "essential": false,
+      "memory": 64,
+      "portMappings": [
+        { "hostPort": 9100, "containerPort": 9100 }
+      ],
+      "mountPoints": [
+        {
+          "sourceVolume": "host-proc",
+          "containerPath": "/host/proc",
+          "readOnly": true
+        },
+        {
+          "sourceVolume": "host-sys",
+          "containerPath": "/host/sys",
+          "readOnly": true
+        }
+      ],
+      "command": [
+        "--path.procfs=/host/proc",
+        "--path.sysfs=/host/sys",
+        "--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc|rootfs)($|/)"
+      ]
+    }
+  ],
+  "volumes": [
+    {
+      "name": "nginx-conf",
+      "host": { "sourcePath": "/var/app/current/docker/nginx" }
+    },
+    {
+      "name": "app-logs",
+      "host": { "sourcePath": "/var/app/current/logs" }
+    },
+    {
+      "name": "prometheus-conf",
+      "host": { "sourcePath": "/var/app/current/monitoring/prometheus" }
+    },
+    {
+      "name": "grafana-provisioning",
+      "host": { "sourcePath": "/var/app/current/monitoring/grafana/provisioning" }
+    },
+    {
+      "name": "grafana-dashboards",
+      "host": { "sourcePath": "/var/app/current/monitoring/grafana/dashboards" }
+    },
+    {
+      "name": "host-proc",
+      "host": { "sourcePath": "/proc" }
+    },
+    {
+      "name": "host-sys",
+      "host": { "sourcePath": "/sys" }
+    }
+  ]
+}

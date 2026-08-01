@@ -1,0 +1,59 @@
+version: "3.8"
+
+services:
+
+  app:
+    image: __APP_IMAGE__
+    expose:
+      - "5000"
+    environment:
+      - PORT=5000
+      - APP_VERSION=1.0.0
+      - BUILD_NUMBER=__BUILD_NUMBER__
+      - ENVIRONMENT=__ENVIRONMENT__
+      - METRICS_INTERVAL=5
+      - MONITOR_TOKEN=__MONITOR_TOKEN__
+      - PYTHONPATH=/app
+
+  nginx:
+    image: __NGINX_IMAGE__
+    ports:
+      - "80:80"
+
+  prometheus:
+    image: __PROMETHEUS_IMAGE__
+    expose:
+      - "9090"
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--web.external-url=/prometheus/"
+      - "--web.route-prefix=/prometheus/"
+
+  grafana:
+    image: __GRAFANA_IMAGE__
+    expose:
+      - "3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=__GRAFANA_ADMIN_PASSWORD__
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_SERVER_DOMAIN=__GF_SERVER_DOMAIN__
+      - GF_SERVER_ROOT_URL=__GF_SERVER_ROOT_URL__
+      - GF_SERVER_SUB_PATH=/grafana/
+      - GF_SERVER_SERVE_FROM_SUB_PATH=true
+      - GF_SERVER_ENABLE_GZIP=true
+      - GF_SECURITY_ALLOW_EMBEDDING=true
+      - GF_SECURITY_COOKIE_SECURE=false
+      - GF_SECURITY_COOKIE_SAMESITE=disabled
+      - GF_LIVE_ALLOWED_ORIGINS=*
+      - GF_AUTH_ANONYMOUS_ENABLED=false
+      - PROMETHEUS_URL=http://prometheus:9090/prometheus/
+
+  node-exporter:
+    image: prom/node-exporter:v1.8.0
+    expose:
+      - "9100"
+    command:
+      - "--path.procfs=/proc"
+      - "--path.sysfs=/sys"
+      - "--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc|rootfs)($$|/)"

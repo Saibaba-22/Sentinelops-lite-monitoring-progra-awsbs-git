@@ -1,0 +1,70 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="420" viewBox="0 0 960 420" font-family="Segoe UI, Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L8,3 L0,6 Z" fill="#94a3b8"/>
+    </marker>
+    <style>
+      .box { fill:#0b1220; stroke:#3b82f6; stroke-width:1.5; }
+      .box2 { fill:#0b1220; stroke:#10b981; stroke-width:1.5; }
+      .box3 { fill:#0b1220; stroke:#f59e0b; stroke-width:1.5; }
+      .lbl { fill:#e5e7eb; font-size:14px; font-weight:700; }
+      .sub { fill:#94a3b8; font-size:11px; }
+      .edge { stroke:#94a3b8; stroke-width:1.5; fill:none; marker-end:url(#arrow); }
+      .n { fill:#22d3ee; font-size:13px; font-weight:700; }
+    </style>
+  </defs>
+  <rect x="0" y="0" width="960" height="420" fill="#030712"/>
+  <text x="30" y="32" class="lbl">Monitoring Data Flow</text>
+
+  <!-- 1 Expose -->
+  <rect x="30" y="90" width="170" height="90" rx="12" class="box"/>
+  <text x="115" y="120" text-anchor="middle" class="n">1</text>
+  <text x="115" y="142" text-anchor="middle" class="lbl">Expose Metrics</text>
+  <text x="115" y="162" text-anchor="middle" class="sub">Flask /metrics +</text>
+  <text x="115" y="178" text-anchor="middle" class="sub">node-exporter :9100</text>
+
+  <!-- 2 Scrape -->
+  <rect x="250" y="90" width="170" height="90" rx="12" class="box2"/>
+  <text x="335" y="120" text-anchor="middle" class="n">2</text>
+  <text x="335" y="142" text-anchor="middle" class="lbl">Prometheus Scrape</text>
+  <text x="335" y="162" text-anchor="middle" class="sub">every 15s</text>
+  <text x="335" y="178" text-anchor="middle" class="sub">store in TSDB</text>
+
+  <!-- 3 Rules -->
+  <rect x="470" y="90" width="170" height="90" rx="12" class="box3"/>
+  <text x="555" y="120" text-anchor="middle" class="n">3</text>
+  <text x="555" y="142" text-anchor="middle" class="lbl">Rules &amp; Alerts</text>
+  <text x="555" y="162" text-anchor="middle" class="sub">recording +</text>
+  <text x="555" y="178" text-anchor="middle" class="sub">alerting rules</text>
+
+  <!-- 4 Grafana -->
+  <rect x="690" y="90" width="170" height="90" rx="12" class="box2"/>
+  <text x="775" y="120" text-anchor="middle" class="n">4</text>
+  <text x="775" y="142" text-anchor="middle" class="lbl">Grafana</text>
+  <text x="775" y="162" text-anchor="middle" class="sub">query Prometheus</text>
+  <text x="775" y="178" text-anchor="middle" class="sub">provisioned dashboards</text>
+
+  <!-- 5 HTML Dashboard -->
+  <rect x="690" y="250" width="170" height="90" rx="12" class="box"/>
+  <text x="775" y="280" text-anchor="middle" class="n">5</text>
+  <text x="775" y="302" text-anchor="middle" class="lbl">HTML Dashboard</text>
+  <text x="775" y="322" text-anchor="middle" class="sub">polls /api/status</text>
+  <text x="775" y="338" text-anchor="middle" class="sub">every 10s</text>
+
+  <!-- 6 Notify -->
+  <rect x="470" y="250" width="170" height="90" rx="12" class="box3"/>
+  <text x="555" y="280" text-anchor="middle" class="n">6</text>
+  <text x="555" y="302" text-anchor="middle" class="lbl">Notifications</text>
+  <text x="555" y="322" text-anchor="middle" class="sub">email / Slack /</text>
+  <text x="555" y="338" text-anchor="middle" class="sub">Alertmanager</text>
+
+  <!-- Edges -->
+  <line x1="200" y1="135" x2="250" y2="135" class="edge"/>
+  <line x1="420" y1="135" x2="470" y2="135" class="edge"/>
+  <line x1="640" y1="135" x2="690" y2="135" class="edge"/>
+  <line x1="775" y1="180" x2="775" y2="250" class="edge"/>
+  <line x1="640" y1="295" x2="690" y2="295" class="edge"/>
+  <path d="M555,180 C555,210 555,220 555,250" class="edge"/>
+  <path d="M335,180 C250,210 200,240 150,295" class="edge"/>
+  <text x="150" y="220" class="sub" text-anchor="middle">/api/status JSON</text>
+</svg>

@@ -1,0 +1,61 @@
+groups:
+  - name: sentinelops-availability
+    interval: 30s
+    rules:
+      - alert: SentinelOpsApplicationDown
+        expr: up{job="flask-app"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          service: sentinelops-lite
+        annotations:
+          summary: SentinelOps application is unavailable
+          description: Prometheus cannot scrape the Flask application for at least two minutes.
+
+      - alert: SentinelOpsNodeExporterDown
+        expr: up{job="node-exporter"} == 0
+        for: 2m
+        labels:
+          severity: warning
+          service: node-exporter
+        annotations:
+          summary: Node Exporter is unavailable
+          description: Prometheus cannot scrape Node Exporter for at least two minutes.
+
+      - alert: SentinelOpsPrometheusTargetDown
+        expr: sum by (job) (up == 0) > 0
+        for: 5m
+        labels:
+          severity: warning
+          service: monitoring
+        annotations:
+          summary: A Prometheus target is down
+          description: At least one target in the {{ $labels.job }} job has been down for five minutes.
+
+  - name: sentinelops-application
+    interval: 30s
+    rules:
+      - alert: SentinelOpsHighErrorRate
+        expr: |
+          (
+            sum(rate(app_errors_total[5m]))
+            /
+            clamp_min(sum(rate(app_requests_total[5m])), 1)
+          ) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+          service: sentinelops-lite
+        annotations:
+          summary: SentinelOps application error rate is high
+          description: The application 5xx error rate has exceeded five percent for five minutes.
+
+      - alert: SentinelOpsHighMemoryUsage
+        expr: system_memory_usage_percent > 90
+        for: 10m
+        labels:
+          severity: warning
+          service: infrastructure
+        annotations:
+          summary: Host memory usage is high
+          description: Host memory usage has been above 90 percent for ten minutes.

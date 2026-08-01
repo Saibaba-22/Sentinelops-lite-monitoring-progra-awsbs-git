@@ -1,0 +1,95 @@
+:root {
+  --bg-0: #030712;
+  --bg-1: #0b1220;
+  --glass: rgba(255, 255, 255, 0.04);
+  --glass-border: rgba(255, 255, 255, 0.08);
+  --text: #e5e7eb;
+  --muted: #94a3b8;
+  --blue: #3b82f6;
+  --indigo: #6366f1;
+  --emerald: #10b981;
+  --amber: #f59e0b;
+  --red: #ef4444;
+  --cyan: #22d3ee;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font-family: "Plus Jakarta Sans", "Segoe UI", system-ui, sans-serif;
+  color: var(--text);
+  background:
+    radial-gradient(circle at 20% 20%, #0e1630 0%, transparent 40%),
+    radial-gradient(circle at 80% 80%, #101a33 0%, transparent 45%),
+    var(--bg-0);
+  min-height: 100vh;
+}
+
+.dashboard-wrap { max-width: 1400px; margin: 0 auto; padding: 24px; }
+
+header.topbar {
+  display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between;
+  gap: 12px; margin-bottom: 20px;
+}
+.title-block h1 {
+  margin: 0; font-size: 22px; font-weight: 700;
+  background: linear-gradient(90deg, var(--blue), var(--indigo), var(--emerald));
+  -webkit-background-clip: text; background-clip: text; color: transparent;
+}
+.title-block p { margin: 4px 0 0; color: var(--muted); font-size: 13px; }
+
+.status-pill {
+  display: inline-flex; align-items: center; gap: 8px;
+  padding: 8px 14px; border-radius: 999px; font-size: 13px; font-weight: 600;
+  background: var(--glass); border: 1px solid var(--glass-border);
+}
+.dot { width: 10px; height: 10px; border-radius: 50%; background: var(--emerald); box-shadow: 0 0 10px var(--emerald); }
+.dot.pulsing { animation: pulse 1.6s infinite; }
+@keyframes pulse { 0% { transform: scale(1); opacity: 1; } 100% { transform: scale(2.4); opacity: 0; } }
+
+.grid { display: grid; grid-template-columns: repeat(12, 1fr); gap: 16px; }
+
+.glass-card {
+  background: var(--glass); backdrop-filter: blur(12px);
+  border: 1px solid var(--glass-border); border-radius: 16px; padding: 18px;
+  transition: transform .35s ease, box-shadow .35s ease, border-color .35s ease;
+  animation: fadeIn .6s ease both;
+}
+.glass-card:hover { transform: translateY(-4px); border-color: rgba(59,130,246,.4); box-shadow: 0 0 30px rgba(59,130,246,.15); }
+@keyframes fadeIn { from { opacity: 0; transform: translateY(16px); } to { opacity: 1; transform: none; } }
+
+.card-title { font-size: 12px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin: 0 0 10px; }
+.stat-value { font-size: 30px; font-weight: 800; line-height: 1; }
+.stat-sub { font-size: 12px; color: var(--muted); margin-top: 6px; }
+
+.col-3 { grid-column: span 3; } .col-4 { grid-column: span 4; }
+.col-6 { grid-column: span 6; } .col-8 { grid-column: span 8; }
+.col-12 { grid-column: span 12; }
+
+@media (max-width: 1024px) { .col-3, .col-4 { grid-column: span 6; } .col-6, .col-8 { grid-column: span 12; } }
+@media (max-width: 640px) { .col-3, .col-4, .col-6, .col-8, .col-12 { grid-column: span 12; } }
+
+.badge { display: inline-block; padding: 3px 10px; border-radius: 999px; font-size: 11px; font-weight: 700; letter-spacing: .03em; }
+.badge.ok { background: rgba(16,185,129,.15); color: #6ee7b7; border: 1px solid rgba(16,185,129,.4); }
+.badge.warn { background: rgba(245,158,11,.15); color: #fcd34d; border: 1px solid rgba(245,158,11,.4); }
+.badge.crit { background: rgba(239,68,68,.15); color: #fca5a5; border: 1px solid rgba(239,68,68,.4); }
+.badge.idle { background: rgba(148,163,184,.15); color: #cbd5e1; border: 1px solid rgba(148,163,184,.35); }
+
+/* Gauge */
+.gauge { display: flex; align-items: center; gap: 14px; }
+.gauge svg { transform: rotate(-90deg); }
+.gauge .track { stroke: rgba(255,255,255,.08); }
+.gauge .fill { stroke-linecap: round; transition: stroke-dashoffset .8s ease, stroke .4s ease; }
+.gauge-value { font-size: 22px; font-weight: 800; }
+.gauge-label { font-size: 12px; color: var(--muted); }
+
+/* Progress bar */
+.progress { height: 8px; border-radius: 999px; background: rgba(255,255,255,.08); overflow: hidden; margin-top: 10px; }
+.progress > span { display: block; height: 100%; border-radius: 999px; transition: width .8s ease; background: linear-gradient(90deg, var(--blue), var(--emerald)); }
+
+.chart-box { position: relative; height: 220px; }
+
+footer.foot { text-align: center; color: var(--muted); font-size: 12px; margin-top: 24px; font-family: ui-monospace, monospace; }
+
+.loading { opacity: .4; }

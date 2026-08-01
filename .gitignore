@@ -1,0 +1,13 @@
+__pycache__/ 
+*.pyc 
+.pytest_cache/ 
+.env 
+.env.* 
+logs/ 
+agent_stats.json 
+agent_decision.txt 
+test_results.txt 
+final_review.txt 
+review_report.txt 
+.idea/ 
+.vscode/ 

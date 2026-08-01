@@ -1,0 +1,16 @@
+Here are the top 2 critical issues (as only two distinct critical issues are present) and their fixes:
+
+1.  **FILE: .env.example**
+    *   **LINE:** N/A
+    *   **ISSUE:** Missing `METRICS_TOKEN` variable, which can lead to CI failures and confusion for new developers.
+    *   **FIX:** Add `METRICS_TOKEN=your_token_here` (or similar placeholder/comment) to `.env.example`.
+
+2.  **FILE: test_app.py**
+    *   **LINE:** 24
+    *   **ISSUE:** The `test_health` unit test is failing. It expects the `/health` endpoint to return `text/html` content, but the application is returning `application/json`.
+    *   **FIX:** Update `test_app.py` on line 24 to expect the correct content type:
+        ```python
+        # Original: assert response.content_type.startswith("text/html")
+        assert response.content_type.startswith("application/json")
+        ```
+        (Assuming `application/json` is the intended content type for the `/health` endpoint, which is common for APIs.)

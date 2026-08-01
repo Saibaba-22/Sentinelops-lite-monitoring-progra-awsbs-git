@@ -1,0 +1,208 @@
+ai-monitoring-platform/
+├── app.py                      # Entry point (imports `application` from agent_monitor)
+├── agent.py                    # AI Agent CI release-gate (Gemini approve/reject)
+├── agent_monitor.py            # Core Flask app + Prometheus metrics + endpoints
+├── final_agent.py              # (new) Post-deploy verification → final_review.txt
+├── review_agent.py             # (new) Pre-deploy review gate
+├── pipeline.yaml               # (new) CI/CD pipeline (GH Actions format)
+├── requirements.txt
+├── test_app.py
+├── README.md
+│
+├── monitoring/
+│   ├── __init__.py
+│   ├── metrics.py              # All Prometheus metric definitions + collectors
+│   ├── collectors.py           # /api/status JSON snapshot
+│   ├── agent_state.py          # Persisted agent state (logs/agent_stats.json)
+│   ├── exporters/
+│   │   └── node-exporter/      # (empty — node-exporter runs from image)
+│   ├── prometheus/
+│   │   ├── prometheus.yml
+│   │   ├── alert.rules.yml
+│   │   └── recording.rules.yml
+│   └── grafana/
+│       ├── dashboards/         # system / application / ai-agent / deployment -dashboard.json
+│       └── provisioning/
+│           ├── datasources/datasource.yml
+│           └── dashboards/dashboard.yml + dashboards.json (Overview)
+│
+├── docker/
+│   ├── Dockerfile
+│   ├── docker-compose.yml
+│   └── nginx/nginx.conf
+│
+├── deployment/
+│   ├── Dockerrun.aws.json      # Multi-container Docker manifest
+│   ├── Procfile                # Single-container fallback
+│   ├── deploy.sh               # Build → ECR → EB deploy
+│   └── .ebextensions/
+│       ├── 01-nginx.config     # Health check / proxy tuning
+│       └── 02-logging.config   # Centralised logging
+│
+├── static/
+│   ├── css/dashboard.css
+│   ├── js/dashboard.js
+│   └── images/                 # (empty)
+│
+├── templates/
+│   ├── index.html              # Pipeline UI
+│   └── dashboard.html          # Live monitoring dashboard
+│
+├── docs/
+│   ├── README.md
+│   ├── DEPLOYMENT.md
+│   ├── TROUBLESHOOTING.md
+│   ├── architecture.svg
+│   └── monitoring-flow.svg
+│
+├── logs/                       # runtime logs + agent_stats.json (git-ignored)
+├── .dockerignore
+└── .env.example
+
+# 0) Put the pipeline where GitHub Actions expects it
+mkdir -p .github/workflows
+mv pipeline.yml .github/workflows/pipeline.yml
+
+# 1) Create a .gitignore so logs/caches/secrets aren't committed
+cat > .gitignore <<'EOF'
+__pycache__/
+*.pyc
+.pytest_cache/
+.env
+.env.*
+logs/
+agent_stats.json
+agent_decision.txt
+test_results.txt
+final_review.txt
+review_report.txt
+.idea/
+.vscode/
+EOF
+
+# 2) Initialise, stage and commit
+git init
+git add .
+git commit -m "Initial commit: SentinelOps-Lite AI monitoring platform"
+
+# 3) Push to GitHub
+# --- Option A: you already created the repo on github.com ---
+git branch -M main
+git remote add origin https://github.com/USERNAME/sentinelops-lite.git
+git push -u origin main
+
+# --- Option B: create the repo from the CLI with GitHub CLI (gh) ---
+# gh repo create sentinelops-lite --private --source=. --remote=origin --push
+
+
+
+What	URL
+Your app / index.html	http://agent3.us-east-1.elasticbeanstalk.com/
+Live dashboard	http://agent3.us-east-1.elasticbeanstalk.com/dashboard
+Prometheus	http://agent3.us-east-1.elasticbeanstalk.com/prometheus/
+Grafana (login admin / admin)	http://agent3.us-east-1.elasticbeanstalk.com/grafana/
+node-exporter metrics	http://agent3.us-east-1.elasticbeanstalk.com/node-exporter/
+
+
+
+
+D:\11>tree /F
+Folder PATH listing for volume Local Disk
+Volume serial number is 000000A1 920E:6D3C
+D:.
+│   .dockerignore
+│   .ebignore
+│   .env.example
+│   .gitignore
+│   agent.py
+│   agent_monitor.py
+│   app.py
+│   docker-compose.yml
+│   Dockerrun.aws.json
+│   error.docx
+│   Filestructure.txt
+│   final_agent.py
+│   requirements.txt
+│   review_agent.py
+│   Sentinelops-AI-Progra.rar
+│   test_app.py
+│
+├───.ebextensions
+│       01-nginx.config
+│       02-logging.config
+│
+├───.github
+│   └───workflows
+│           awsbs.yml
+│           azappser.yml
+│           pipeline.yml
+│
+├───.platform
+│   └───hooks
+│       └───predeploy
+│               10-inject-private-ip.sh
+│
+├───agent
+│       errors.py
+│       final_agent.py
+│       single_agent.py
+│       test_agent.py
+│
+├───deployment
+│       deploy.sh
+│       Procfile
+│
+├───docker
+│   │   docker-compose.yml
+│   │   Dockerfile
+│   │
+│   └───nginx
+│           nginx.conf
+│
+├───docs
+│       architecture.svg
+│       DEPLOYMENT.md
+│       monitoring-flow.svg
+│       README.md
+│       TROUBLESHOOTING.md
+│
+├───logs
+├───monitoring
+│   │   agent_state.py
+│   │   collectors.py
+│   │   metrics.py
+│   │   __init__.py
+│   │
+│   ├───exporters
+│   │   └───node-exporter
+│   ├───grafana
+│   │   ├───dashboards
+│   │   │       ai-agent-dashboard.json
+│   │   │       application-dashboard.json
+│   │   │       deployment-dashboard.json
+│   │   │       system-dashboard.json
+│   │   │
+│   │   └───provisioning
+│   │       ├───dashboards
+│   │       │       dashboard.yml
+│   │       │       dashboards.json
+│   │       │
+│   │       └───datasources
+│   │               datasource.yml
+│   │
+│   └───prometheus
+│           alert.rules.yml
+│           prometheus.yml
+│           recording.rules.yml
+│
+├───static
+│   ├───css
+│   │       dashboard.css
+│   │
+│   ├───images
+│   └───js
+│           dashboard.js
+│
+└───templates
+        dashboard.html
+        index.html

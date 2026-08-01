@@ -1,0 +1,7 @@
+FILE: docker-compose.yml or deployment template
+LINE: N/A
+PRESENT_ERROR: An image placeholder reached deployment.
+EXPECTED_VALUE: A concrete Docker image URI with the current build tag.
+WHY: The deployment preparation step did not render the template.
+SOLUTION: Re-run the rendering step and fail before deployment when a template marker remains.
+
