@@ -543,104 +543,396 @@ def _extract_pipeline_name(platform, files):
 # AI AGENT DETECTOR
 # ══════════════════════════════════════════════════════════════════════════════
 
-AI_PROVIDER_PATTERNS = {
+AI_PROVIDER_FULL_METRICS = {
     "OpenAI": {
-        "imports": ["openai", "OpenAI"],
-        "env_keys": ["OPENAI_API_KEY", "OPENAI_KEY"],
-        "models": ["gpt-4", "gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "gpt-3.5-turbo",
-                    "o1-preview", "o1-mini", "o3-mini", "text-embedding-ada", "text-embedding-3"],
-        "token_limits": {
-            "gpt-4": {"input": 8192, "output": 8192},
-            "gpt-4o": {"input": 128000, "output": 16384},
-            "gpt-4o-mini": {"input": 128000, "output": 16384},
-            "gpt-4-turbo": {"input": 128000, "output": 4096},
-            "gpt-3.5-turbo": {"input": 16385, "output": 4096},
-            "o1-preview": {"input": 128000, "output": 32768},
-            "o1-mini": {"input": 128000, "output": 65536},
-            "o3-mini": {"input": 200000, "output": 100000},
-        },
-        "rate_limits": {
-            "gpt-4": {"rpm": 500, "rpd": 10000},
-            "gpt-4o": {"rpm": 500, "rpd": 10000},
-            "gpt-4o-mini": {"rpm": 500, "rpd": 10000},
-            "gpt-4-turbo": {"rpm": 500, "rpd": 10000},
-            "gpt-3.5-turbo": {"rpm": 3500, "rpd": 10000},
-            "o1-preview": {"rpm": 500, "rpd": 10000},
-            "o1-mini": {"rpm": 500, "rpd": 10000},
-            "o3-mini": {"rpm": 500, "rpd": 10000},
+        "imports": ["openai", "OpenAI", "AsyncOpenAI"],
+        "env_keys": ["OPENAI_API_KEY", "OPENAI_KEY", "OPENAI_ORG_ID"],
+        "website": "https://platform.openai.com",
+        "models": {
+            "gpt-4o": {
+                "full_name": "GPT-4o",
+                "type": "Chat / Multimodal",
+                "context_window": 128000,
+                "max_output_tokens": 16384,
+                "input_cost_per_1k": 0.005,
+                "output_cost_per_1k": 0.015,
+                "rate_limits": {"rpm": 500, "rpd": 10000, "tpm": 30000, "tpd": 1000000},
+                "features": ["vision", "function_calling", "json_mode", "streaming"],
+                "training_cutoff": "Oct 2023",
+                "latency": "medium",
+            },
+            "gpt-4o-mini": {
+                "full_name": "GPT-4o Mini",
+                "type": "Chat / Lightweight",
+                "context_window": 128000,
+                "max_output_tokens": 16384,
+                "input_cost_per_1k": 0.000150,
+                "output_cost_per_1k": 0.000600,
+                "rate_limits": {"rpm": 500, "rpd": 10000, "tpm": 200000, "tpd": 2000000},
+                "features": ["vision", "function_calling", "json_mode", "streaming"],
+                "training_cutoff": "Oct 2023",
+                "latency": "fast",
+            },
+            "gpt-4-turbo": {
+                "full_name": "GPT-4 Turbo",
+                "type": "Chat",
+                "context_window": 128000,
+                "max_output_tokens": 4096,
+                "input_cost_per_1k": 0.010,
+                "output_cost_per_1k": 0.030,
+                "rate_limits": {"rpm": 500, "rpd": 10000, "tpm": 30000, "tpd": 1000000},
+                "features": ["vision", "function_calling", "json_mode", "streaming"],
+                "training_cutoff": "Apr 2024",
+                "latency": "medium",
+            },
+            "gpt-4": {
+                "full_name": "GPT-4",
+                "type": "Chat",
+                "context_window": 8192,
+                "max_output_tokens": 8192,
+                "input_cost_per_1k": 0.030,
+                "output_cost_per_1k": 0.060,
+                "rate_limits": {"rpm": 500, "rpd": 10000, "tpm": 10000, "tpd": 300000},
+                "features": ["function_calling", "json_mode"],
+                "training_cutoff": "Sep 2021",
+                "latency": "slow",
+            },
+            "gpt-3.5-turbo": {
+                "full_name": "GPT-3.5 Turbo",
+                "type": "Chat",
+                "context_window": 16385,
+                "max_output_tokens": 4096,
+                "input_cost_per_1k": 0.0005,
+                "output_cost_per_1k": 0.0015,
+                "rate_limits": {"rpm": 3500, "rpd": 10000, "tpm": 90000, "tpd": 2000000},
+                "features": ["function_calling", "json_mode", "streaming"],
+                "training_cutoff": "Sep 2021",
+                "latency": "fast",
+            },
+            "o1-preview": {
+                "full_name": "O1 Preview",
+                "type": "Reasoning",
+                "context_window": 128000,
+                "max_output_tokens": 32768,
+                "input_cost_per_1k": 0.015,
+                "output_cost_per_1k": 0.060,
+                "rate_limits": {"rpm": 500, "rpd": 10000, "tpm": 30000, "tpd": 1000000},
+                "features": ["reasoning", "streaming"],
+                "training_cutoff": "Oct 2023",
+                "latency": "very_slow",
+            },
+            "o1-mini": {
+                "full_name": "O1 Mini",
+                "type": "Reasoning / Lightweight",
+                "context_window": 128000,
+                "max_output_tokens": 65536,
+                "input_cost_per_1k": 0.003,
+                "output_cost_per_1k": 0.012,
+                "rate_limits": {"rpm": 500, "rpd": 10000, "tpm": 200000, "tpd": 2000000},
+                "features": ["reasoning", "streaming"],
+                "training_cutoff": "Oct 2023",
+                "latency": "slow",
+            },
+            "o3-mini": {
+                "full_name": "O3 Mini",
+                "type": "Reasoning / Fast",
+                "context_window": 200000,
+                "max_output_tokens": 100000,
+                "input_cost_per_1k": 0.0011,
+                "output_cost_per_1k": 0.0044,
+                "rate_limits": {"rpm": 500, "rpd": 10000, "tpm": 200000, "tpd": 2000000},
+                "features": ["reasoning", "function_calling", "streaming"],
+                "training_cutoff": "Oct 2023",
+                "latency": "fast",
+            },
         },
     },
+
     "Anthropic (Claude)": {
-        "imports": ["anthropic", "Anthropic"],
+        "imports": ["anthropic", "Anthropic", "AsyncAnthropic"],
         "env_keys": ["ANTHROPIC_API_KEY"],
-        "models": ["claude-3-opus", "claude-3-sonnet", "claude-3-haiku",
-                    "claude-3.5-sonnet", "claude-3.5-haiku", "claude-2"],
-        "token_limits": {
-            "claude-3-opus": {"input": 200000, "output": 4096},
-            "claude-3-sonnet": {"input": 200000, "output": 4096},
-            "claude-3-haiku": {"input": 200000, "output": 4096},
-            "claude-3.5-sonnet": {"input": 200000, "output": 8192},
-            "claude-3.5-haiku": {"input": 200000, "output": 8192},
-        },
-        "rate_limits": {
-            "claude-3-opus": {"rpm": 1000, "rpd": 50000},
-            "claude-3-sonnet": {"rpm": 1000, "rpd": 50000},
-            "claude-3-haiku": {"rpm": 4000, "rpd": 200000},
-            "claude-3.5-sonnet": {"rpm": 1000, "rpd": 50000},
-            "claude-3.5-haiku": {"rpm": 4000, "rpd": 200000},
+        "website": "https://console.anthropic.com",
+        "models": {
+            "claude-3-5-sonnet-20241022": {
+                "full_name": "Claude 3.5 Sonnet",
+                "type": "Chat / Flagship",
+                "context_window": 200000,
+                "max_output_tokens": 8192,
+                "input_cost_per_1k": 0.003,
+                "output_cost_per_1k": 0.015,
+                "rate_limits": {"rpm": 1000, "rpd": 50000, "tpm": 80000, "tpd": 5000000},
+                "features": ["vision", "tool_use", "streaming", "json_mode"],
+                "training_cutoff": "Apr 2024",
+                "latency": "medium",
+            },
+            "claude-3-5-haiku-20241022": {
+                "full_name": "Claude 3.5 Haiku",
+                "type": "Chat / Fast",
+                "context_window": 200000,
+                "max_output_tokens": 8192,
+                "input_cost_per_1k": 0.0008,
+                "output_cost_per_1k": 0.004,
+                "rate_limits": {"rpm": 4000, "rpd": 200000, "tpm": 400000, "tpd": 10000000},
+                "features": ["vision", "tool_use", "streaming"],
+                "training_cutoff": "Jul 2024",
+                "latency": "fast",
+            },
+            "claude-3-opus-20240229": {
+                "full_name": "Claude 3 Opus",
+                "type": "Chat / Most Capable",
+                "context_window": 200000,
+                "max_output_tokens": 4096,
+                "input_cost_per_1k": 0.015,
+                "output_cost_per_1k": 0.075,
+                "rate_limits": {"rpm": 1000, "rpd": 50000, "tpm": 40000, "tpd": 1000000},
+                "features": ["vision", "tool_use", "streaming"],
+                "training_cutoff": "Aug 2023",
+                "latency": "slow",
+            },
+            "claude-3-haiku-20240307": {
+                "full_name": "Claude 3 Haiku",
+                "type": "Chat / Fastest",
+                "context_window": 200000,
+                "max_output_tokens": 4096,
+                "input_cost_per_1k": 0.00025,
+                "output_cost_per_1k": 0.00125,
+                "rate_limits": {"rpm": 4000, "rpd": 200000, "tpm": 400000, "tpd": 10000000},
+                "features": ["vision", "tool_use", "streaming"],
+                "training_cutoff": "Aug 2023",
+                "latency": "very_fast",
+            },
+            "claude-3-sonnet-20240229": {
+                "full_name": "Claude 3 Sonnet",
+                "type": "Chat / Balanced",
+                "context_window": 200000,
+                "max_output_tokens": 4096,
+                "input_cost_per_1k": 0.003,
+                "output_cost_per_1k": 0.015,
+                "rate_limits": {"rpm": 1000, "rpd": 50000, "tpm": 80000, "tpd": 5000000},
+                "features": ["vision", "tool_use", "streaming"],
+                "training_cutoff": "Aug 2023",
+                "latency": "medium",
+            },
         },
     },
+
     "Google Gemini": {
-        "imports": ["google.generativeai", "genai", "vertexai"],
+        "imports": ["google.generativeai", "genai", "vertexai", "google.ai.generativelanguage"],
         "env_keys": ["GOOGLE_API_KEY", "GEMINI_API_KEY", "GOOGLE_APPLICATION_CREDENTIALS"],
-        "models": ["gemini-pro", "gemini-1.5-pro", "gemini-1.5-flash", "gemini-ultra", "gemini-2.0-flash"],
-        "token_limits": {
-            "gemini-pro": {"input": 32760, "output": 8192},
-            "gemini-1.5-pro": {"input": 2097152, "output": 8192},
-            "gemini-1.5-flash": {"input": 1048576, "output": 8192},
-            "gemini-2.0-flash": {"input": 1048576, "output": 8192},
-        },
-        "rate_limits": {
-            "gemini-pro": {"rpm": 60, "rpd": 1500},
-            "gemini-1.5-pro": {"rpm": 360, "rpd": 50000},
-            "gemini-1.5-flash": {"rpm": 1000, "rpd": 100000},
-            "gemini-2.0-flash": {"rpm": 1000, "rpd": 100000},
+        "website": "https://aistudio.google.com",
+        "models": {
+            "gemini-1.5-pro": {
+                "full_name": "Gemini 1.5 Pro",
+                "type": "Chat / Multimodal",
+                "context_window": 2097152,
+                "max_output_tokens": 8192,
+                "input_cost_per_1k": 0.00125,
+                "output_cost_per_1k": 0.005,
+                "rate_limits": {"rpm": 360, "rpd": 50000, "tpm": 4000000, "tpd": 0},
+                "features": ["vision", "audio", "video", "function_calling", "streaming"],
+                "training_cutoff": "Nov 2023",
+                "latency": "medium",
+            },
+            "gemini-1.5-flash": {
+                "full_name": "Gemini 1.5 Flash",
+                "type": "Chat / Fast Multimodal",
+                "context_window": 1048576,
+                "max_output_tokens": 8192,
+                "input_cost_per_1k": 0.000075,
+                "output_cost_per_1k": 0.000300,
+                "rate_limits": {"rpm": 1000, "rpd": 100000, "tpm": 4000000, "tpd": 0},
+                "features": ["vision", "audio", "function_calling", "streaming"],
+                "training_cutoff": "Nov 2023",
+                "latency": "fast",
+            },
+            "gemini-2.0-flash": {
+                "full_name": "Gemini 2.0 Flash",
+                "type": "Chat / Next Gen",
+                "context_window": 1048576,
+                "max_output_tokens": 8192,
+                "input_cost_per_1k": 0.000100,
+                "output_cost_per_1k": 0.000400,
+                "rate_limits": {"rpm": 1000, "rpd": 100000, "tpm": 4000000, "tpd": 0},
+                "features": ["vision", "audio", "function_calling", "streaming"],
+                "training_cutoff": "Jan 2025",
+                "latency": "fast",
+            },
+            "gemini-pro": {
+                "full_name": "Gemini Pro",
+                "type": "Chat",
+                "context_window": 32760,
+                "max_output_tokens": 8192,
+                "input_cost_per_1k": 0.0005,
+                "output_cost_per_1k": 0.0015,
+                "rate_limits": {"rpm": 60, "rpd": 1500, "tpm": 32000, "tpd": 0},
+                "features": ["function_calling", "streaming"],
+                "training_cutoff": "Feb 2023",
+                "latency": "medium",
+            },
         },
     },
+
     "Azure OpenAI": {
-        "imports": ["openai.AzureOpenAI", "AzureOpenAI"],
-        "env_keys": ["AZURE_OPENAI_API_KEY", "AZURE_OPENAI_ENDPOINT"],
-        "models": ["gpt-4", "gpt-4o", "gpt-35-turbo"],
-        "token_limits": {"gpt-4": {"input": 8192, "output": 8192}, "gpt-4o": {"input": 128000, "output": 16384}},
-        "rate_limits": {"gpt-4": {"rpm": 600, "rpd": 14400}, "gpt-4o": {"rpm": 600, "rpd": 14400}},
+        "imports": ["openai.AzureOpenAI", "AzureOpenAI", "AsyncAzureOpenAI"],
+        "env_keys": ["AZURE_OPENAI_API_KEY", "AZURE_OPENAI_ENDPOINT", "AZURE_OPENAI_DEPLOYMENT"],
+        "website": "https://portal.azure.com",
+        "models": {
+            "gpt-4o": {
+                "full_name": "GPT-4o (Azure)",
+                "type": "Chat / Multimodal",
+                "context_window": 128000,
+                "max_output_tokens": 16384,
+                "input_cost_per_1k": 0.005,
+                "output_cost_per_1k": 0.015,
+                "rate_limits": {"rpm": 600, "rpd": 14400, "tpm": 600000, "tpd": 0},
+                "features": ["vision", "function_calling", "json_mode", "streaming"],
+                "training_cutoff": "Oct 2023",
+                "latency": "medium",
+            },
+            "gpt-4": {
+                "full_name": "GPT-4 (Azure)",
+                "type": "Chat",
+                "context_window": 8192,
+                "max_output_tokens": 8192,
+                "input_cost_per_1k": 0.030,
+                "output_cost_per_1k": 0.060,
+                "rate_limits": {"rpm": 600, "rpd": 14400, "tpm": 600000, "tpd": 0},
+                "features": ["function_calling"],
+                "training_cutoff": "Sep 2021",
+                "latency": "slow",
+            },
+            "gpt-35-turbo": {
+                "full_name": "GPT-3.5 Turbo (Azure)",
+                "type": "Chat",
+                "context_window": 16385,
+                "max_output_tokens": 4096,
+                "input_cost_per_1k": 0.0005,
+                "output_cost_per_1k": 0.0015,
+                "rate_limits": {"rpm": 600, "rpd": 14400, "tpm": 600000, "tpd": 0},
+                "features": ["function_calling", "streaming"],
+                "training_cutoff": "Sep 2021",
+                "latency": "fast",
+            },
+        },
     },
+
     "Hugging Face": {
-        "imports": ["transformers", "huggingface_hub", "HfApi"],
-        "env_keys": ["HF_TOKEN", "HUGGINGFACE_TOKEN"],
-        "models": ["llama", "mistral", "falcon", "bloom", "starcoder"],
-        "token_limits": {}, "rate_limits": {},
+        "imports": ["transformers", "huggingface_hub", "HfApi", "AutoModelForCausalLM", "pipeline"],
+        "env_keys": ["HF_TOKEN", "HUGGINGFACE_TOKEN", "HF_API_TOKEN"],
+        "website": "https://huggingface.co",
+        "models": {
+            "meta-llama/Llama-3-70b": {
+                "full_name": "Llama 3 70B",
+                "type": "Open Source LLM",
+                "context_window": 8192,
+                "max_output_tokens": 8192,
+                "input_cost_per_1k": 0.0009,
+                "output_cost_per_1k": 0.0009,
+                "rate_limits": {"rpm": 30, "rpd": 1000, "tpm": 500000, "tpd": 0},
+                "features": ["streaming", "function_calling"],
+                "training_cutoff": "Dec 2023",
+                "latency": "medium",
+            },
+            "mistralai/Mistral-7B": {
+                "full_name": "Mistral 7B",
+                "type": "Open Source LLM",
+                "context_window": 32768,
+                "max_output_tokens": 32768,
+                "input_cost_per_1k": 0.0002,
+                "output_cost_per_1k": 0.0002,
+                "rate_limits": {"rpm": 30, "rpd": 1000, "tpm": 500000, "tpd": 0},
+                "features": ["streaming"],
+                "training_cutoff": "Sep 2023",
+                "latency": "fast",
+            },
+        },
     },
+
     "Cohere": {
-        "imports": ["cohere"],
+        "imports": ["cohere", "Client"],
         "env_keys": ["COHERE_API_KEY", "CO_API_KEY"],
-        "models": ["command", "command-r", "command-r-plus"],
-        "token_limits": {"command-r-plus": {"input": 128000, "output": 4096}, "command-r": {"input": 128000, "output": 4096}},
-        "rate_limits": {"command-r-plus": {"rpm": 1000, "rpd": 50000}, "command-r": {"rpm": 1000, "rpd": 50000}},
+        "website": "https://dashboard.cohere.com",
+        "models": {
+            "command-r-plus": {
+                "full_name": "Command R+",
+                "type": "Chat / RAG",
+                "context_window": 128000,
+                "max_output_tokens": 4096,
+                "input_cost_per_1k": 0.003,
+                "output_cost_per_1k": 0.015,
+                "rate_limits": {"rpm": 1000, "rpd": 50000, "tpm": 2000000, "tpd": 0},
+                "features": ["rag", "tool_use", "streaming", "json_mode"],
+                "training_cutoff": "Mar 2024",
+                "latency": "medium",
+            },
+            "command-r": {
+                "full_name": "Command R",
+                "type": "Chat / RAG",
+                "context_window": 128000,
+                "max_output_tokens": 4096,
+                "input_cost_per_1k": 0.0005,
+                "output_cost_per_1k": 0.0015,
+                "rate_limits": {"rpm": 1000, "rpd": 50000, "tpm": 2000000, "tpd": 0},
+                "features": ["rag", "tool_use", "streaming"],
+                "training_cutoff": "Mar 2024",
+                "latency": "fast",
+            },
+        },
     },
+
     "Groq": {
-        "imports": ["groq"],
+        "imports": ["groq", "Groq", "AsyncGroq"],
         "env_keys": ["GROQ_API_KEY"],
-        "models": ["llama3", "mixtral", "gemma"],
-        "token_limits": {"llama3-70b": {"input": 8192, "output": 8192}, "mixtral-8x7b": {"input": 32768, "output": 32768}},
-        "rate_limits": {"llama3-70b": {"rpm": 30, "rpd": 14400}, "mixtral-8x7b": {"rpm": 30, "rpd": 14400}},
+        "website": "https://console.groq.com",
+        "models": {
+            "llama3-70b-8192": {
+                "full_name": "LLaMA3 70B (Groq)",
+                "type": "Chat / Ultra Fast",
+                "context_window": 8192,
+                "max_output_tokens": 8192,
+                "input_cost_per_1k": 0.00059,
+                "output_cost_per_1k": 0.00079,
+                "rate_limits": {"rpm": 30, "rpd": 14400, "tpm": 6000, "tpd": 500000},
+                "features": ["streaming", "function_calling"],
+                "training_cutoff": "Dec 2023",
+                "latency": "ultra_fast",
+            },
+            "mixtral-8x7b-32768": {
+                "full_name": "Mixtral 8x7B (Groq)",
+                "type": "Chat / MoE",
+                "context_window": 32768,
+                "max_output_tokens": 32768,
+                "input_cost_per_1k": 0.00027,
+                "output_cost_per_1k": 0.00027,
+                "rate_limits": {"rpm": 30, "rpd": 14400, "tpm": 5000, "tpd": 500000},
+                "features": ["streaming", "function_calling"],
+                "training_cutoff": "Sep 2023",
+                "latency": "ultra_fast",
+            },
+        },
     },
+
     "LangChain": {
-        "imports": ["langchain", "langchain_openai", "langchain_anthropic", "langchain_google_genai", "langchain_community"],
-        "env_keys": ["LANGCHAIN_API_KEY", "LANGCHAIN_TRACING_V2"],
-        "models": [], "token_limits": {}, "rate_limits": {},
+        "imports": ["langchain", "langchain_openai", "langchain_anthropic",
+                    "langchain_google_genai", "langchain_community", "langchain_core"],
+        "env_keys": ["LANGCHAIN_API_KEY", "LANGCHAIN_TRACING_V2", "LANGCHAIN_PROJECT"],
+        "website": "https://smith.langchain.com",
+        "models": {},
     },
-    "CrewAI": {"imports": ["crewai"], "env_keys": [], "models": [], "token_limits": {}, "rate_limits": {}},
-    "AutoGen": {"imports": ["autogen", "pyautogen"], "env_keys": [], "models": [], "token_limits": {}, "rate_limits": {}},
+
+    "CrewAI": {
+        "imports": ["crewai", "Crew", "Agent", "Task"],
+        "env_keys": ["CREWAI_API_KEY"],
+        "website": "https://crewai.com",
+        "models": {},
+    },
+
+    "AutoGen": {
+        "imports": ["autogen", "pyautogen", "AssistantAgent", "UserProxyAgent"],
+        "env_keys": ["AUTOGEN_USE_DOCKER"],
+        "website": "https://microsoft.github.io/autogen",
+        "models": {},
+    },
 }
 
 AI_AGENT_CHARACTERISTICS = [
@@ -658,88 +950,199 @@ AI_AGENT_CHARACTERISTICS = [
     {"trait": "Multi-Agent Collaboration", "icon": "🤝", "desc": "Coordinates with other agents to solve tasks"},
 ]
 
-
 def _scan_python_file(filepath):
-    results = {"providers_found": [], "models_found": [], "imports_found": [],
-               "env_vars_used": [], "token_configs": [], "agent_patterns": []}
+    results = {
+        "providers_found":   [],
+        "models_found":      [],
+        "imports_found":     [],
+        "env_vars_used":     [],
+        "token_configs":     [],
+        "agent_patterns":    [],
+        "raw_model_strings": [],
+    }
+
     try:
         with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
             content = f.read()
     except Exception:
         return results
 
+    # ── Imports ────────────────────────────────────────────────────────────
     try:
         tree = ast.parse(content)
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 for alias in node.names:
                     results["imports_found"].append(alias.name)
-            elif isinstance(node, ast.ImportFrom):
-                if node.module:
-                    results["imports_found"].append(node.module)
-                    for alias in node.names:
-                        results["imports_found"].append(f"{node.module}.{alias.name}")
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                results["imports_found"].append(node.module)
+                for alias in node.names:
+                    results["imports_found"].append(
+                        f"{node.module}.{alias.name}"
+                    )
     except SyntaxError:
-        import_patterns = re.findall(r'^\s*(?:from\s+([\w.]+)\s+import|import\s+([\w.]+))', content, re.MULTILINE)
-        for groups in import_patterns:
+        for groups in re.findall(
+            r'^\s*(?:from\s+([\w.]+)\s+import|import\s+([\w.]+))',
+            content, re.MULTILINE,
+        ):
             for g in groups:
                 if g:
                     results["imports_found"].append(g)
 
-    for provider_name, provider_info in AI_PROVIDER_PATTERNS.items():
-        provider_match = False
-        for imp in provider_info["imports"]:
-            if any(imp in found_imp for found_imp in results["imports_found"]):
-                provider_match = True
-                break
-        for env_key in provider_info["env_keys"]:
-            if env_key in content:
-                results["env_vars_used"].append(env_key)
-                provider_match = True
-        if not provider_match:
+    # ── Configured params ──────────────────────────────────────────────────
+    configured = {}
+    for key, pattern in [
+        ("max_tokens",        r'max_tokens\s*[=:]\s*(\d+)'),
+        ("temperature",       r'temperature\s*[=:]\s*([\d.]+)'),
+        ("top_p",             r'top_p\s*[=:]\s*([\d.]+)'),
+        ("timeout",           r'timeout\s*[=:]\s*(\d+)'),
+        ("max_retries",       r'max_retries\s*[=:]\s*(\d+)'),
+        ("frequency_penalty", r'frequency_penalty\s*[=:]\s*([\d.]+)'),
+        ("presence_penalty",  r'presence_penalty\s*[=:]\s*([\d.]+)'),
+    ]:
+        m = re.findall(pattern, content)
+        if m:
+            configured[key] = (
+                int(m[0])
+                if key in ("max_tokens", "timeout", "max_retries")
+                else float(m[0])
+            )
+
+    # ── Raw model strings ──────────────────────────────────────────────────
+    raw_models = re.findall(r'model\s*[=:]\s*["\']([^"\']+)["\']', content)
+    results["raw_model_strings"] = list(set(raw_models))
+
+    # ── Match providers then models ────────────────────────────────────────
+    for provider_name, provider_info in AI_PROVIDER_FULL_METRICS.items():
+
+        provider_matched = any(
+            imp in found
+            for imp in provider_info["imports"]
+            for found in results["imports_found"]
+        )
+        for ek in provider_info["env_keys"]:
+            if ek in content:
+                results["env_vars_used"].append(ek)
+                provider_matched = True
+
+        if not provider_matched:
             continue
 
         results["providers_found"].append(provider_name)
-        for model in provider_info.get("models", []):
-            if model in content:
-                results["models_found"].append({
-                    "provider": provider_name, "model": model,
-                    "token_limits": provider_info.get("token_limits", {}).get(model, {}),
-                    "rate_limits": provider_info.get("rate_limits", {}).get(model, {}),
-                })
-        token_matches = re.findall(r'max_tokens\s*[=:]\s*(\d+)', content)
-        for tm in token_matches:
-            results["token_configs"].append({"provider": provider_name, "max_tokens_configured": int(tm)})
-        temp_matches = re.findall(r'temperature\s*[=:]\s*([\d.]+)', content)
-        for t in temp_matches:
-            results["token_configs"].append({"provider": provider_name, "temperature": float(t)})
 
-    agent_class_patterns = [
-        (r'class\s+(\w*[Aa]gent\w*)\s*[\(:]', "Class-based Agent"),
-        (r'Agent\s*\(', "Agent instantiation"),
-        (r'CrewAI|Crew\s*\(', "CrewAI Agent"),
-        (r'AssistantAgent|UserProxyAgent', "AutoGen Agent"),
-        (r'AgentExecutor', "LangChain Agent"),
-        (r'create_react_agent|create_openai_tools_agent', "LangChain ReAct Agent"),
-        (r'tool\s*=|tools\s*=\s*\[', "Tool-using Agent"),
-    ]
-    for pattern, label in agent_class_patterns:
+        for model_key, model_metrics in provider_info.get("models", {}).items():
+
+            model_hit = (
+                model_key in content
+                or any(model_key in rm for rm in results["raw_model_strings"])
+                or any(rm in model_key for rm in results["raw_model_strings"])
+            )
+            if not model_hit:
+                continue
+
+            rl       = model_metrics["rate_limits"]
+            in_cost  = model_metrics["input_cost_per_1k"]
+            out_cost = model_metrics["output_cost_per_1k"]
+            max_tok  = configured.get(
+                "max_tokens", model_metrics["max_output_tokens"]
+            )
+            est_hourly = (
+                rl.get("rpm", 0) * 60
+                * (
+                    model_metrics["context_window"] / 1000 * in_cost
+                    + max_tok / 1000 * out_cost
+                )
+            )
+
+            results["models_found"].append({
+                # Identity
+                "provider":        provider_name,
+                "model":           model_key,
+                "full_name":       model_metrics["full_name"],
+                "model_type":      model_metrics["type"],
+                "website":         provider_info["website"],
+                "training_cutoff": model_metrics["training_cutoff"],
+                "latency_class":   model_metrics["latency"],
+                "features":        model_metrics["features"],
+                # Token limits
+                "token_limits": {
+                    "context_window":      model_metrics["context_window"],
+                    "max_output_tokens":   model_metrics["max_output_tokens"],
+                    "configured_max_tokens": configured.get("max_tokens", "Default"),
+                    "temperature":         configured.get("temperature", "Default"),
+                    "top_p":               configured.get("top_p", "Default"),
+                    "frequency_penalty":   configured.get("frequency_penalty", "Default"),
+                    "presence_penalty":    configured.get("presence_penalty", "Default"),
+                },
+                # Rate limits
+                "rate_limits": {
+                    "requests_per_minute": rl.get("rpm", "Unknown"),
+                    "requests_per_day":    rl.get("rpd", "Unknown"),
+                    "tokens_per_minute":   rl.get("tpm", "Unknown"),
+                    "tokens_per_day":      rl.get("tpd", "Unknown"),
+                    "est_per_hour":        rl.get("rpm", 0) * 60,
+                },
+                # Costs
+                "costs": {
+                    "input_per_1k":   f"${in_cost:.6f}",
+                    "output_per_1k":  f"${out_cost:.6f}",
+                    "per_1m_input":   f"${in_cost  * 1000:.4f}",
+                    "per_1m_output":  f"${out_cost * 1000:.4f}",
+                    "est_max_hourly": f"${est_hourly:.4f}",
+                },
+                # What was found in code
+                "found_in_code": {
+                    "raw_model_strings": results["raw_model_strings"],
+                    "env_vars_used": [
+                        ek for ek in provider_info["env_keys"]
+                        if ek in content
+                    ],
+                    "configured_params": configured,
+                },
+            })
+
+        # backward-compat token_configs
+        for tm in re.findall(r'max_tokens\s*[=:]\s*(\d+)', content):
+            results["token_configs"].append(
+                {"provider": provider_name, "max_tokens_configured": int(tm)}
+            )
+        for t in re.findall(r'temperature\s*[=:]\s*([\d.]+)', content):
+            results["token_configs"].append(
+                {"provider": provider_name, "temperature": float(t)}
+            )
+
+    # ── Agent patterns ─────────────────────────────────────────────────────
+    for pattern, label in [
+        (r'class\s+(\w*[Aa]gent\w*)\s*[\(:]',            "Class-based Agent"),
+        (r'Agent\s*\(',                                    "Agent instantiation"),
+        (r'CrewAI|Crew\s*\(',                             "CrewAI Agent"),
+        (r'AssistantAgent|UserProxyAgent',                 "AutoGen Agent"),
+        (r'AgentExecutor',                                 "LangChain Agent"),
+        (r'create_react_agent|create_openai_tools_agent',  "LangChain ReAct Agent"),
+        (r'tool\s*=|tools\s*=\s*\[',                      "Tool-using Agent"),
+        (r'memory\s*=|Memory\s*\(',                        "Memory-enabled Agent"),
+        (r'vector_store|VectorStore|Chroma|Pinecone|FAISS',"RAG Agent"),
+    ]:
         if re.search(pattern, content):
             results["agent_patterns"].append(label)
+
     return results
 
-
-def _infer_purpose(filepath, model, scan_result):
-    fp = filepath.lower()
+def _infer_purpose(filepath, model_dict, scan_result):
+    fp       = filepath.lower()
     patterns = scan_result.get("agent_patterns", [])
-    if "monitor" in fp: return "Monitoring, health-check analysis, or alerting"
-    if "chat" in fp: return "Conversational AI / chatbot functionality"
-    if "agent" in fp: return "Autonomous AI agent task execution"
-    if "embed" in model.lower(): return "Text embedding for semantic search or RAG"
-    if "tool" in " ".join(patterns).lower(): return "Tool-augmented reasoning and function calling"
-    if any(p in patterns for p in ["CrewAI Agent", "AutoGen Agent"]): return "Multi-agent collaboration and task orchestration"
-    return "AI-powered text generation and analysis"
+    mtype    = model_dict.get("model_type", "").lower()
 
+    if "monitor"   in fp: return "Monitoring, health-check analysis, or alerting"
+    if "chat"      in fp: return "Conversational AI / chatbot functionality"
+    if "agent"     in fp: return "Autonomous AI agent task execution"
+    if "embed"     in mtype: return "Text embedding for semantic search or RAG"
+    if "rag"       in " ".join(patterns).lower(): return "Retrieval-Augmented Generation (RAG)"
+    if "tool"      in " ".join(patterns).lower(): return "Tool-augmented reasoning and function calling"
+    if any(p in patterns for p in ["CrewAI Agent", "AutoGen Agent"]):
+        return "Multi-agent collaboration and task orchestration"
+    if "reasoning" in mtype: return "Complex multi-step reasoning"
+    return "AI-powered text generation and analysis"
 
 FILE_PURPOSES = {
     "app.py": "Flask application entry point — defines routes and WSGI startup",
@@ -768,95 +1171,121 @@ FILE_PURPOSES = {
     "buildspec.yml": "AWS CodeBuild build specification",
 }
 
+# ── DELETE old scan_project() and REPLACE ────────────────────────────────────
 
 def scan_project():
     scan_time = datetime.datetime.now(datetime.timezone.utc).isoformat()
-    skip_dirs = {".git", "__pycache__", "node_modules", ".venv", "venv", "env",
-                 ".tox", ".mypy_cache", ".pytest_cache", "dist", "build", ".eggs"}
+    skip_dirs = {
+        ".git", "__pycache__", "node_modules", ".venv", "venv", "env",
+        ".tox", ".mypy_cache", ".pytest_cache", "dist", "build", ".eggs",
+    }
 
     file_tree = []
-    py_files = []
+    py_files  = []
 
     for root, dirs, files in os.walk(BASE_DIR):
-        dirs[:] = [d for d in dirs if d not in skip_dirs and not d.endswith(".egg-info")]
+        dirs[:] = [
+            d for d in dirs
+            if d not in skip_dirs and not d.endswith(".egg-info")
+        ]
         rel_root = Path(root).relative_to(BASE_DIR)
         for fname in sorted(files):
-            rel_path = str(rel_root / fname) if str(rel_root) != "." else fname
-            ext = Path(fname).suffix.lower()
+            rel_path = (
+                str(rel_root / fname) if str(rel_root) != "." else fname
+            )
+            ext     = Path(fname).suffix.lower()
             purpose = FILE_PURPOSES.get(fname, "")
             if not purpose:
-                ext_map = {".py": "Python module", ".html": "HTML template", ".css": "Stylesheet",
-                           ".js": "JavaScript module", ".yml": "YAML configuration", ".yaml": "YAML configuration",
-                           ".json": "JSON data / configuration", ".md": "Markdown documentation",
-                           ".txt": "Text file", ".sh": "Shell script", ".sql": "SQL database script",
-                           ".toml": "TOML configuration"}
-                purpose = ext_map.get(ext, "Project file")
-            is_main = fname in ("app.py", "application.py", "manage.py", "wsgi.py", "agent_monitor.py", "main.py")
-            file_tree.append({"path": rel_path, "name": fname, "purpose": purpose,
-                              "is_main": is_main, "extension": ext,
-                              "size": os.path.getsize(os.path.join(root, fname))})
+                purpose = {
+                    ".py": "Python module", ".html": "HTML template",
+                    ".css": "Stylesheet",   ".js":   "JavaScript module",
+                    ".yml": "YAML configuration", ".yaml": "YAML configuration",
+                    ".json": "JSON data / configuration",
+                    ".md":  "Markdown documentation",
+                    ".txt": "Text file",   ".sh":   "Shell script",
+                    ".sql": "SQL database script",
+                    ".toml":"TOML configuration",
+                }.get(ext, "Project file")
+
+            is_main = fname in (
+                "app.py", "application.py", "manage.py",
+                "wsgi.py", "agent_monitor.py", "main.py",
+            )
+            file_tree.append({
+                "path": rel_path, "name": fname, "purpose": purpose,
+                "is_main": is_main, "extension": ext,
+                "size": os.path.getsize(os.path.join(root, fname)),
+            })
             if ext == ".py":
                 py_files.append(os.path.join(root, fname))
 
     file_tree.sort(key=lambda x: (not x["is_main"], x["path"]))
 
-    agents = []
+    agents        = []
     all_providers = set()
-    all_models = []
+    all_models    = []
 
     for pyf in py_files:
         scan_result = _scan_python_file(pyf)
-        if scan_result["providers_found"] or scan_result["agent_patterns"]:
-            rel = str(Path(pyf).relative_to(BASE_DIR))
-            model_details = []
-            for m in scan_result["models_found"]:
-                tl = m.get("token_limits", {})
-                rl = m.get("rate_limits", {})
-                configured_tokens = None
-                configured_temp = None
-                for tc in scan_result["token_configs"]:
-                    if tc["provider"] == m["provider"]:
-                        if "max_tokens_configured" in tc: configured_tokens = tc["max_tokens_configured"]
-                        if "temperature" in tc: configured_temp = tc["temperature"]
-                model_details.append({
-                    "model_name": m["model"], "provider": m["provider"],
-                    "where_used": rel, "why_used": _infer_purpose(rel, m["model"], scan_result),
-                    "tokens": {"max_input": tl.get("input", "Unknown"), "max_output": tl.get("output", "Unknown"),
-                               "configured_max_tokens": configured_tokens or "Default", "temperature": configured_temp},
-                    "rate_limits_hourly": {"requests_per_minute": rl.get("rpm", "Unknown"),
-                                           "est_per_hour": rl.get("rpm", 0) * 60 if rl.get("rpm") else "Unknown",
-                                           "window": "Rolling 60-second window"},
-                    "rate_limits_daily": {"requests_per_day": rl.get("rpd", "Unknown"), "window": "UTC 00:00 – 23:59"},
-                })
-            agents.append({
-                "script": rel, "providers": list(set(scan_result["providers_found"])),
-                "models": scan_result["models_found"], "patterns": list(set(scan_result["agent_patterns"])),
-                "env_vars": list(set(scan_result["env_vars_used"])), "token_configs": scan_result["token_configs"],
-                "model_details": model_details,
+
+        if not scan_result["providers_found"] and not scan_result["agent_patterns"]:
+            continue
+
+        rel = str(Path(pyf).relative_to(BASE_DIR))
+
+        # Build model_details with full metrics + purpose
+        model_details = []
+        for m in scan_result["models_found"]:
+            model_details.append({
+                **m,
+                "why_used":   _infer_purpose(rel, m, scan_result),
+                "where_used": rel,
             })
-            all_providers.update(scan_result["providers_found"])
-            all_models.extend(scan_result["models_found"])
+
+        agents.append({
+            "script":            rel,
+            "providers":         list(set(scan_result["providers_found"])),
+            "models":            scan_result["models_found"],
+            "patterns":          list(set(scan_result["agent_patterns"])),
+            "env_vars":          list(set(scan_result["env_vars_used"])),
+            "token_configs":     scan_result["token_configs"],
+            "model_details":     model_details,
+            "raw_model_strings": scan_result["raw_model_strings"],
+        })
+
+        all_providers.update(scan_result["providers_found"])
+        all_models.extend(scan_result["models_found"])
 
     pipelines = detect_pipelines()
 
     active_env = {}
-    for prov_info in AI_PROVIDER_PATTERNS.values():
+    for prov_info in AI_PROVIDER_FULL_METRICS.values():
         for ek in prov_info["env_keys"]:
             val = os.environ.get(ek)
             if val:
-                masked = val[:4] + "****" + val[-4:] if len(val) > 8 else "****"
+                masked = (
+                    val[:4] + "****" + val[-4:]
+                    if len(val) > 8 else "****"
+                )
                 active_env[ek] = masked
 
     return {
-        "scan_time": scan_time, "project_root": str(BASE_DIR), "pipelines": pipelines,
-        "ai_agent_characteristics": AI_AGENT_CHARACTERISTICS, "file_tree": file_tree,
-        "agents": agents,
-        "summary": {"total_files": len(file_tree), "python_files": len(py_files),
-                     "ai_agents_found": len(agents), "providers": list(all_providers),
-                     "models_used": len(all_models), "pipelines_detected": len(pipelines)},
+        "scan_time":    scan_time,
+        "project_root": str(BASE_DIR),
+        "pipelines":    pipelines,
+        "ai_agent_characteristics": AI_AGENT_CHARACTERISTICS,
+        "file_tree":    file_tree,
+        "agents":       agents,
+        "summary": {
+            "total_files":        len(file_tree),
+            "python_files":       len(py_files),
+            "ai_agents_found":    len(agents),
+            "providers":          list(all_providers),
+            "models_used":        len(all_models),
+            "pipelines_detected": len(pipelines),
+        },
         "active_env_keys": active_env,
     }
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ROUTE: /monitor/status  (GET + POST)
@@ -964,6 +1393,229 @@ def _colorize_json(json_str):
     s = re.sub(r':\s*(null)', r': <span class="json-null">\1</span>', s)
     return s
 
+# ── ADD this new function (place it near the other helpers like _stat_card) ───
+
+def _render_model_details(model_details):
+    """Full metrics card for every detected model — used by both routes."""
+    if not model_details:
+        return """
+        <div style="background:#fff8e1;border:1px solid #ffe082;
+                    border-radius:8px;padding:14px;margin-top:10px">
+          <strong>⚠️ Provider detected but no specific model string matched.</strong><br>
+          <span style="font-size:.83rem;color:var(--text-secondary)">
+            Model may be set via environment variable or config file.
+          </span>
+        </div>"""
+
+    html = ""
+    for md in model_details:
+        tl   = md.get("token_limits", {})
+        rl   = md.get("rate_limits",  {})
+        cost = md.get("costs",        {})
+        fic  = md.get("found_in_code", {})
+        cfg  = fic.get("configured_params", {})
+
+        latency_color = {
+            "ultra_fast": "#28a745", "very_fast": "#5cb85c",
+            "fast":       "#2d8a4e", "medium":    "#f0ad4e",
+            "slow":       "#d9534f", "very_slow": "#c9302c",
+        }.get(md.get("latency_class", ""), "#6c757d")
+
+        features_html = "".join([
+            f'<span class="tag model">✅ {f}</span>'
+            for f in md.get("features", [])
+        ])
+
+        env_tags = "".join([
+            f'<span class="tag env">🔐 {e}</span>'
+            for e in fic.get("env_vars_used", [])
+        ]) or '<span style="font-size:.78rem;color:var(--text-secondary)">None found</span>'
+
+        html += f"""
+        <div class="model-detail" style="margin-bottom:16px">
+
+          <!-- Model header -->
+          <div style="display:flex;justify-content:space-between;
+                      align-items:center;flex-wrap:wrap;gap:8px;
+                      margin-bottom:14px;padding-bottom:12px;
+                      border-bottom:1px solid var(--border)">
+            <div>
+              <span style="font-size:1.05rem;font-weight:800;color:var(--accent2)">
+                🧠 {md.get('full_name', md.get('model','Unknown'))}
+              </span>
+              <span style="font-size:.8rem;color:var(--text-secondary);margin-left:8px">
+                ({md.get('provider','')})
+              </span>
+            </div>
+            <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+              <span style="background:{latency_color};color:#fff;padding:3px 12px;
+                           border-radius:12px;font-size:.75rem;font-weight:700">
+                ⚡ {md.get('latency_class','').replace('_',' ').title()}
+              </span>
+              <span class="tag provider">📂 {md.get('model_type','')}</span>
+              <a href="{md.get('website','#')}" target="_blank"
+                 style="font-size:.75rem;color:var(--accent);text-decoration:none">
+                🌐 Docs ↗
+              </a>
+            </div>
+          </div>
+
+          <!-- Purpose bar -->
+          <div style="margin-bottom:12px;padding:8px 12px;
+                      background:var(--accent-light);border-radius:8px;font-size:.85rem">
+            🎯 <strong>Purpose:</strong> {md.get('why_used','AI-powered text generation')}
+            &nbsp;|&nbsp; 📄 <strong>File:</strong> {md.get('where_used','')}
+            &nbsp;|&nbsp; 🗓️ <strong>Cutoff:</strong> {md.get('training_cutoff','')}
+          </div>
+
+          <div class="detail-grid">
+
+            <!-- TOKEN LIMITS -->
+            <div class="detail-box">
+              <h5>🎟️ Token Limits</h5>
+              <div class="detail-row">
+                <span class="detail-label">Context Window</span>
+                <span class="detail-value">{_fmt(tl.get('context_window'))} tokens</span>
+              </div>
+              <div class="detail-row">
+                <span class="detail-label">Max Output</span>
+                <span class="detail-value">{_fmt(tl.get('max_output_tokens'))} tokens</span>
+              </div>
+              <div class="detail-row">
+                <span class="detail-label">Configured max_tokens</span>
+                <span class="detail-value">{_fmt(tl.get('configured_max_tokens'))}</span>
+              </div>
+              <div class="detail-row">
+                <span class="detail-label">Temperature</span>
+                <span class="detail-value">{tl.get('temperature','Default')}</span>
+              </div>
+              <div class="detail-row">
+                <span class="detail-label">Top-P</span>
+                <span class="detail-value">{tl.get('top_p','Default')}</span>
+              </div>
+              <div class="detail-row">
+                <span class="detail-label">Freq Penalty</span>
+                <span class="detail-value">{tl.get('frequency_penalty','Default')}</span>
+              </div>
+              <div class="detail-row">
+                <span class="detail-label">Presence Penalty</span>
+                <span class="detail-value">{tl.get('presence_penalty','Default')}</span>
+              </div>
+              <div style="margin-top:10px">
+                <div style="font-size:.7rem;color:var(--text-secondary);margin-bottom:4px">
+                  Context window scale
+                </div>
+                <div class="gauge-bar" style="height:8px">
+                  <div class="gauge-fill"
+                       style="width:{min(100,(tl.get('context_window',0) or 0)/20000):.0f}%">
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <!-- RATE LIMITS -->
+            <div class="detail-box">
+              <h5>⏱️ Rate Limits</h5>
+              <div class="detail-row">
+                <span class="detail-label">Requests / Minute</span>
+                <span class="detail-value">{_fmt(rl.get('requests_per_minute'))}</span>
+              </div>
+              <div class="detail-row">
+                <span class="detail-label">Requests / Hour (est.)</span>
+                <span class="detail-value">{_fmt(rl.get('est_per_hour'))}</span>
+              </div>
+              <div class="detail-row">
+                <span class="detail-label">Requests / Day</span>
+                <span class="detail-value">{_fmt(rl.get('requests_per_day'))}</span>
+              </div>
+              <div class="detail-row">
+                <span class="detail-label">Tokens / Minute</span>
+                <span class="detail-value">{_fmt(rl.get('tokens_per_minute'))}</span>
+              </div>
+              <div class="detail-row">
+                <span class="detail-label">Tokens / Day</span>
+                <span class="detail-value">{_fmt(rl.get('tokens_per_day'))}</span>
+              </div>
+              <div style="margin-top:10px">
+                <div class="gauge-container">
+                  <div class="gauge-bar">
+                    <div class="gauge-fill"
+                         style="width:{min(100,(rl.get('requests_per_minute',0) or 0)/40):.0f}%">
+                    </div>
+                  </div>
+                  <span class="gauge-text">{rl.get('requests_per_minute','?')} rpm</span>
+                </div>
+              </div>
+            </div>
+
+            <!-- COSTS -->
+            <div class="detail-box">
+              <h5>💰 Cost</h5>
+              <div class="detail-row">
+                <span class="detail-label">Input / 1K tokens</span>
+                <span class="detail-value">{cost.get('input_per_1k','—')}</span>
+              </div>
+              <div class="detail-row">
+                <span class="detail-label">Output / 1K tokens</span>
+                <span class="detail-value">{cost.get('output_per_1k','—')}</span>
+              </div>
+              <div class="detail-row">
+                <span class="detail-label">Per 1M input tokens</span>
+                <span class="detail-value">{cost.get('per_1m_input','—')}</span>
+              </div>
+              <div class="detail-row">
+                <span class="detail-label">Per 1M output tokens</span>
+                <span class="detail-value">{cost.get('per_1m_output','—')}</span>
+              </div>
+              <div class="detail-row">
+                <span class="detail-label">Est. Max Hourly</span>
+                <span class="detail-value" style="color:#d9534f;font-weight:800">
+                  {cost.get('est_max_hourly','—')}
+                </span>
+              </div>
+              <div style="font-size:.7rem;color:var(--text-secondary);margin-top:6px">
+                * At full RPM × max context tokens
+              </div>
+            </div>
+
+            <!-- FOUND IN CODE -->
+            <div class="detail-box">
+              <h5>🔍 Found In Code</h5>
+              <div class="detail-row">
+                <span class="detail-label">Model strings</span>
+                <span class="detail-value" style="font-size:.78rem">
+                  {', '.join(fic.get('raw_model_strings',[])) or '—'}
+                </span>
+              </div>
+              <div class="detail-row">
+                <span class="detail-label">Configured params</span>
+                <span class="detail-value" style="font-size:.78rem">
+                  {', '.join([f'{k}={v}' for k,v in cfg.items()]) or 'None (defaults)'}
+                </span>
+              </div>
+              <div style="margin-top:10px">
+                <div style="font-size:.72rem;font-weight:700;text-transform:uppercase;
+                             color:var(--accent);margin-bottom:6px">
+                  API Keys referenced
+                </div>
+                {env_tags}
+              </div>
+            </div>
+
+          </div><!-- /detail-grid -->
+
+          <!-- Features -->
+          <div style="margin-top:12px;padding-top:10px;border-top:1px solid var(--border)">
+            <span style="font-size:.75rem;font-weight:700;color:var(--accent2);
+                         text-transform:uppercase;letter-spacing:.5px;margin-right:8px">
+              ✨ Features:
+            </span>
+            {features_html or '<span style="font-size:.8rem;color:var(--text-secondary)">—</span>'}
+          </div>
+
+        </div>"""
+
+    return html
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ROUTE: /scanner/scan  (HTML)
@@ -1010,43 +1662,8 @@ def scanner_scan():
             pats = "".join([f'<span class="tag pattern">⚙️ {p}</span>' for p in agent["patterns"]])
             envs = "".join([f'<span class="tag env">🔐 {e}</span>' for e in agent["env_vars"]])
 
-            models_html = ""
-            for md in agent.get("model_details", []):
-                toks = md.get("tokens", {})
-                rh = md.get("rate_limits_hourly", {})
-                rd = md.get("rate_limits_daily", {})
-                models_html += f"""
-                <div class="model-detail">
-                  <h4>🧠 {md['model_name']} <span style="font-weight:400;font-size:.85rem">({md['provider']})</span></h4>
-                  <div class="detail-grid">
-                    <div class="detail-box">
-                      <h5>🏷️ Identity</h5>
-                      <div class="detail-row"><span class="detail-label">Model</span><span class="detail-value">{md['model_name']}</span></div>
-                      <div class="detail-row"><span class="detail-label">Provider</span><span class="detail-value">{md['provider']}</span></div>
-                      <div class="detail-row"><span class="detail-label">Script</span><span class="detail-value">{md['where_used']}</span></div>
-                      <div class="detail-row"><span class="detail-label">Purpose</span><span class="detail-value">{md['why_used']}</span></div>
-                    </div>
-                    <div class="detail-box">
-                      <h5>🎟️ Tokens</h5>
-                      <div class="detail-row"><span class="detail-label">Max Input</span><span class="detail-value">{_fmt(toks.get('max_input'))}</span></div>
-                      <div class="detail-row"><span class="detail-label">Max Output</span><span class="detail-value">{_fmt(toks.get('max_output'))}</span></div>
-                      <div class="detail-row"><span class="detail-label">Configured</span><span class="detail-value">{_fmt(toks.get('configured_max_tokens'))}</span></div>
-                      <div class="detail-row"><span class="detail-label">Temperature</span><span class="detail-value">{toks.get('temperature') or 'Default'}</span></div>
-                    </div>
-                    <div class="detail-box">
-                      <h5>⏱️ Hourly Limits</h5>
-                      <div class="detail-row"><span class="detail-label">RPM</span><span class="detail-value">{_fmt(rh.get('requests_per_minute'))}</span></div>
-                      <div class="detail-row"><span class="detail-label">Per Hour</span><span class="detail-value">{_fmt(rh.get('est_per_hour'))}</span></div>
-                      <div class="detail-row"><span class="detail-label">Window</span><span class="detail-value">{rh.get('window','—')}</span></div>
-                    </div>
-                    <div class="detail-box">
-                      <h5>📅 Daily Limits</h5>
-                      <div class="detail-row"><span class="detail-label">RPD</span><span class="detail-value">{_fmt(rd.get('requests_per_day'))}</span></div>
-                      <div class="detail-row"><span class="detail-label">Window</span><span class="detail-value">{rd.get('window','—')}</span></div>
-                    </div>
-                  </div>
-                </div>"""
-
+        models_html = _render_model_details(agent.get("model_details", []))
+        
             agents_html += f"""
             <div class="card agent-card">
               <div style="font-weight:700;font-size:1.05rem;color:var(--accent2);margin-bottom:12px">📜 {agent['script']}</div>
@@ -1208,8 +1825,7 @@ def monitor_dashboard():
             pats = "".join([f'<span class="tag pattern">⚙️ {p}</span>' for p in agent["patterns"]])
             envs = "".join([f'<span class="tag env">🔐 {e}</span>' for e in agent["env_vars"]])
 
-            models_html = ""
-            for md in agent.get("model_details", []):
+models_html = _render_model_details(agent.get("model_details", []))
                 toks = md.get("tokens", {})
                 rh = md.get("rate_limits_hourly", {})
                 rd = md.get("rate_limits_daily", {})
