@@ -1,0 +1,2762 @@
+<!-- ai-agent-scanner.html -->
+<!-- Save this file in your project root and open in browser -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>🤖 AI Agent Scanner & Dashboard</title>
+    <style>
+        /* ============================================
+           CSS VARIABLES & ROOT
+           ============================================ */
+        :root {
+            --bg-primary: #0a0a1a;
+            --bg-secondary: #12122a;
+            --bg-card: #1a1a3e;
+            --bg-card-hover: #242460;
+            --text-primary: #e0e0ff;
+            --text-secondary: #a0a0cc;
+            --accent-cyan: #00f5ff;
+            --accent-magenta: #ff00ff;
+            --accent-yellow: #ffdd00;
+            --accent-green: #00ff88;
+            --accent-red: #ff4466;
+            --accent-orange: #ff8800;
+            --accent-purple: #aa44ff;
+            --accent-blue: #4488ff;
+            --accent-pink: #ff66aa;
+            --accent-lime: #aaff00;
+            --gradient-1: linear-gradient(135deg, #00f5ff, #aa44ff);
+            --gradient-2: linear-gradient(135deg, #ff00ff, #ff8800);
+            --gradient-3: linear-gradient(135deg, #00ff88, #00f5ff);
+            --gradient-4: linear-gradient(135deg, #ffdd00, #ff4466);
+            --gradient-5: linear-gradient(135deg, #4488ff, #ff00ff);
+            --shadow-glow-cyan: 0 0 30px rgba(0, 245, 255, 0.3);
+            --shadow-glow-magenta: 0 0 30px rgba(255, 0, 255, 0.3);
+            --shadow-glow-green: 0 0 30px rgba(0, 255, 136, 0.3);
+        }
+
+        /* ============================================
+           RESET & BASE
+           ============================================ */
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            min-height: 100vh;
+            overflow-x: hidden;
+        }
+
+        /* Animated background */
+        body::before {
+            content: '';
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background:
+                radial-gradient(ellipse at 20% 50%, rgba(0, 245, 255, 0.05) 0%, transparent 50%),
+                radial-gradient(ellipse at 80% 20%, rgba(255, 0, 255, 0.05) 0%, transparent 50%),
+                radial-gradient(ellipse at 50% 80%, rgba(0, 255, 136, 0.05) 0%, transparent 50%);
+            pointer-events: none;
+            z-index: 0;
+        }
+
+        /* ============================================
+           SCROLLBAR
+           ============================================ */
+        ::-webkit-scrollbar {
+            width: 8px;
+        }
+        ::-webkit-scrollbar-track {
+            background: var(--bg-primary);
+        }
+        ::-webkit-scrollbar-thumb {
+            background: var(--gradient-1);
+            border-radius: 4px;
+        }
+
+        /* ============================================
+           HEADER
+           ============================================ */
+        .header {
+            position: relative;
+            z-index: 10;
+            background: linear-gradient(180deg, rgba(18, 18, 42, 0.95), rgba(10, 10, 26, 0.9));
+            border-bottom: 2px solid;
+            border-image: var(--gradient-1) 1;
+            padding: 20px 40px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            flex-wrap: wrap;
+            gap: 15px;
+        }
+
+        .header-left {
+            display: flex;
+            align-items: center;
+            gap: 15px;
+        }
+
+        .logo-shape {
+            width: 60px;
+            height: 60px;
+            position: relative;
+            animation: rotate 10s linear infinite;
+        }
+
+        @keyframes rotate {
+            from { transform: rotate(0deg); }
+            to { transform: rotate(360deg); }
+        }
+
+        .logo-shape svg {
+            width: 100%;
+            height: 100%;
+        }
+
+        .header-title h1 {
+            font-size: 28px;
+            background: var(--gradient-1);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            font-weight: 800;
+            letter-spacing: 1px;
+        }
+
+        .header-title p {
+            color: var(--text-secondary);
+            font-size: 13px;
+            margin-top: 2px;
+        }
+
+        .header-actions {
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+
+        /* ============================================
+           BUTTONS
+           ============================================ */
+        .btn {
+            padding: 10px 22px;
+            border: none;
+            border-radius: 12px;
+            font-size: 14px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .btn-primary {
+            background: var(--gradient-1);
+            color: #000;
+            box-shadow: var(--shadow-glow-cyan);
+        }
+        .btn-primary:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 0 50px rgba(0, 245, 255, 0.5);
+        }
+
+        .btn-secondary {
+            background: var(--gradient-2);
+            color: #fff;
+            box-shadow: var(--shadow-glow-magenta);
+        }
+        .btn-secondary:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 0 50px rgba(255, 0, 255, 0.5);
+        }
+
+        .btn-success {
+            background: var(--gradient-3);
+            color: #000;
+            box-shadow: var(--shadow-glow-green);
+        }
+        .btn-success:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 0 50px rgba(0, 255, 136, 0.5);
+        }
+
+        .btn-warning {
+            background: var(--gradient-4);
+            color: #000;
+        }
+
+        .btn-outline {
+            background: transparent;
+            border: 2px solid var(--accent-cyan);
+            color: var(--accent-cyan);
+        }
+        .btn-outline:hover {
+            background: rgba(0, 245, 255, 0.1);
+        }
+
+        .btn-icon {
+            font-size: 18px;
+        }
+
+        /* ============================================
+           MAIN CONTAINER
+           ============================================ */
+        .main-container {
+            position: relative;
+            z-index: 5;
+            padding: 30px 40px;
+            max-width: 1600px;
+            margin: 0 auto;
+        }
+
+        /* ============================================
+           STATS BAR (Top summary)
+           ============================================ */
+        .stats-bar {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+            margin-bottom: 30px;
+        }
+
+        .stat-card {
+            background: var(--bg-card);
+            border-radius: 16px;
+            padding: 20px;
+            position: relative;
+            overflow: hidden;
+            border: 1px solid rgba(255, 255, 255, 0.05);
+            transition: all 0.3s ease;
+        }
+        .stat-card:hover {
+            transform: translateY(-5px);
+            border-color: rgba(0, 245, 255, 0.3);
+        }
+
+        .stat-card::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 3px;
+        }
+        .stat-card:nth-child(1)::before { background: var(--gradient-1); }
+        .stat-card:nth-child(2)::before { background: var(--gradient-2); }
+        .stat-card:nth-child(3)::before { background: var(--gradient-3); }
+        .stat-card:nth-child(4)::before { background: var(--gradient-4); }
+        .stat-card:nth-child(5)::before { background: var(--gradient-5); }
+        .stat-card:nth-child(6)::before { background: linear-gradient(135deg, #ff66aa, #ffdd00); }
+
+        .stat-icon {
+            font-size: 32px;
+            margin-bottom: 8px;
+        }
+
+        .stat-value {
+            font-size: 32px;
+            font-weight: 800;
+            line-height: 1;
+        }
+        .stat-card:nth-child(1) .stat-value { color: var(--accent-cyan); }
+        .stat-card:nth-child(2) .stat-value { color: var(--accent-magenta); }
+        .stat-card:nth-child(3) .stat-value { color: var(--accent-green); }
+        .stat-card:nth-child(4) .stat-value { color: var(--accent-yellow); }
+        .stat-card:nth-child(5) .stat-value { color: var(--accent-purple); }
+        .stat-card:nth-child(6) .stat-value { color: var(--accent-pink); }
+
+        .stat-label {
+            color: var(--text-secondary);
+            font-size: 12px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            margin-top: 5px;
+        }
+
+        /* ============================================
+           SECTION TITLES
+           ============================================ */
+        .section-title {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            margin: 35px 0 20px;
+            font-size: 22px;
+            font-weight: 700;
+        }
+
+        .section-title .icon {
+            font-size: 28px;
+        }
+
+        .section-title .line {
+            flex: 1;
+            height: 2px;
+            background: linear-gradient(90deg, rgba(0, 245, 255, 0.5), transparent);
+            border-radius: 1px;
+        }
+
+        /* ============================================
+           FOLDER TREE
+           ============================================ */
+        .folder-tree-container {
+            background: var(--bg-card);
+            border-radius: 20px;
+            padding: 25px;
+            border: 1px solid rgba(255, 255, 255, 0.05);
+            max-height: 500px;
+            overflow-y: auto;
+            margin-bottom: 30px;
+        }
+
+        .tree-node {
+            padding: 4px 0;
+        }
+
+        .tree-node-header {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 6px 10px;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: background 0.2s;
+            font-size: 14px;
+        }
+        .tree-node-header:hover {
+            background: rgba(0, 245, 255, 0.08);
+        }
+
+        .tree-toggle {
+            width: 20px;
+            height: 20px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 12px;
+            color: var(--accent-cyan);
+            transition: transform 0.2s;
+        }
+        .tree-toggle.open {
+            transform: rotate(90deg);
+        }
+
+        .tree-icon {
+            font-size: 18px;
+        }
+
+        .tree-name {
+            flex: 1;
+        }
+
+        .tree-badge {
+            background: var(--gradient-2);
+            color: #fff;
+            font-size: 10px;
+            padding: 2px 8px;
+            border-radius: 10px;
+            font-weight: 700;
+        }
+
+        .tree-children {
+            padding-left: 28px;
+            border-left: 1px dashed rgba(0, 245, 255, 0.2);
+            margin-left: 10px;
+            display: none;
+        }
+        .tree-children.open {
+            display: block;
+        }
+
+        /* ============================================
+           SEMI-CIRCLE GAUGES
+           ============================================ */
+        .gauges-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+
+        .gauge-card {
+            background: var(--bg-card);
+            border-radius: 20px;
+            padding: 25px;
+            text-align: center;
+            border: 1px solid rgba(255, 255, 255, 0.05);
+            transition: all 0.3s;
+        }
+        .gauge-card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 10px 40px rgba(0, 0, 0, 0.3);
+        }
+
+        .semi-circle-container {
+            width: 160px;
+            height: 80px;
+            margin: 0 auto 15px;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .semi-circle-bg {
+            width: 160px;
+            height: 160px;
+            border-radius: 50%;
+            border: 12px solid rgba(255, 255, 255, 0.05);
+            border-bottom-color: transparent;
+            border-right-color: transparent;
+            transform: rotate(-45deg);
+            position: absolute;
+            top: 0;
+            left: 0;
+        }
+
+        .semi-circle-fill {
+            width: 160px;
+            height: 160px;
+            border-radius: 50%;
+            border: 12px solid transparent;
+            position: absolute;
+            top: 0;
+            left: 0;
+            transform: rotate(-45deg);
+            transition: all 1s ease;
+        }
+
+        .gauge-value {
+            position: absolute;
+            bottom: 5px;
+            left: 50%;
+            transform: translateX(-50%);
+            font-size: 24px;
+            font-weight: 800;
+        }
+
+        .gauge-label {
+            font-size: 13px;
+            color: var(--text-secondary);
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+
+        .gauge-sub {
+            font-size: 11px;
+            color: var(--text-secondary);
+            margin-top: 5px;
+        }
+
+        /* ============================================
+           HEXAGON SHAPES
+           ============================================ */
+        .hex-grid {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 15px;
+            justify-content: center;
+            margin-bottom: 30px;
+        }
+
+        .hexagon {
+            width: 120px;
+            height: 104px;
+            position: relative;
+            cursor: pointer;
+            transition: all 0.3s;
+        }
+        .hexagon:hover {
+            transform: scale(1.1);
+        }
+
+        .hexagon svg {
+            width: 100%;
+            height: 100%;
+            filter: drop-shadow(0 4px 15px rgba(0, 0, 0, 0.3));
+        }
+
+        .hexagon-content {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            text-align: center;
+            width: 80%;
+        }
+
+        .hexagon-icon {
+            font-size: 24px;
+            margin-bottom: 4px;
+        }
+
+        .hexagon-value {
+            font-size: 16px;
+            font-weight: 800;
+        }
+
+        .hexagon-label {
+            font-size: 8px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            color: var(--text-secondary);
+        }
+
+        /* ============================================
+           PENTAGON & OCTAGON
+           ============================================ */
+        .shape-row {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 20px;
+            justify-content: center;
+            margin-bottom: 30px;
+        }
+
+        .pentagon-card, .octagon-card {
+            width: 150px;
+            height: 150px;
+            position: relative;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+            transition: all 0.3s;
+        }
+        .pentagon-card:hover, .octagon-card:hover {
+            transform: scale(1.05) rotate(5deg);
+        }
+
+        .pentagon-card svg, .octagon-card svg {
+            position: absolute;
+            width: 100%;
+            height: 100%;
+            filter: drop-shadow(0 4px 20px rgba(0, 0, 0, 0.3));
+        }
+
+        .shape-content {
+            position: relative;
+            z-index: 2;
+            text-align: center;
+        }
+
+        .shape-icon {
+            font-size: 28px;
+            margin-bottom: 4px;
+        }
+
+        .shape-value {
+            font-size: 18px;
+            font-weight: 800;
+        }
+
+        .shape-label {
+            font-size: 9px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            color: var(--text-secondary);
+        }
+
+        /* ============================================
+           AGENT CARDS
+           ============================================ */
+        .agents-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(380px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+
+        .agent-card {
+            background: var(--bg-card);
+            border-radius: 20px;
+            padding: 25px;
+            border: 1px solid rgba(255, 255, 255, 0.05);
+            transition: all 0.4s ease;
+            position: relative;
+            overflow: hidden;
+        }
+        .agent-card:hover {
+            transform: translateY(-5px);
+            border-color: rgba(0, 245, 255, 0.3);
+            box-shadow: var(--shadow-glow-cyan);
+        }
+
+        .agent-card::after {
+            content: '';
+            position: absolute;
+            top: 0;
+            right: 0;
+            width: 100px;
+            height: 100px;
+            border-radius: 0 20px 0 80px;
+            opacity: 0.1;
+        }
+        .agent-card:nth-child(1)::after { background: var(--accent-cyan); }
+        .agent-card:nth-child(2)::after { background: var(--accent-magenta); }
+        .agent-card:nth-child(3)::after { background: var(--accent-green); }
+        .agent-card:nth-child(4)::after { background: var(--accent-yellow); }
+        .agent-card:nth-child(5)::after { background: var(--accent-purple); }
+        .agent-card:nth-child(6)::after { background: var(--accent-orange); }
+
+        .agent-header {
+            display: flex;
+            align-items: center;
+            gap: 15px;
+            margin-bottom: 18px;
+        }
+
+        .agent-avatar {
+            width: 50px;
+            height: 50px;
+            border-radius: 14px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 24px;
+            flex-shrink: 0;
+        }
+
+        .agent-name {
+            font-size: 17px;
+            font-weight: 700;
+        }
+
+        .agent-script {
+            font-size: 12px;
+            color: var(--text-secondary);
+            font-family: 'Courier New', monospace;
+            background: rgba(0, 245, 255, 0.08);
+            padding: 2px 8px;
+            border-radius: 4px;
+            margin-top: 3px;
+            display: inline-block;
+        }
+
+        .agent-details {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 10px;
+            margin-bottom: 15px;
+        }
+
+        .agent-detail {
+            background: rgba(255, 255, 255, 0.03);
+            border-radius: 10px;
+            padding: 10px 12px;
+        }
+
+        .agent-detail-label {
+            font-size: 10px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            color: var(--text-secondary);
+            margin-bottom: 4px;
+        }
+
+        .agent-detail-value {
+            font-size: 13px;
+            font-weight: 600;
+        }
+
+        .agent-description {
+            background: rgba(0, 245, 255, 0.05);
+            border-left: 3px solid var(--accent-cyan);
+            padding: 10px 14px;
+            border-radius: 0 10px 10px 0;
+            font-size: 13px;
+            color: var(--text-secondary);
+            line-height: 1.5;
+            margin-bottom: 15px;
+        }
+
+        .agent-metrics {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+
+        .agent-metric-tag {
+            padding: 4px 10px;
+            border-radius: 20px;
+            font-size: 11px;
+            font-weight: 600;
+        }
+
+        .tag-cyan { background: rgba(0, 245, 255, 0.15); color: var(--accent-cyan); }
+        .tag-green { background: rgba(0, 255, 136, 0.15); color: var(--accent-green); }
+        .tag-magenta { background: rgba(255, 0, 255, 0.15); color: var(--accent-magenta); }
+        .tag-yellow { background: rgba(255, 221, 0, 0.15); color: var(--accent-yellow); }
+        .tag-red { background: rgba(255, 68, 102, 0.15); color: var(--accent-red); }
+        .tag-orange { background: rgba(255, 136, 0, 0.15); color: var(--accent-orange); }
+        .tag-purple { background: rgba(170, 68, 255, 0.15); color: var(--accent-purple); }
+        .tag-blue { background: rgba(68, 136, 255, 0.15); color: var(--accent-blue); }
+
+        /* ============================================
+           TOKEN & REQUEST BARS
+           ============================================ */
+        .usage-section {
+            background: var(--bg-card);
+            border-radius: 20px;
+            padding: 25px;
+            border: 1px solid rgba(255, 255, 255, 0.05);
+            margin-bottom: 20px;
+        }
+
+        .usage-bar-container {
+            margin-bottom: 18px;
+        }
+
+        .usage-bar-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 8px;
+        }
+
+        .usage-bar-label {
+            font-size: 13px;
+            font-weight: 600;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .usage-bar-numbers {
+            font-size: 12px;
+            color: var(--text-secondary);
+        }
+
+        .usage-bar-track {
+            width: 100%;
+            height: 12px;
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 6px;
+            overflow: hidden;
+            position: relative;
+        }
+
+        .usage-bar-fill {
+            height: 100%;
+            border-radius: 6px;
+            transition: width 1.5s ease;
+            position: relative;
+        }
+        .usage-bar-fill::after {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.2), transparent);
+            animation: shimmer 2s infinite;
+        }
+
+        @keyframes shimmer {
+            0% { transform: translateX(-100%); }
+            100% { transform: translateX(100%); }
+        }
+
+        .bar-cyan { background: var(--gradient-1); }
+        .bar-magenta { background: var(--gradient-2); }
+        .bar-green { background: var(--gradient-3); }
+        .bar-yellow { background: var(--gradient-4); }
+        .bar-purple { background: var(--gradient-5); }
+
+        /* ============================================
+           REQUEST STATUS TABLE
+           ============================================ */
+        .request-table-container {
+            background: var(--bg-card);
+            border-radius: 20px;
+            padding: 25px;
+            border: 1px solid rgba(255, 255, 255, 0.05);
+            overflow-x: auto;
+            margin-bottom: 30px;
+        }
+
+        .request-table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+
+        .request-table thead th {
+            text-align: left;
+            padding: 12px 15px;
+            font-size: 11px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            color: var(--text-secondary);
+            border-bottom: 2px solid rgba(0, 245, 255, 0.2);
+            white-space: nowrap;
+        }
+
+        .request-table tbody td {
+            padding: 12px 15px;
+            font-size: 13px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.03);
+            white-space: nowrap;
+        }
+
+        .request-table tbody tr {
+            transition: background 0.2s;
+        }
+        .request-table tbody tr:hover {
+            background: rgba(0, 245, 255, 0.05);
+        }
+
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            display: inline-block;
+            margin-right: 6px;
+        }
+        .status-dot.success { background: var(--accent-green); box-shadow: 0 0 8px rgba(0, 255, 136, 0.5); }
+        .status-dot.failed { background: var(--accent-red); box-shadow: 0 0 8px rgba(255, 68, 102, 0.5); }
+
+        .fail-reason {
+            color: var(--accent-red);
+            font-size: 11px;
+            max-width: 200px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        /* ============================================
+           FAILURE LOG
+           ============================================ */
+        .failure-log {
+            background: var(--bg-card);
+            border-radius: 20px;
+            padding: 25px;
+            border: 1px solid rgba(255, 68, 102, 0.2);
+            margin-bottom: 30px;
+        }
+
+        .failure-item {
+            background: rgba(255, 68, 102, 0.05);
+            border-left: 3px solid var(--accent-red);
+            padding: 12px 16px;
+            border-radius: 0 10px 10px 0;
+            margin-bottom: 10px;
+        }
+
+        .failure-item:last-child {
+            margin-bottom: 0;
+        }
+
+        .failure-agent {
+            font-weight: 700;
+            color: var(--accent-red);
+            font-size: 13px;
+        }
+
+        .failure-time {
+            font-size: 11px;
+            color: var(--text-secondary);
+            margin-top: 2px;
+        }
+
+        .failure-reason {
+            font-size: 12px;
+            color: var(--text-secondary);
+            margin-top: 6px;
+            line-height: 1.4;
+        }
+
+        /* ============================================
+           SCAN CONFIGURATION PANEL
+           ============================================ */
+        .config-panel {
+            background: var(--bg-card);
+            border-radius: 20px;
+            padding: 30px;
+            border: 1px solid rgba(255, 255, 255, 0.05);
+            margin-bottom: 30px;
+        }
+
+        .config-row {
+            display: flex;
+            gap: 15px;
+            align-items: flex-end;
+            flex-wrap: wrap;
+            margin-bottom: 15px;
+        }
+
+        .config-group {
+            flex: 1;
+            min-width: 200px;
+        }
+
+        .config-label {
+            font-size: 12px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            color: var(--text-secondary);
+            margin-bottom: 6px;
+        }
+
+        .config-input {
+            width: 100%;
+            padding: 10px 14px;
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 10px;
+            color: var(--text-primary);
+            font-size: 14px;
+            transition: border-color 0.3s;
+        }
+        .config-input:focus {
+            outline: none;
+            border-color: var(--accent-cyan);
+        }
+
+        .config-select {
+            width: 100%;
+            padding: 10px 14px;
+            background: var(--bg-card);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 10px;
+            color: var(--text-primary);
+            font-size: 14px;
+        }
+
+        /* ============================================
+           LOADING ANIMATION
+           ============================================ */
+        .loading-overlay {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(10, 10, 26, 0.9);
+            z-index: 1000;
+            align-items: center;
+            justify-content: center;
+            flex-direction: column;
+            gap: 20px;
+        }
+        .loading-overlay.active {
+            display: flex;
+        }
+
+        .spinner {
+            width: 80px;
+            height: 80px;
+            border: 4px solid rgba(0, 245, 255, 0.1);
+            border-top: 4px solid var(--accent-cyan);
+            border-right: 4px solid var(--accent-magenta);
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        .loading-text {
+            font-size: 16px;
+            color: var(--accent-cyan);
+            animation: pulse 1.5s ease-in-out infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+
+        /* ============================================
+           INTEGRATION LINKS SECTION
+           ============================================ */
+        .integration-section {
+            background: var(--bg-card);
+            border-radius: 20px;
+            padding: 30px;
+            border: 1px solid rgba(255, 255, 255, 0.05);
+            margin-bottom: 30px;
+        }
+
+        .integration-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 20px;
+        }
+
+        .integration-card {
+            background: rgba(255, 255, 255, 0.03);
+            border-radius: 16px;
+            padding: 25px;
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            transition: all 0.3s;
+        }
+        .integration-card:hover {
+            border-color: rgba(0, 245, 255, 0.3);
+            transform: translateY(-3px);
+        }
+
+        .integration-header {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            margin-bottom: 15px;
+        }
+
+        .integration-icon {
+            width: 45px;
+            height: 45px;
+            border-radius: 12px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 24px;
+        }
+
+        .integration-name {
+            font-size: 18px;
+            font-weight: 700;
+        }
+
+        .code-block {
+            background: rgba(0, 0, 0, 0.4);
+            border-radius: 10px;
+            padding: 15px;
+            font-family: 'Courier New', monospace;
+            font-size: 12px;
+            line-height: 1.6;
+            overflow-x: auto;
+            position: relative;
+            border: 1px solid rgba(255, 255, 255, 0.05);
+        }
+
+        .code-block .copy-btn {
+            position: absolute;
+            top: 8px;
+            right: 8px;
+            background: rgba(0, 245, 255, 0.2);
+            border: none;
+            color: var(--accent-cyan);
+            padding: 4px 10px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 11px;
+        }
+
+        .code-keyword { color: var(--accent-magenta); }
+        .code-string { color: var(--accent-green); }
+        .code-comment { color: #666; font-style: italic; }
+        .code-func { color: var(--accent-yellow); }
+        .code-var { color: var(--accent-cyan); }
+
+        /* ============================================
+           FOOTER
+           ============================================ */
+        .footer {
+            text-align: center;
+            padding: 30px;
+            color: var(--text-secondary);
+            font-size: 12px;
+            border-top: 1px solid rgba(255, 255, 255, 0.05);
+        }
+
+        /* ============================================
+           NOTIFICATION TOAST
+           ============================================ */
+        .toast-container {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            z-index: 9999;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+
+        .toast {
+            padding: 14px 20px;
+            border-radius: 12px;
+            font-size: 13px;
+            font-weight: 600;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            animation: slideIn 0.3s ease, fadeOut 0.3s ease 3.7s forwards;
+            min-width: 280px;
+        }
+
+        .toast-success {
+            background: rgba(0, 255, 136, 0.15);
+            border: 1px solid rgba(0, 255, 136, 0.3);
+            color: var(--accent-green);
+        }
+
+        .toast-error {
+            background: rgba(255, 68, 102, 0.15);
+            border: 1px solid rgba(255, 68, 102, 0.3);
+            color: var(--accent-red);
+        }
+
+        .toast-info {
+            background: rgba(0, 245, 255, 0.15);
+            border: 1px solid rgba(0, 245, 255, 0.3);
+            color: var(--accent-cyan);
+        }
+
+        @keyframes slideIn {
+            from { transform: translateX(100%); opacity: 0; }
+            to { transform: translateX(0); opacity: 1; }
+        }
+
+        @keyframes fadeOut {
+            to { transform: translateX(100%); opacity: 0; }
+        }
+
+        /* ============================================
+           TABS
+           ============================================ */
+        .tabs {
+            display: flex;
+            gap: 5px;
+            margin-bottom: 20px;
+            border-bottom: 2px solid rgba(255, 255, 255, 0.05);
+            padding-bottom: 5px;
+            flex-wrap: wrap;
+        }
+
+        .tab {
+            padding: 10px 20px;
+            border-radius: 10px 10px 0 0;
+            cursor: pointer;
+            font-size: 13px;
+            font-weight: 600;
+            color: var(--text-secondary);
+            transition: all 0.3s;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            border: none;
+            background: none;
+        }
+        .tab:hover {
+            color: var(--text-primary);
+            background: rgba(0, 245, 255, 0.05);
+        }
+        .tab.active {
+            color: var(--accent-cyan);
+            background: rgba(0, 245, 255, 0.1);
+            border-bottom: 2px solid var(--accent-cyan);
+        }
+
+        .tab-content {
+            display: none;
+        }
+        .tab-content.active {
+            display: block;
+        }
+
+        /* ============================================
+           DONUT CHART
+           ============================================ */
+        .donut-container {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 30px;
+            justify-content: center;
+            margin-bottom: 30px;
+        }
+
+        .donut-card {
+            text-align: center;
+        }
+
+        .donut-chart {
+            width: 150px;
+            height: 150px;
+            position: relative;
+            margin: 0 auto 10px;
+        }
+
+        .donut-chart svg {
+            width: 100%;
+            height: 100%;
+            transform: rotate(-90deg);
+        }
+
+        .donut-center {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            text-align: center;
+        }
+
+        .donut-value {
+            font-size: 22px;
+            font-weight: 800;
+        }
+
+        .donut-sublabel {
+            font-size: 10px;
+            color: var(--text-secondary);
+        }
+
+        .donut-label {
+            font-size: 13px;
+            color: var(--text-secondary);
+            font-weight: 600;
+        }
+
+        /* ============================================
+           RESPONSIVE
+           ============================================ */
+        @media (max-width: 768px) {
+            .header {
+                padding: 15px 20px;
+            }
+            .header-title h1 {
+                font-size: 20px;
+            }
+            .main-container {
+                padding: 15px;
+            }
+            .agents-grid {
+                grid-template-columns: 1fr;
+            }
+            .stats-bar {
+                grid-template-columns: repeat(2, 1fr);
+            }
+            .agent-details {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        /* ============================================
+           ANIMATION HELPERS
+           ============================================ */
+        .fade-in {
+            animation: fadeIn 0.5s ease forwards;
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(20px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        .scale-in {
+            animation: scaleIn 0.4s ease forwards;
+        }
+
+        @keyframes scaleIn {
+            from { opacity: 0; transform: scale(0.8); }
+            to { opacity: 1; transform: scale(1); }
+        }
+
+        /* Live indicator */
+        .live-dot {
+            width: 8px;
+            height: 8px;
+            background: var(--accent-green);
+            border-radius: 50%;
+            display: inline-block;
+            animation: livePulse 1.5s ease-in-out infinite;
+        }
+
+        @keyframes livePulse {
+            0%, 100% { box-shadow: 0 0 0 0 rgba(0, 255, 136, 0.4); }
+            50% { box-shadow: 0 0 0 8px rgba(0, 255, 136, 0); }
+        }
+
+        /* Provider badge colors */
+        .provider-openai { color: var(--accent-green); }
+        .provider-anthropic { color: var(--accent-orange); }
+        .provider-google { color: var(--accent-blue); }
+        .provider-meta { color: var(--accent-cyan); }
+        .provider-cohere { color: var(--accent-purple); }
+        .provider-mistral { color: var(--accent-yellow); }
+
+        /* Area tags */
+        .area-tag {
+            display: inline-block;
+            padding: 3px 10px;
+            border-radius: 20px;
+            font-size: 11px;
+            font-weight: 600;
+            margin: 2px;
+        }
+
+        .area-nlp { background: rgba(0, 245, 255, 0.15); color: var(--accent-cyan); }
+        .area-vision { background: rgba(255, 0, 255, 0.15); color: var(--accent-magenta); }
+        .area-code { background: rgba(0, 255, 136, 0.15); color: var(--accent-green); }
+        .area-data { background: rgba(255, 221, 0, 0.15); color: var(--accent-yellow); }
+        .area-chat { background: rgba(170, 68, 255, 0.15); color: var(--accent-purple); }
+        .area-search { background: rgba(255, 136, 0, 0.15); color: var(--accent-orange); }
+    </style>
+</head>
+<body>
+
+<!-- Loading Overlay -->
+<div class="loading-overlay" id="loadingOverlay">
+    <div class="spinner"></div>
+    <div class="loading-text" id="loadingText">Scanning project files...</div>
+</div>
+
+<!-- Toast Container -->
+<div class="toast-container" id="toastContainer"></div>
+
+<!-- ============================================
+     HEADER
+     ============================================ -->
+<header class="header">
+    <div class="header-left">
+        <div class="logo-shape">
+            <svg viewBox="0 0 100 100">
+                <defs>
+                    <linearGradient id="logoGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+                        <stop offset="0%" style="stop-color:#00f5ff"/>
+                        <stop offset="100%" style="stop-color:#aa44ff"/>
+                    </linearGradient>
+                </defs>
+                <polygon points="50,5 95,27.5 95,72.5 50,95 5,72.5 5,27.5" fill="none" stroke="url(#logoGrad)" stroke-width="3"/>
+                <text x="50" y="58" text-anchor="middle" fill="url(#logoGrad)" font-size="30" font-weight="bold">AI</text>
+            </svg>
+        </div>
+        <div class="header-title">
+            <h1>🤖 AI Agent Scanner</h1>
+            <p>Project Intelligence Dashboard &bull; <span class="live-dot"></span> Live Analysis</p>
+        </div>
+    </div>
+    <div class="header-actions">
+        <button class="btn btn-primary" onclick="startScan()">
+            <span class="btn-icon">🔍</span> Scan Project
+        </button>
+        <button class="btn btn-secondary" onclick="loadFromAPI()">
+            <span class="btn-icon">🔗</span> Load from API
+        </button>
+        <button class="btn btn-success" onclick="exportReport()">
+            <span class="btn-icon">📊</span> Export
+        </button>
+        <button class="btn btn-outline" onclick="showConfig()">
+            <span class="btn-icon">⚙️</span> Config
+        </button>
+    </div>
+</header>
+
+<!-- ============================================
+     MAIN CONTENT
+     ============================================ -->
+<div class="main-container">
+
+    <!-- Config Panel (hidden by default) -->
+    <div class="config-panel" id="configPanel" style="display:none;">
+        <div class="section-title">
+            <span class="icon">⚙️</span>
+            <span>Scan Configuration</span>
+            <div class="line"></div>
+        </div>
+        <div class="config-row">
+            <div class="config-group">
+                <div class="config-label">Project Root Path</div>
+                <input type="text" class="config-input" id="projectPath" placeholder="/path/to/project or http://api-endpoint" value="./"/>
+            </div>
+            <div class="config-group">
+                <div class="config-label">API Endpoint (Optional)</div>
+                <input type="text" class="config-input" id="apiEndpoint" value="/api/agents" placeholder="/api/agents"/>
+            </div>
+            <div class="config-group">
+                <div class="config-label">Scan Mode</div>
+                <select class="config-select" id="scanMode">
+                    <option value="demo">Demo / Sample Data</option>
+                    <option value="api" selected>Fetch from API</option>
+                    <option value="file">Upload Config File</option>
+                </select>
+            </div>
+        </div>
+        <div class="config-row">
+            <div class="config-group">
+                <div class="config-label">Upload agents.json</div>
+                <input type="file" class="config-input" id="fileUpload" accept=".json"/>
+            </div>
+            <div class="config-group" style="flex:0;">
+                <button class="btn btn-primary" onclick="applyScan()">
+                    <span class="btn-icon">▶️</span> Apply & Scan
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- TABS -->
+    <div class="tabs">
+        <button class="tab active" onclick="switchTab('overview')">
+            <span>📊</span> Overview
+        </button>
+        <button class="tab" onclick="switchTab('folders')">
+            <span>📁</span> Folder Structure
+        </button>
+        <button class="tab" onclick="switchTab('agents')">
+            <span>🤖</span> AI Agents
+        </button>
+        <button class="tab" onclick="switchTab('usage')">
+            <span>📈</span> Usage & Tokens
+        </button>
+        <button class="tab" onclick="switchTab('requests')">
+            <span>📋</span> Requests Log
+        </button>
+        <button class="tab" onclick="switchTab('integration')">
+            <span>🔗</span> Integration
+        </button>
+    </div>
+
+    <!-- ==========================================
+         TAB: OVERVIEW
+         ========================================== -->
+    <div class="tab-content active" id="tab-overview">
+
+        <!-- Stats Bar -->
+        <div class="stats-bar" id="statsBar">
+            <!-- Filled by JS -->
+        </div>
+
+        <!-- Hexagon Grid -->
+        <div class="section-title">
+            <span class="icon">⬡</span>
+            <span>Provider Distribution</span>
+            <div class="line"></div>
+        </div>
+        <div class="hex-grid" id="hexGrid">
+            <!-- Filled by JS -->
+        </div>
+
+        <!-- Pentagon & Octagon Row -->
+        <div class="section-title">
+            <span class="icon">⬠</span>
+            <span>Rate Limits Overview</span>
+            <div class="line"></div>
+        </div>
+        <div class="shape-row" id="shapeRow">
+            <!-- Filled by JS -->
+        </div>
+
+        <!-- Donut Charts -->
+        <div class="section-title">
+            <span class="icon">🍩</span>
+            <span>Request Success Rate</span>
+            <div class="line"></div>
+        </div>
+        <div class="donut-container" id="donutContainer">
+            <!-- Filled by JS -->
+        </div>
+
+        <!-- Semi-Circle Gauges -->
+        <div class="section-title">
+            <span class="icon">📐</span>
+            <span>Token Usage Gauges</span>
+            <div class="line"></div>
+        </div>
+        <div class="gauges-grid" id="gaugesGrid">
+            <!-- Filled by JS -->
+        </div>
+
+    </div>
+
+    <!-- ==========================================
+         TAB: FOLDERS
+         ========================================== -->
+    <div class="tab-content" id="tab-folders">
+        <div class="section-title">
+            <span class="icon">📁</span>
+            <span>Project Folder Structure</span>
+            <div class="line"></div>
+        </div>
+        <div class="folder-tree-container" id="folderTree">
+            <!-- Filled by JS -->
+        </div>
+    </div>
+
+    <!-- ==========================================
+         TAB: AGENTS
+         ========================================== -->
+    <div class="tab-content" id="tab-agents">
+        <div class="section-title">
+            <span class="icon">🤖</span>
+            <span>AI Agents in Project</span>
+            <div class="line"></div>
+        </div>
+
+        <!-- Folder-level agent count -->
+        <div id="folderAgentSummary" class="stats-bar" style="margin-bottom:25px;"></div>
+
+        <div class="agents-grid" id="agentsGrid">
+            <!-- Filled by JS -->
+        </div>
+    </div>
+
+    <!-- ==========================================
+         TAB: USAGE & TOKENS
+         ========================================== -->
+    <div class="tab-content" id="tab-usage">
+        <div class="section-title">
+            <span class="icon">📈</span>
+            <span>Token & Request Usage per Agent</span>
+            <div class="line"></div>
+        </div>
+        <div id="usageBars">
+            <!-- Filled by JS -->
+        </div>
+    </div>
+
+    <!-- ==========================================
+         TAB: REQUESTS LOG
+         ========================================== -->
+    <div class="tab-content" id="tab-requests">
+        <div class="section-title">
+            <span class="icon">📋</span>
+            <span>Request Log — Success & Failures</span>
+            <div class="line"></div>
+        </div>
+        <div class="request-table-container">
+            <table class="request-table" id="requestTable">
+                <thead>
+                    <tr>
+                        <th>Agent</th>
+                        <th>Timestamp</th>
+                        <th>Status</th>
+                        <th>Tokens Used</th>
+                        <th>Latency</th>
+                        <th>Failure Reason</th>
+                    </tr>
+                </thead>
+                <tbody id="requestTableBody">
+                    <!-- Filled by JS -->
+                </tbody>
+            </table>
+        </div>
+
+        <div class="section-title">
+            <span class="icon">❌</span>
+            <span>Failure Details</span>
+            <div class="line"></div>
+        </div>
+        <div class="failure-log" id="failureLog">
+            <!-- Filled by JS -->
+        </div>
+    </div>
+
+    <!-- ==========================================
+         TAB: INTEGRATION
+         ========================================== -->
+    <div class="tab-content" id="tab-integration">
+        <div class="section-title">
+            <span class="icon">🔗</span>
+            <span>Integration with Python, Java & .NET</span>
+            <div class="line"></div>
+        </div>
+        <div class="integration-grid">
+
+            <!-- PYTHON -->
+            <div class="integration-card">
+                <div class="integration-header">
+                    <div class="integration-icon" style="background:rgba(0,255,136,0.15);">🐍</div>
+                    <div class="integration-name" style="color:var(--accent-green);">Python</div>
+                </div>
+                <div class="code-block">
+                    <button class="copy-btn" onclick="copyCode(this)">📋 Copy</button>
+<pre><span class="code-comment"># pip install flask flask-cors</span>
+
+<span class="code-keyword">from</span> flask <span class="code-keyword">import</span> Flask, jsonify
+<span class="code-keyword">from</span> flask_cors <span class="code-keyword">import</span> CORS
+<span class="code-keyword">import</span> os, json, re
+
+app = <span class="code-func">Flask</span>(__name__)
+<span class="code-func">CORS</span>(app)
+
+<span class="code-comment"># AI patterns to detect</span>
+<span class="code-var">AI_PATTERNS</span> = {
+    <span class="code-string">"openai"</span>: [<span class="code-string">r"import openai"</span>, <span class="code-string">r"from openai"</span>, <span class="code-string">r"OpenAI\(\)"</span>],
+    <span class="code-string">"anthropic"</span>: [<span class="code-string">r"import anthropic"</span>, <span class="code-string">r"from anthropic"</span>],
+    <span class="code-string">"google"</span>: [<span class="code-string">r"import google.generativeai"</span>, <span class="code-string">r"genai\."</span>],
+    <span class="code-string">"langchain"</span>: [<span class="code-string">r"from langchain"</span>, <span class="code-string">r"import langchain"</span>],
+    <span class="code-string">"huggingface"</span>: [<span class="code-string">r"from transformers"</span>, <span class="code-string">r"pipeline\("</span>],
+    <span class="code-string">"cohere"</span>: [<span class="code-string">r"import cohere"</span>, <span class="code-string">r"cohere\.Client"</span>],
+}
+
+<span class="code-var">MODEL_PATTERNS</span> = {
+    <span class="code-string">"gpt-4"</span>: <span class="code-string">r"gpt-4"</span>,
+    <span class="code-string">"gpt-3.5"</span>: <span class="code-string">r"gpt-3\.5"</span>,
+    <span class="code-string">"claude"</span>: <span class="code-string">r"claude"</span>,
+    <span class="code-string">"gemini"</span>: <span class="code-string">r"gemini"</span>,
+    <span class="code-string">"llama"</span>: <span class="code-string">r"llama"</span>,
+}
+
+<span class="code-keyword">def</span> <span class="code-func">scan_directory</span>(root_path):
+    result = {<span class="code-string">"folders"</span>: [], <span class="code-string">"agents"</span>: []}
+    <span class="code-keyword">for</span> dirpath, dirnames, filenames <span class="code-keyword">in</span> os.<span class="code-func">walk</span>(root_path):
+        folder_info = {
+            <span class="code-string">"path"</span>: dirpath,
+            <span class="code-string">"name"</span>: os.path.<span class="code-func">basename</span>(dirpath),
+            <span class="code-string">"subfolders"</span>: dirnames,
+            <span class="code-string">"files"</span>: filenames,
+            <span class="code-string">"agent_count"</span>: 0
+        }
+        <span class="code-keyword">for</span> f <span class="code-keyword">in</span> filenames:
+            <span class="code-keyword">if</span> f.<span class="code-func">endswith</span>((<span class="code-string">'.py'</span>,<span class="code-string">'.js'</span>,<span class="code-string">'.ts'</span>,<span class="code-string">'.java'</span>,<span class="code-string">'.cs'</span>)):
+                fpath = os.path.<span class="code-func">join</span>(dirpath, f)
+                <span class="code-keyword">try</span>:
+                    content = <span class="code-func">open</span>(fpath).<span class="code-func">read</span>()
+                    <span class="code-keyword">for</span> provider, patterns <span class="code-keyword">in</span> AI_PATTERNS.items():
+                        <span class="code-keyword">for</span> p <span class="code-keyword">in</span> patterns:
+                            <span class="code-keyword">if</span> re.<span class="code-func">search</span>(p, content):
+                                model = <span class="code-string">"unknown"</span>
+                                <span class="code-keyword">for</span> m, mp <span class="code-keyword">in</span> MODEL_PATTERNS.items():
+                                    <span class="code-keyword">if</span> re.<span class="code-func">search</span>(mp, content):
+                                        model = m
+                                result[<span class="code-string">"agents"</span>].<span class="code-func">append</span>({
+                                    <span class="code-string">"script"</span>: f,
+                                    <span class="code-string">"path"</span>: fpath,
+                                    <span class="code-string">"provider"</span>: provider,
+                                    <span class="code-string">"model"</span>: model,
+                                    <span class="code-string">"folder"</span>: dirpath
+                                })
+                                folder_info[<span class="code-string">"agent_count"</span>] += 1
+                                <span class="code-keyword">break</span>
+                        <span class="code-keyword">else</span>: <span class="code-keyword">continue</span>
+                        <span class="code-keyword">break</span>
+                <span class="code-keyword">except</span>: <span class="code-keyword">pass</span>
+        result[<span class="code-string">"folders"</span>].<span class="code-func">append</span>(folder_info)
+    <span class="code-keyword">return</span> result
+
+<span class="code-keyword">@app</span>.<span class="code-func">route</span>(<span class="code-string">'/api/scan'</span>)
+<span class="code-keyword">def</span> <span class="code-func">scan</span>():
+    path = request.args.<span class="code-func">get</span>(<span class="code-string">'path'</span>, <span class="code-string">'.'</span>)
+    <span class="code-keyword">return</span> <span class="code-func">jsonify</span>(<span class="code-func">scan_directory</span>(path))
+
+<span class="code-keyword">@app</span>.<span class="code-func">route</span>(<span class="code-string">'/api/agents'</span>)
+<span class="code-keyword">def</span> <span class="code-func">agents</span>():
+    <span class="code-keyword">return</span> <span class="code-func">jsonify</span>(get_agent_data())
+
+<span class="code-keyword">if</span> __name__ == <span class="code-string">'__main__'</span>:
+    app.<span class="code-func">run</span>(port=<span class="code-var">8000</span>, debug=True)</pre>
+                </div>
+            </div>
+
+            <!-- JAVA -->
+            <div class="integration-card">
+                <div class="integration-header">
+                    <div class="integration-icon" style="background:rgba(255,136,0,0.15);">☕</div>
+                    <div class="integration-name" style="color:var(--accent-orange);">Java (Spring Boot)</div>
+                </div>
+                <div class="code-block">
+                    <button class="copy-btn" onclick="copyCode(this)">📋 Copy</button>
+<pre><span class="code-comment">// Add to pom.xml: spring-boot-starter-web</span>
+
+<span class="code-keyword">@RestController</span>
+<span class="code-keyword">@CrossOrigin</span>(origins = <span class="code-string">"*"</span>)
+<span class="code-keyword">@RequestMapping</span>(<span class="code-string">"/api"</span>)
+<span class="code-keyword">public class</span> <span class="code-func">AgentScannerController</span> {
+
+    <span class="code-keyword">@GetMapping</span>(<span class="code-string">"/scan"</span>)
+    <span class="code-keyword">public</span> ResponseEntity&lt;Map&gt; <span class="code-func">scanProject</span>(
+        <span class="code-keyword">@RequestParam</span>(defaultValue=<span class="code-string">"."</span>)
+        String path) {
+
+        File root = <span class="code-keyword">new</span> <span class="code-func">File</span>(path);
+        Map&lt;String, Object&gt; result = <span class="code-keyword">new</span> HashMap&lt;&gt;();
+        List&lt;Map&gt; agents = <span class="code-keyword">new</span> ArrayList&lt;&gt;();
+        List&lt;Map&gt; folders = <span class="code-keyword">new</span> ArrayList&lt;&gt;();
+
+        <span class="code-func">scanDir</span>(root, agents, folders);
+
+        result.<span class="code-func">put</span>(<span class="code-string">"agents"</span>, agents);
+        result.<span class="code-func">put</span>(<span class="code-string">"folders"</span>, folders);
+        <span class="code-keyword">return</span> ResponseEntity.<span class="code-func">ok</span>(result);
+    }
+
+    <span class="code-keyword">private void</span> <span class="code-func">scanDir</span>(File dir,
+        List&lt;Map&gt; agents, List&lt;Map&gt; folders) {
+
+        <span class="code-keyword">if</span> (!dir.isDirectory()) <span class="code-keyword">return</span>;
+        File[] files = dir.<span class="code-func">listFiles</span>();
+        Map&lt;String,Object&gt; folderInfo = <span class="code-keyword">new</span> HashMap&lt;&gt;();
+        folderInfo.<span class="code-func">put</span>(<span class="code-string">"name"</span>, dir.getName());
+        folderInfo.<span class="code-func">put</span>(<span class="code-string">"path"</span>, dir.getPath());
+        <span class="code-keyword">int</span> agentCount = 0;
+
+        <span class="code-keyword">for</span> (File f : files) {
+            <span class="code-keyword">if</span> (f.isDirectory()) {
+                <span class="code-func">scanDir</span>(f, agents, folders);
+            } <span class="code-keyword">else</span> {
+                String content = <span class="code-func">readFile</span>(f);
+                <span class="code-keyword">if</span> (content.<span class="code-func">contains</span>(<span class="code-string">"openai"</span>)
+                    || content.<span class="code-func">contains</span>(<span class="code-string">"anthropic"</span>)
+                    || content.<span class="code-func">contains</span>(<span class="code-string">"genai"</span>)) {
+                    Map&lt;String,String&gt; agent = <span class="code-keyword">new</span> HashMap&lt;&gt;();
+                    agent.<span class="code-func">put</span>(<span class="code-string">"script"</span>, f.getName());
+                    agent.<span class="code-func">put</span>(<span class="code-string">"path"</span>, f.getPath());
+                    agents.<span class="code-func">add</span>(agent);
+                    agentCount++;
+                }
+            }
+        }
+        folderInfo.<span class="code-func">put</span>(<span class="code-string">"agentCount"</span>, agentCount);
+        folders.<span class="code-func">add</span>(folderInfo);
+    }
+
+    <span class="code-keyword">@GetMapping</span>(<span class="code-string">"/agents"</span>)
+    <span class="code-keyword">public</span> ResponseEntity&lt;?&gt; <span class="code-func">getAgents</span>() {
+        <span class="code-keyword">return</span> ResponseEntity.<span class="code-func">ok</span>(agentService.getAll());
+    }
+}</pre>
+                </div>
+            </div>
+
+            <!-- .NET -->
+            <div class="integration-card">
+                <div class="integration-header">
+                    <div class="integration-icon" style="background:rgba(170,68,255,0.15);">🔷</div>
+                    <div class="integration-name" style="color:var(--accent-purple);">.NET (ASP.NET Core)</div>
+                </div>
+                <div class="code-block">
+                    <button class="copy-btn" onclick="copyCode(this)">📋 Copy</button>
+<pre><span class="code-comment">// AgentScannerController.cs</span>
+<span class="code-keyword">using</span> Microsoft.AspNetCore.Mvc;
+<span class="code-keyword">using</span> System.Text.RegularExpressions;
+
+[<span class="code-func">ApiController</span>]
+[<span class="code-func">Route</span>(<span class="code-string">"api"</span>)]
+<span class="code-keyword">public class</span> <span class="code-func">AgentScannerController</span>
+    : ControllerBase
+{
+    <span class="code-keyword">private static readonly</span> Dictionary&lt;string,string[]&gt;
+    Patterns = <span class="code-keyword">new</span>() {
+        [<span class="code-string">"openai"</span>] = <span class="code-keyword">new</span>[]{<span class="code-string">"openai"</span>,<span class="code-string">"OpenAI"</span>},
+        [<span class="code-string">"anthropic"</span>] = <span class="code-keyword">new</span>[]{<span class="code-string">"anthropic"</span>,<span class="code-string">"Claude"</span>},
+        [<span class="code-string">"google"</span>] = <span class="code-keyword">new</span>[]{<span class="code-string">"genai"</span>,<span class="code-string">"Gemini"</span>},
+    };
+
+    [<span class="code-func">HttpGet</span>(<span class="code-string">"scan"</span>)]
+    <span class="code-keyword">public</span> IActionResult <span class="code-func">Scan</span>(
+        [FromQuery] <span class="code-keyword">string</span> path = <span class="code-string">"."</span>)
+    {
+        <span class="code-keyword">var</span> agents = <span class="code-keyword">new</span> List&lt;object&gt;();
+        <span class="code-keyword">var</span> folders = <span class="code-keyword">new</span> List&lt;object&gt;();
+
+        <span class="code-func">ScanDirectory</span>(path, agents, folders);
+
+        <span class="code-keyword">return</span> <span class="code-func">Ok</span>(<span class="code-keyword">new</span> {
+            agents, folders
+        });
+    }
+
+    <span class="code-keyword">private void</span> <span class="code-func">ScanDirectory</span>(
+        <span class="code-keyword">string</span> dir,
+        List&lt;object&gt; agents,
+        List&lt;object&gt; folders)
+    {
+        <span class="code-keyword">var</span> agentCount = 0;
+        <span class="code-keyword">foreach</span> (<span class="code-keyword">var</span> file <span class="code-keyword">in</span>
+            Directory.<span class="code-func">GetFiles</span>(dir))
+        {
+            <span class="code-keyword">var</span> content = System.IO.File
+                .<span class="code-func">ReadAllText</span>(file);
+            <span class="code-keyword">foreach</span> (<span class="code-keyword">var</span> kvp <span class="code-keyword">in</span> Patterns)
+            {
+                <span class="code-keyword">if</span> (kvp.Value.<span class="code-func">Any</span>(p =>
+                    content.<span class="code-func">Contains</span>(p)))
+                {
+                    agents.<span class="code-func">Add</span>(<span class="code-keyword">new</span> {
+                        script = Path.<span class="code-func">GetFileName</span>(file),
+                        provider = kvp.Key,
+                        path = file
+                    });
+                    agentCount++;
+                    <span class="code-keyword">break</span>;
+                }
+            }
+        }
+        folders.<span class="code-func">Add</span>(<span class="code-keyword">new</span> {
+            name = <span class="code-keyword">new</span> DirectoryInfo(dir).Name,
+            path = dir,
+            agentCount
+        });
+        <span class="code-keyword">foreach</span> (<span class="code-keyword">var</span> sub <span class="code-keyword">in</span>
+            Directory.<span class="code-func">GetDirectories</span>(dir))
+            <span class="code-func">ScanDirectory</span>(sub, agents, folders);
+    }
+
+    [<span class="code-func">HttpGet</span>(<span class="code-string">"agents"</span>)]
+    <span class="code-keyword">public</span> IActionResult <span class="code-func">GetAgents</span>()
+        => <span class="code-func">Ok</span>(AgentService.GetAll());
+}
+
+<span class="code-comment">// Program.cs — add CORS</span>
+builder.Services.<span class="code-func">AddCors</span>(o =>
+    o.<span class="code-func">AddDefaultPolicy</span>(b =>
+        b.<span class="code-func">AllowAnyOrigin</span>()
+         .<span class="code-func">AllowAnyMethod</span>()
+         .<span class="code-func">AllowAnyHeader</span>()));
+app.<span class="code-func">UseCors</span>();</pre>
+                </div>
+            </div>
+
+        </div>
+
+        <!-- How to connect -->
+        <div class="usage-section" style="margin-top:20px;">
+            <div class="section-title" style="margin-top:0;">
+                <span class="icon">📡</span>
+                <span>How to Connect This Dashboard</span>
+                <div class="line"></div>
+            </div>
+            <div style="color:var(--text-secondary);line-height:1.8;font-size:14px;">
+                <p><strong style="color:var(--accent-cyan);">Step 1:</strong> Run your backend (Python/Java/.NET) with the API endpoints shown above.</p>
+                <p><strong style="color:var(--accent-magenta);">Step 2:</strong> Click <strong>⚙️ Config</strong> in the header of this dashboard.</p>
+                <p><strong style="color:var(--accent-green);">Step 3:</strong> Set <em>API Endpoint</em> to your backend URL (e.g., <code style="background:rgba(0,245,255,0.1);padding:2px 8px;border-radius:4px;">http://localhost:8000/api/agents</code>).</p>
+                <p><strong style="color:var(--accent-yellow);">Step 4:</strong> Set <em>Scan Mode</em> to <strong>"Fetch from API"</strong> and click <strong>Apply & Scan</strong>.</p>
+                <p><strong style="color:var(--accent-purple);">Step 5:</strong> The dashboard auto-populates with your real project data!</p>
+                <br/>
+                <p>💡 <strong>Or</strong> export your agent data as <code style="background:rgba(0,245,255,0.1);padding:2px 8px;border-radius:4px;">agents.json</code> and upload it via the Config panel.</p>
+            </div>
+        </div>
+    </div>
+
+</div>
+
+<!-- FOOTER -->
+<div class="footer">
+    🤖 AI Agent Scanner Dashboard &copy; 2025 &bull; Standalone &bull; Works with Python, Java, .NET & more
+</div>
+
+<!-- ============================================
+     JAVASCRIPT
+     ============================================ -->
+<script>
+// =============================================
+// SAMPLE DATA (Demo Mode)
+// =============================================
+const SAMPLE_DATA = {
+    projectName: "MyAIProject",
+    scanTime: new Date().toISOString(),
+    folders: [
+        {
+            name: "MyAIProject",
+            path: "/MyAIProject",
+            type: "folder",
+            agentCount: 2,
+            children: [
+                {
+                    name: "agents",
+                    path: "/MyAIProject/agents",
+                    type: "folder",
+                    agentCount: 3,
+                    children: [
+                        { name: "chatbot_agent.py", path: "/MyAIProject/agents/chatbot_agent.py", type: "file", isAgent: true },
+                        { name: "code_reviewer.py", path: "/MyAIProject/agents/code_reviewer.py", type: "file", isAgent: true },
+                        { name: "summarizer.js", path: "/MyAIProject/agents/summarizer.js", type: "file", isAgent: true },
+                        { name: "utils.py", path: "/MyAIProject/agents/utils.py", type: "file", isAgent: false },
+                        {
+                            name: "sub_agents",
+                            path: "/MyAIProject/agents/sub_agents",
+                            type: "folder",
+                            agentCount: 2,
+                            children: [
+                                { name: "vision_agent.py", path: "/MyAIProject/agents/sub_agents/vision_agent.py", type: "file", isAgent: true },
+                                { name: "search_agent.ts", path: "/MyAIProject/agents/sub_agents/search_agent.ts", type: "file", isAgent: true },
+                                {
+                                    name: "deep",
+                                    path: "/MyAIProject/agents/sub_agents/deep",
+                                    type: "folder",
+                                    agentCount: 1,
+                                    children: [
+                                        { name: "translator_agent.py", path: "/MyAIProject/agents/sub_agents/deep/translator_agent.py", type: "file", isAgent: true },
+                                    ]
+                                }
+                            ]
+                        }
+                    ]
+                },
+                {
+                    name: "services",
+                    path: "/MyAIProject/services",
+                    type: "folder",
+                    agentCount: 2,
+                    children: [
+                        { name: "data_analyzer.java", path: "/MyAIProject/services/data_analyzer.java", type: "file", isAgent: true },
+                        { name: "sentiment_engine.cs", path: "/MyAIProject/services/sentiment_engine.cs", type: "file", isAgent: true },
+                        { name: "config.json", path: "/MyAIProject/services/config.json", type: "file", isAgent: false },
+                    ]
+                },
+                {
+                    name: "pipelines",
+                    path: "/MyAIProject/pipelines",
+                    type: "folder",
+                    agentCount: 1,
+                    children: [
+                        { name: "rag_pipeline.py", path: "/MyAIProject/pipelines/rag_pipeline.py", type: "file", isAgent: true },
+                        { name: "embeddings.py", path: "/MyAIProject/pipelines/embeddings.py", type: "file", isAgent: false },
+                    ]
+                },
+                { name: "README.md", path: "/MyAIProject/README.md", type: "file", isAgent: false },
+                { name: "main.py", path: "/MyAIProject/main.py", type: "file", isAgent: false },
+            ]
+        }
+    ],
+    agents: [
+        {
+            id: 1,
+            scriptName: "chatbot_agent.py",
+            path: "/MyAIProject/agents/chatbot_agent.py",
+            provider: "OpenAI",
+            model: "gpt-4-turbo",
+            area: "Conversational AI",
+            description: "Handles multi-turn customer conversations with context memory, sentiment analysis, and smart routing to human agents when needed.",
+            folder: "agents",
+            tokens: { used: 847520, total: 2000000 },
+            requests: { used: 12480, total: 50000, success: 12105, failed: 375 },
+            rpm: 58, tpm: 42000, rpd: 4160,
+            status: "active"
+        },
+        {
+            id: 2,
+            scriptName: "code_reviewer.py",
+            path: "/MyAIProject/agents/code_reviewer.py",
+            provider: "Anthropic",
+            model: "claude-3-opus",
+            area: "Code Analysis",
+            description: "Performs automated code reviews, detects bugs, security vulnerabilities, and suggests optimizations using AST parsing combined with LLM analysis.",
+            folder: "agents",
+            tokens: { used: 1250000, total: 3000000 },
+            requests: { used: 8900, total: 30000, success: 8734, failed: 166 },
+            rpm: 35, tpm: 65000, rpd: 2966,
+            status: "active"
+        },
+        {
+            id: 3,
+            scriptName: "summarizer.js",
+            path: "/MyAIProject/agents/summarizer.js",
+            provider: "Google",
+            model: "gemini-1.5-pro",
+            area: "Text Summarization",
+            description: "Generates concise summaries of documents, emails, and meeting transcripts. Supports multi-language input with automatic language detection.",
+            folder: "agents",
+            tokens: { used: 523000, total: 1500000 },
+            requests: { used: 6200, total: 20000, success: 6145, failed: 55 },
+            rpm: 42, tpm: 38000, rpd: 2066,
+            status: "active"
+        },
+        {
+            id: 4,
+            scriptName: "vision_agent.py",
+            path: "/MyAIProject/agents/sub_agents/vision_agent.py",
+            provider: "OpenAI",
+            model: "gpt-4-vision",
+            area: "Computer Vision",
+            description: "Analyzes images for object detection, OCR text extraction, and visual question answering. Used in document processing pipeline.",
+            folder: "sub_agents",
+            tokens: { used: 1890000, total: 5000000 },
+            requests: { used: 3400, total: 15000, success: 3250, failed: 150 },
+            rpm: 20, tpm: 95000, rpd: 1133,
+            status: "active"
+        },
+        {
+            id: 5,
+            scriptName: "search_agent.ts",
+            path: "/MyAIProject/agents/sub_agents/search_agent.ts",
+            provider: "Cohere",
+            model: "command-r-plus",
+            area: "Semantic Search",
+            description: "Performs RAG-based semantic search across knowledge base. Combines vector similarity with re-ranking for optimal result relevance.",
+            folder: "sub_agents",
+            tokens: { used: 340000, total: 1000000 },
+            requests: { used: 15600, total: 40000, success: 15420, failed: 180 },
+            rpm: 80, tpm: 25000, rpd: 5200,
+            status: "active"
+        },
+        {
+            id: 6,
+            scriptName: "translator_agent.py",
+            path: "/MyAIProject/agents/sub_agents/deep/translator_agent.py",
+            provider: "Meta",
+            model: "llama-3-70b",
+            area: "Translation",
+            description: "Real-time multilingual translation agent supporting 50+ languages. Uses specialized fine-tuned LLaMA model for high-quality translations.",
+            folder: "deep",
+            tokens: { used: 670000, total: 2000000 },
+            requests: { used: 9800, total: 25000, success: 9650, failed: 150 },
+            rpm: 45, tpm: 35000, rpd: 3266,
+            status: "active"
+        },
+        {
+            id: 7,
+            scriptName: "data_analyzer.java",
+            path: "/MyAIProject/services/data_analyzer.java",
+            provider: "OpenAI",
+            model: "gpt-4-turbo",
+            area: "Data Analysis",
+            description: "Analyzes structured and unstructured datasets, generates insights, creates SQL queries from natural language, and produces automated reports.",
+            folder: "services",
+            tokens: { used: 1100000, total: 2500000 },
+            requests: { used: 5600, total: 20000, success: 5480, failed: 120 },
+            rpm: 30, tpm: 55000, rpd: 1866,
+            status: "active"
+        },
+        {
+            id: 8,
+            scriptName: "sentiment_engine.cs",
+            path: "/MyAIProject/services/sentiment_engine.cs",
+            provider: "Anthropic",
+            model: "claude-3-sonnet",
+            area: "Sentiment Analysis",
+            description: "Real-time sentiment analysis engine for social media monitoring, customer feedback processing, and brand perception tracking.",
+            folder: "services",
+            tokens: { used: 420000, total: 1000000 },
+            requests: { used: 22000, total: 60000, success: 21800, failed: 200 },
+            rpm: 100, tpm: 20000, rpd: 7333,
+            status: "active"
+        },
+        {
+            id: 9,
+            scriptName: "rag_pipeline.py",
+            path: "/MyAIProject/pipelines/rag_pipeline.py",
+            provider: "Google",
+            model: "gemini-1.5-flash",
+            area: "RAG Pipeline",
+            description: "End-to-end Retrieval-Augmented Generation pipeline with document chunking, embedding generation, vector store management, and contextual response generation.",
+            folder: "pipelines",
+            tokens: { used: 2100000, total: 4000000 },
+            requests: { used: 7800, total: 30000, success: 7600, failed: 200 },
+            rpm: 40, tpm: 72000, rpd: 2600,
+            status: "active"
+        }
+    ],
+    failureLog: [
+        { agent: "chatbot_agent.py", time: "2025-01-15 14:23:11", reason: "Rate limit exceeded (429) — Too many requests per minute. Retry after 60s.", tokens: 0 },
+        { agent: "chatbot_agent.py", time: "2025-01-15 09:02:45", reason: "Context length exceeded — Input tokens (128,500) exceeded max (128,000). Truncation needed.", tokens: 0 },
+        { agent: "vision_agent.py", time: "2025-01-14 22:15:33", reason: "Invalid image format — Received corrupted PNG file. Image preprocessing failed.", tokens: 0 },
+        { agent: "code_reviewer.py", time: "2025-01-14 18:44:02", reason: "API timeout — Response not received within 120s. Server overloaded.", tokens: 0 },
+        { agent: "search_agent.ts", time: "2025-01-14 11:30:19", reason: "Embedding dimension mismatch — Expected 1024, got 768. Index needs rebuild.", tokens: 0 },
+        { agent: "data_analyzer.java", time: "2025-01-13 16:55:41", reason: "Authentication failed — API key expired. Rotation required.", tokens: 0 },
+        { agent: "rag_pipeline.py", time: "2025-01-13 08:12:58", reason: "Vector store connection failed — ChromaDB instance not reachable on port 8200.", tokens: 0 },
+        { agent: "sentiment_engine.cs", time: "2025-01-12 20:33:07", reason: "Malformed response — JSON parsing error in API response. Non-UTF8 characters detected.", tokens: 0 },
+        { agent: "translator_agent.py", time: "2025-01-12 13:47:22", reason: "Unsupported language pair — Translation from Klingon to Elvish not supported.", tokens: 0 },
+        { agent: "chatbot_agent.py", time: "2025-01-12 07:01:55", reason: "Content filter triggered — Response blocked due to safety policy violation.", tokens: 0 },
+    ]
+};
+
+// =============================================
+// STATE
+// =============================================
+let currentData = null;
+
+// =============================================
+// INITIALIZATION
+// =============================================
+document.addEventListener('DOMContentLoaded', () => {
+    loadFromAPI();
+});
+
+// =============================================
+// CORE FUNCTIONS
+// =============================================
+
+function startScan() {
+    const mode = document.getElementById('scanMode')?.value || 'demo';
+    if (mode === 'api') {
+        loadFromAPI();
+    } else if (mode === 'file') {
+        // handled by file upload
+        showToast('Please upload a JSON file via Config panel', 'info');
+    } else {
+        loadDemoData();
+    }
+}
+
+function loadDemoData() {
+    showLoading('Scanning project structure...');
+    setTimeout(() => {
+        updateLoadingText('Detecting AI agents...');
+        setTimeout(() => {
+            updateLoadingText('Analyzing token usage...');
+            setTimeout(() => {
+                updateLoadingText('Building dashboard...');
+                setTimeout(() => {
+                    currentData = SAMPLE_DATA;
+                    renderAll(currentData);
+                    hideLoading();
+                    showToast('✅ Project scan complete! Found ' + currentData.agents.length + ' AI agents.', 'success');
+                }, 400);
+            }, 500);
+        }, 600);
+    }, 500);
+}
+
+async function loadFromAPI() {
+    const endpoint = document.getElementById('apiEndpoint')?.value || 'http://localhost:8000/api/agents';
+    showLoading('Connecting to API: ' + endpoint);
+    try {
+        const response = await fetch(endpoint);
+        if (!response.ok) throw new Error('HTTP ' + response.status);
+        const data = await response.json();
+        currentData = normalizeAPIData(data);
+        renderAll(currentData);
+        hideLoading();
+        showToast('✅ Data loaded from API successfully!', 'success');
+    } catch (err) {
+        hideLoading();
+        showToast('⚠️ API connection failed: ' + err.message + '. Loading demo data instead.', 'error');
+        setTimeout(() => loadDemoData(), 1000);
+    }
+}
+
+function normalizeAPIData(data) {
+    // Normalize whatever format comes from API
+    return {
+        projectName: data.projectName || "Project",
+        scanTime: data.scanTime || new Date().toISOString(),
+        folders: data.folders || SAMPLE_DATA.folders,
+        agents: (data.agents || []).map((a, i) => ({
+            id: a.id || i + 1,
+            scriptName: a.scriptName || a.script || a.name || 'unknown.py',
+            path: a.path || '',
+            provider: a.provider || 'Unknown',
+            model: a.model || 'unknown',
+            area: a.area || 'General',
+            description: a.description || 'AI agent',
+            folder: a.folder || '',
+            tokens: a.tokens || { used: 0, total: 100000 },
+            requests: a.requests || { used: 0, total: 1000, success: 0, failed: 0 },
+            rpm: a.rpm || 0,
+            tpm: a.tpm || 0,
+            rpd: a.rpd || 0,
+            status: a.status || 'active'
+        })),
+        failureLog: data.failureLog || data.failures || []
+    };
+}
+
+function applyScan() {
+    const mode = document.getElementById('scanMode').value;
+    if (mode === 'file') {
+        const fileInput = document.getElementById('fileUpload');
+        if (fileInput.files.length > 0) {
+            const reader = new FileReader();
+            reader.onload = (e) => {
+                try {
+                    const data = JSON.parse(e.target.result);
+                    currentData = normalizeAPIData(data);
+                    renderAll(currentData);
+                    showToast('✅ Data loaded from file!', 'success');
+                } catch (err) {
+                    showToast('❌ Invalid JSON file: ' + err.message, 'error');
+                }
+            };
+            reader.readAsText(fileInput.files[0]);
+        } else {
+            showToast('⚠️ Please select a JSON file first', 'info');
+        }
+    } else {
+        startScan();
+    }
+}
+
+// =============================================
+// RENDER FUNCTIONS
+// =============================================
+
+function renderAll(data) {
+    renderStatsBar(data);
+    renderFolderTree(data.folders);
+    renderFolderAgentSummary(data);
+    renderAgentCards(data.agents);
+    renderHexGrid(data.agents);
+    renderShapeRow(data.agents);
+    renderDonutCharts(data.agents);
+    renderGauges(data.agents);
+    renderUsageBars(data.agents);
+    renderRequestTable(data);
+    renderFailureLog(data.failureLog);
+}
+
+// ---- STATS BAR ----
+function renderStatsBar(data) {
+    const totalAgents = data.agents.length;
+    const totalFolders = countFolders(data.folders);
+    const totalRequests = data.agents.reduce((s, a) => s + a.requests.used, 0);
+    const totalSuccess = data.agents.reduce((s, a) => s + a.requests.success, 0);
+    const totalFailed = data.agents.reduce((s, a) => s + a.requests.failed, 0);
+    const totalTokens = data.agents.reduce((s, a) => s + a.tokens.used, 0);
+    const providers = [...new Set(data.agents.map(a => a.provider))].length;
+
+    const stats = [
+        { icon: '🤖', value: totalAgents, label: 'AI Agents Found' },
+        { icon: '📁', value: totalFolders, label: 'Folders Scanned' },
+        { icon: '🏢', value: providers, label: 'Providers Used' },
+        { icon: '📨', value: formatNumber(totalRequests), label: 'Total Requests' },
+        { icon: '✅', value: formatNumber(totalSuccess), label: 'Successful' },
+        { icon: '❌', value: formatNumber(totalFailed), label: 'Failed' },
+    ];
+
+    document.getElementById('statsBar').innerHTML = stats.map((s, i) => `
+        <div class="stat-card fade-in" style="animation-delay:${i * 0.1}s">
+            <div class="stat-icon">${s.icon}</div>
+            <div class="stat-value">${s.value}</div>
+            <div class="stat-label">${s.label}</div>
+        </div>
+    `).join('');
+}
+
+function countFolders(folders) {
+    let count = 0;
+    function traverse(items) {
+        items.forEach(item => {
+            if (item.type === 'folder' || item.children) {
+                count++;
+                if (item.children) traverse(item.children);
+            }
+        });
+    }
+    traverse(folders);
+    return count;
+}
+
+// ---- FOLDER TREE ----
+function renderFolderTree(folders) {
+    document.getElementById('folderTree').innerHTML = folders.map(f => renderTreeNode(f)).join('');
+}
+
+function renderTreeNode(node) {
+    const isFolder = node.type === 'folder' || node.children;
+    const hasChildren = node.children && node.children.length > 0;
+    const icon = isFolder ? '📁' : (node.isAgent ? '🤖' : '📄');
+    const badge = node.agentCount > 0 ? `<span class="tree-badge">${node.agentCount} agents</span>` : '';
+    const agentHighlight = node.isAgent ? 'style="color:var(--accent-cyan);"' : '';
+
+    let html = `<div class="tree-node">
+        <div class="tree-node-header" ${hasChildren ? `onclick="toggleTree(this)"` : ''}>
+            ${hasChildren ? '<span class="tree-toggle">▶</span>' : '<span class="tree-toggle" style="opacity:0">▶</span>'}
+            <span class="tree-icon">${icon}</span>
+            <span class="tree-name" ${agentHighlight}>${node.name}</span>
+            ${badge}
+        </div>`;
+
+    if (hasChildren) {
+        html += `<div class="tree-children">`;
+        html += node.children.map(c => renderTreeNode(c)).join('');
+        html += `</div>`;
+    }
+
+    html += `</div>`;
+    return html;
+}
+
+function toggleTree(el) {
+    const children = el.nextElementSibling;
+    const toggle = el.querySelector('.tree-toggle');
+    if (children && children.classList.contains('tree-children')) {
+        children.classList.toggle('open');
+        toggle.classList.toggle('open');
+    }
+}
+
+// ---- FOLDER AGENT SUMMARY ----
+function renderFolderAgentSummary(data) {
+    const folderMap = {};
+    data.agents.forEach(a => {
+        folderMap[a.folder] = (folderMap[a.folder] || 0) + 1;
+    });
+
+    const colors = ['var(--accent-cyan)', 'var(--accent-magenta)', 'var(--accent-green)', 'var(--accent-yellow)', 'var(--accent-purple)', 'var(--accent-orange)'];
+
+    document.getElementById('folderAgentSummary').innerHTML = Object.entries(folderMap).map(([folder, count], i) => `
+        <div class="stat-card fade-in" style="animation-delay:${i * 0.1}s">
+            <div class="stat-icon">📂</div>
+            <div class="stat-value" style="color:${colors[i % colors.length]}">${count}</div>
+            <div class="stat-label">in /${folder}</div>
+        </div>
+    `).join('');
+}
+
+// ---- AGENT CARDS ----
+function renderAgentCards(agents) {
+    const providerIcons = {
+        'OpenAI': '🟢', 'Anthropic': '🟠', 'Google': '🔵',
+        'Meta': '🔷', 'Cohere': '🟣', 'Mistral': '🟡', 'HuggingFace': '🤗'
+    };
+
+    const areaClasses = {
+        'Conversational AI': 'area-chat', 'Code Analysis': 'area-code',
+        'Text Summarization': 'area-nlp', 'Computer Vision': 'area-vision',
+        'Semantic Search': 'area-search', 'Translation': 'area-nlp',
+        'Data Analysis': 'area-data', 'Sentiment Analysis': 'area-nlp',
+        'RAG Pipeline': 'area-data'
+    };
+
+    const avatarColors = [
+        'var(--gradient-1)', 'var(--gradient-2)', 'var(--gradient-3)',
+        'var(--gradient-4)', 'var(--gradient-5)',
+        'linear-gradient(135deg, #ff66aa, #ffdd00)',
+        'linear-gradient(135deg, #00ff88, #ffdd00)',
+        'linear-gradient(135deg, #4488ff, #00f5ff)',
+        'linear-gradient(135deg, #aa44ff, #ff4466)'
+    ];
+
+    document.getElementById('agentsGrid').innerHTML = agents.map((agent, i) => {
+        const tokenPct = ((agent.tokens.used / agent.tokens.total) * 100).toFixed(1);
+        const reqPct = ((agent.requests.used / agent.requests.total) * 100).toFixed(1);
+        const successRate = ((agent.requests.success / agent.requests.used) * 100).toFixed(1);
+
+        return `
+        <div class="agent-card fade-in" style="animation-delay:${i * 0.08}s">
+            <div class="agent-header">
+                <div class="agent-avatar" style="background:${avatarColors[i % avatarColors.length]}">
+                    ${providerIcons[agent.provider] || '🤖'}
+                </div>
+                <div>
+                    <div class="agent-name">${agent.scriptName}</div>
+                    <div class="agent-script">📂 ${agent.path}</div>
+                </div>
+            </div>
+
+            <div class="agent-details">
+                <div class="agent-detail">
+                    <div class="agent-detail-label">🏢 Provider</div>
+                    <div class="agent-detail-value provider-${agent.provider.toLowerCase()}">${agent.provider}</div>
+                </div>
+                <div class="agent-detail">
+                    <div class="agent-detail-label">🧠 Model</div>
+                    <div class="agent-detail-value">${agent.model}</div>
+                </div>
+                <div class="agent-detail">
+                    <div class="agent-detail-label">🎯 Area</div>
+                    <div class="agent-detail-value"><span class="area-tag ${areaClasses[agent.area] || 'area-nlp'}">${agent.area}</span></div>
+                </div>
+                <div class="agent-detail">
+                    <div class="agent-detail-label">📊 Success Rate</div>
+                    <div class="agent-detail-value" style="color:${parseFloat(successRate) > 95 ? 'var(--accent-green)' : 'var(--accent-yellow)'}">${successRate}%</div>
+                </div>
+            </div>
+
+            <div class="agent-description">
+                💡 ${agent.description}
+            </div>
+
+            <div class="agent-details">
+                <div class="agent-detail">
+                    <div class="agent-detail-label">🪙 Tokens</div>
+                    <div class="agent-detail-value">${formatNumber(agent.tokens.used)} / ${formatNumber(agent.tokens.total)}</div>
+                    <div style="margin-top:6px;">
+                        <div class="usage-bar-track" style="height:6px;">
+                            <div class="usage-bar-fill bar-cyan" style="width:${tokenPct}%"></div>
+                        </div>
+                    </div>
+                </div>
+                <div class="agent-detail">
+                    <div class="agent-detail-label">📨 Requests</div>
+                    <div class="agent-detail-value">${formatNumber(agent.requests.used)} / ${formatNumber(agent.requests.total)}</div>
+                    <div style="margin-top:6px;">
+                        <div class="usage-bar-track" style="height:6px;">
+                            <div class="usage-bar-fill bar-magenta" style="width:${reqPct}%"></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="agent-metrics" style="margin-top:12px;">
+                <span class="agent-metric-tag tag-cyan">⚡ RPM: ${agent.rpm}</span>
+                <span class="agent-metric-tag tag-green">🪙 TPM: ${formatNumber(agent.tpm)}</span>
+                <span class="agent-metric-tag tag-purple">📅 RPD: ${formatNumber(agent.rpd)}</span>
+                <span class="agent-metric-tag tag-green">✅ ${formatNumber(agent.requests.success)}</span>
+                <span class="agent-metric-tag tag-red">❌ ${agent.requests.failed}</span>
+            </div>
+        </div>`;
+    }).join('');
+}
+
+// ---- HEX GRID (Provider Distribution) ----
+function renderHexGrid(agents) {
+    const providerCount = {};
+    agents.forEach(a => {
+        providerCount[a.provider] = (providerCount[a.provider] || 0) + 1;
+    });
+
+    const colors = ['#00f5ff', '#ff00ff', '#00ff88', '#ffdd00', '#aa44ff', '#ff8800'];
+    const icons = ['🟢', '🟠', '🔵', '🔷', '🟣', '🟡'];
+
+    document.getElementById('hexGrid').innerHTML = Object.entries(providerCount).map(([provider, count], i) => `
+        <div class="hexagon scale-in" style="animation-delay:${i * 0.1}s" title="${provider}: ${count} agents">
+            <svg viewBox="0 0 120 104">
+                <polygon points="60,2 115,27 115,77 60,102 5,77 5,27"
+                    fill="rgba(${hexToRgb(colors[i % colors.length])},0.1)"
+                    stroke="${colors[i % colors.length]}"
+                    stroke-width="2"/>
+            </svg>
+            <div class="hexagon-content">
+                <div class="hexagon-icon">${icons[i % icons.length]}</div>
+                <div class="hexagon-value" style="color:${colors[i % colors.length]}">${count}</div>
+                <div class="hexagon-label">${provider}</div>
+            </div>
+        </div>
+    `).join('');
+}
+
+// ---- PENTAGON & OCTAGON (Rate Limits) ----
+function renderShapeRow(agents) {
+    const totalRPM = agents.reduce((s, a) => s + a.rpm, 0);
+    const totalTPM = agents.reduce((s, a) => s + a.tpm, 0);
+    const totalRPD = agents.reduce((s, a) => s + a.rpd, 0);
+    const avgRPM = Math.round(totalRPM / agents.length);
+    const avgTPM = Math.round(totalTPM / agents.length);
+
+    const shapes = [
+        { label: 'Total RPM', value: totalRPM, icon: '⚡', type: 'pentagon', color: '#00f5ff' },
+        { label: 'Avg RPM', value: avgRPM, icon: '📊', type: 'octagon', color: '#ff00ff' },
+        { label: 'Total TPM', value: formatNumber(totalTPM), icon: '🪙', type: 'pentagon', color: '#00ff88' },
+        { label: 'Avg TPM', value: formatNumber(avgTPM), icon: '📈', type: 'octagon', color: '#ffdd00' },
+        { label: 'Total RPD', value: formatNumber(totalRPD), icon: '📅', type: 'pentagon', color: '#aa44ff' },
+    ];
+
+    document.getElementById('shapeRow').innerHTML = shapes.map((s, i) => {
+        if (s.type === 'pentagon') {
+            return `
+                <div class="pentagon-card scale-in" style="animation-delay:${i * 0.1}s">
+                    <svg viewBox="0 0 150 150">
+                        <polygon points="75,5 145,55 120,140 30,140 5,55"
+                            fill="rgba(${hexToRgb(s.color)},0.08)"
+                            stroke="${s.color}" stroke-width="2"/>
+                    </svg>
+                    <div class="shape-content">
+                        <div class="shape-icon">${s.icon}</div>
+                        <div class="shape-value" style="color:${s.color}">${s.value}</div>
+                        <div class="shape-label">${s.label}</div>
+                    </div>
+                </div>`;
+        } else {
+            return `
+                <div class="octagon-card scale-in" style="animation-delay:${i * 0.1}s">
+                    <svg viewBox="0 0 150 150">
+                        <polygon points="45,5 105,5 145,45 145,105 105,145 45,145 5,105 5,45"
+                            fill="rgba(${hexToRgb(s.color)},0.08)"
+                            stroke="${s.color}" stroke-width="2"/>
+                    </svg>
+                    <div class="shape-content">
+                        <div class="shape-icon">${s.icon}</div>
+                        <div class="shape-value" style="color:${s.color}">${s.value}</div>
+                        <div class="shape-label">${s.label}</div>
+                    </div>
+                </div>`;
+        }
+    }).join('');
+}
+
+// ---- DONUT CHARTS ----
+function renderDonutCharts(agents) {
+    const totalReq = agents.reduce((s, a) => s + a.requests.used, 0);
+    const totalSuccess = agents.reduce((s, a) => s + a.requests.success, 0);
+    const totalFailed = agents.reduce((s, a) => s + a.requests.failed, 0);
+    const successPct = ((totalSuccess / totalReq) * 100).toFixed(1);
+    const failPct = ((totalFailed / totalReq) * 100).toFixed(1);
+
+    const donuts = [
+        { label: 'Overall Success', value: successPct, color: '#00ff88', used: totalSuccess, total: totalReq },
+        { label: 'Overall Failure', value: failPct, color: '#ff4466', used: totalFailed, total: totalReq },
+        ...agents.slice(0, 4).map(a => ({
+            label: a.scriptName.split('.')[0],
+            value: ((a.requests.success / a.requests.used) * 100).toFixed(1),
+            color: ['#00f5ff', '#ff00ff', '#ffdd00', '#aa44ff'][agents.indexOf(a) % 4],
+            used: a.requests.success,
+            total: a.requests.used
+        }))
+    ];
+
+    document.getElementById('donutContainer').innerHTML = donuts.map((d, i) => {
+        const circumference = 2 * Math.PI * 55;
+        const offset = circumference - (circumference * parseFloat(d.value) / 100);
+        return `
+        <div class="donut-card scale-in" style="animation-delay:${i * 0.1}s">
+            <div class="donut-chart">
+                <svg viewBox="0 0 150 150">
+                    <circle cx="75" cy="75" r="55" fill="none" stroke="rgba(255,255,255,0.05)" stroke-width="14"/>
+                    <circle cx="75" cy="75" r="55" fill="none" stroke="${d.color}" stroke-width="14"
+                        stroke-dasharray="${circumference}" stroke-dashoffset="${offset}"
+                        stroke-linecap="round" style="transition: stroke-dashoffset 1.5s ease;"/>
+                </svg>
+                <div class="donut-center">
+                    <div class="donut-value" style="color:${d.color}">${d.value}%</div>
+                    <div class="donut-sublabel">${formatNumber(d.used)}/${formatNumber(d.total)}</div>
+                </div>
+            </div>
+            <div class="donut-label">${d.label}</div>
+        </div>`;
+    }).join('');
+}
+
+// ---- SEMI-CIRCLE GAUGES ----
+function renderGauges(agents) {
+    document.getElementById('gaugesGrid').innerHTML = agents.map((agent, i) => {
+        const pct = ((agent.tokens.used / agent.tokens.total) * 100).toFixed(1);
+        const colors = ['#00f5ff', '#ff00ff', '#00ff88', '#ffdd00', '#aa44ff', '#ff8800', '#4488ff', '#ff66aa', '#aaff00'];
+        const color = colors[i % colors.length];
+
+        // Semi-circle: 180 degrees = full
+        const angle = (pct / 100) * 180;
+
+        return `
+        <div class="gauge-card fade-in" style="animation-delay:${i * 0.08}s">
+            <div class="semi-circle-container">
+                <svg viewBox="0 0 160 85" style="overflow:visible;">
+                    <path d="M 10 80 A 70 70 0 0 1 150 80" fill="none" stroke="rgba(255,255,255,0.05)" stroke-width="12" stroke-linecap="round"/>
+                    <path d="M 10 80 A 70 70 0 0 1 150 80" fill="none" stroke="${color}" stroke-width="12" stroke-linecap="round"
+                        stroke-dasharray="${220}" stroke-dashoffset="${220 - (220 * pct / 100)}"
+                        style="transition: stroke-dashoffset 1.5s ease; filter: drop-shadow(0 0 6px ${color});"/>
+                </svg>
+                <div class="gauge-value" style="color:${color}; bottom:0;">${pct}%</div>
+            </div>
+            <div class="gauge-label">${agent.scriptName.replace(/\.\w+$/, '')}</div>
+            <div class="gauge-sub">${formatNumber(agent.tokens.used)} / ${formatNumber(agent.tokens.total)} tokens</div>
+        </div>`;
+    }).join('');
+}
+
+// ---- USAGE BARS ----
+function renderUsageBars(agents) {
+    const barColors = ['bar-cyan', 'bar-magenta', 'bar-green', 'bar-yellow', 'bar-purple'];
+
+    document.getElementById('usageBars').innerHTML = agents.map((agent, i) => {
+        const tokenPct = ((agent.tokens.used / agent.tokens.total) * 100).toFixed(1);
+        const reqPct = ((agent.requests.used / agent.requests.total) * 100).toFixed(1);
+        const barClass = barColors[i % barColors.length];
+
+        return `
+        <div class="usage-section fade-in" style="animation-delay:${i * 0.05}s; margin-bottom:15px;">
+            <div style="font-size:16px;font-weight:700;margin-bottom:15px;display:flex;align-items:center;gap:8px;">
+                🤖 ${agent.scriptName}
+                <span class="agent-metric-tag tag-cyan" style="font-size:10px;">${agent.provider}</span>
+                <span class="agent-metric-tag tag-purple" style="font-size:10px;">${agent.model}</span>
+            </div>
+            <div class="usage-bar-container">
+                <div class="usage-bar-header">
+                    <div class="usage-bar-label">🪙 Token Usage</div>
+                    <div class="usage-bar-numbers">${formatNumber(agent.tokens.used)} / ${formatNumber(agent.tokens.total)} (${tokenPct}%)</div>
+                </div>
+                <div class="usage-bar-track">
+                    <div class="usage-bar-fill ${barClass}" style="width:${tokenPct}%"></div>
+                </div>
+            </div>
+            <div class="usage-bar-container">
+                <div class="usage-bar-header">
+                    <div class="usage-bar-label">📨 Request Usage</div>
+                    <div class="usage-bar-numbers">${formatNumber(agent.requests.used)} / ${formatNumber(agent.requests.total)} (${reqPct}%)</div>
+                </div>
+                <div class="usage-bar-track">
+                    <div class="usage-bar-fill ${barClass}" style="width:${reqPct}%"></div>
+                </div>
+            </div>
+            <div style="display:flex;gap:15px;margin-top:10px;flex-wrap:wrap;">
+                <span class="agent-metric-tag tag-cyan">⚡ RPM: ${agent.rpm}</span>
+                <span class="agent-metric-tag tag-green">🪙 TPM: ${formatNumber(agent.tpm)}</span>
+                <span class="agent-metric-tag tag-purple">📅 RPD: ${formatNumber(agent.rpd)}</span>
+                <span class="agent-metric-tag tag-green">✅ Success: ${formatNumber(agent.requests.success)}</span>
+                <span class="agent-metric-tag tag-red">❌ Failed: ${agent.requests.failed}</span>
+            </div>
+        </div>`;
+    }).join('');
+}
+
+// ---- REQUEST TABLE ----
+function renderRequestTable(data) {
+    // Generate sample request log entries
+    const allEntries = [];
+
+    data.agents.forEach(agent => {
+        // Success entries
+        for (let j = 0; j < Math.min(3, agent.requests.success); j++) {
+            allEntries.push({
+                agent: agent.scriptName,
+                time: randomTime(),
+                status: 'success',
+                tokens: Math.floor(Math.random() * 2000) + 100,
+                latency: (Math.random() * 3 + 0.2).toFixed(2) + 's',
+                reason: '-'
+            });
+        }
+        // Failed entries
+        for (let j = 0; j < Math.min(2, agent.requests.failed); j++) {
+            const reasons = [
+                'Rate limit exceeded (429)',
+                'Context length exceeded',
+                'API timeout (120s)',
+                'Authentication failed',
+                'Malformed response',
+                'Content filter triggered',
+                'Service unavailable (503)',
+                'Invalid request format'
+            ];
+            allEntries.push({
+                agent: agent.scriptName,
+                time: randomTime(),
+                status: 'failed',
+                tokens: 0,
+                latency: '-',
+                reason: reasons[Math.floor(Math.random() * reasons.length)]
+            });
+        }
+    });
+
+    // Sort by time descending
+    allEntries.sort((a, b) => b.time.localeCompare(a.time));
+
+    document.getElementById('requestTableBody').innerHTML = allEntries.map(entry => `
+        <tr>
+            <td><strong>${entry.agent}</strong></td>
+            <td style="color:var(--text-secondary)">${entry.time}</td>
+            <td>
+                <span class="status-dot ${entry.status}"></span>
+                ${entry.status === 'success' ? '<span style="color:var(--accent-green)">Success</span>' : '<span style="color:var(--accent-red)">Failed</span>'}
+            </td>
+            <td>${entry.tokens > 0 ? formatNumber(entry.tokens) : '-'}</td>
+            <td>${entry.latency}</td>
+            <td class="fail-reason">${entry.reason}</td>
+        </tr>
+    `).join('');
+}
+
+// ---- FAILURE LOG ----
+function renderFailureLog(failures) {
+    if (!failures || failures.length === 0) {
+        document.getElementById('failureLog').innerHTML = '<p style="color:var(--accent-green);text-align:center;padding:20px;">🎉 No failures recorded!</p>';
+        return;
+    }
+
+    document.getElementById('failureLog').innerHTML = failures.map((f, i) => `
+        <div class="failure-item fade-in" style="animation-delay:${i * 0.05}s">
+            <div class="failure-agent">🤖 ${f.agent}</div>
+            <div class="failure-time">🕐 ${f.time}</div>
+            <div class="failure-reason">💥 ${f.reason}</div>
+        </div>
+    `).join('');
+}
+
+// =============================================
+// UTILITY FUNCTIONS
+// =============================================
+
+function formatNumber(num) {
+    if (num >= 1000000) return (num / 1000000).toFixed(1) + 'M';
+    if (num >= 1000) return (num / 1000).toFixed(1) + 'K';
+    return num.toString();
+}
+
+function hexToRgb(hex) {
+    const result = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
+    return result ? `${parseInt(result[1], 16)},${parseInt(result[2], 16)},${parseInt(result[3], 16)}` : '255,255,255';
+}
+
+function randomTime() {
+    const d = new Date();
+    d.setHours(d.getHours() - Math.floor(Math.random() * 72));
+    d.setMinutes(Math.floor(Math.random() * 60));
+    d.setSeconds(Math.floor(Math.random() * 60));
+    return d.toISOString().replace('T', ' ').substring(0, 19);
+}
+
+// ---- TAB SWITCHING ----
+function switchTab(tabName) {
+    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+    document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+    document.getElementById('tab-' + tabName).classList.add('active');
+    // Find and activate button
+    document.querySelectorAll('.tab').forEach(t => {
+        if (t.getAttribute('onclick')?.includes(tabName)) {
+            t.classList.add('active');
+        }
+    });
+}
+
+// ---- CONFIG TOGGLE ----
+function showConfig() {
+    const panel = document.getElementById('configPanel');
+    panel.style.display = panel.style.display === 'none' ? 'block' : 'none';
+}
+
+// ---- LOADING ----
+function showLoading(text) {
+    document.getElementById('loadingText').textContent = text || 'Loading...';
+    document.getElementById('loadingOverlay').classList.add('active');
+}
+
+function updateLoadingText(text) {
+    document.getElementById('loadingText').textContent = text;
+}
+
+function hideLoading() {
+    document.getElementById('loadingOverlay').classList.remove('active');
+}
+
+// ---- TOAST ----
+function showToast(message, type = 'info') {
+    const container = document.getElementById('toastContainer');
+    const toast = document.createElement('div');
+    toast.className = `toast toast-${type}`;
+    const icons = { success: '✅', error: '❌', info: 'ℹ️' };
+    toast.innerHTML = `<span>${icons[type] || 'ℹ️'}</span> ${message}`;
+    container.appendChild(toast);
+    setTimeout(() => toast.remove(), 4000);
+}
+
+// ---- EXPORT ----
+function exportReport() {
+    if (!currentData) {
+        showToast('No data to export. Run a scan first.', 'error');
+        return;
+    }
+
+    const report = {
+        exportDate: new Date().toISOString(),
+        project: currentData.projectName,
+        summary: {
+            totalAgents: currentData.agents.length,
+            totalRequests: currentData.agents.reduce((s, a) => s + a.requests.used, 0),
+            totalSuccess: currentData.agents.reduce((s, a) => s + a.requests.success, 0),
+            totalFailed: currentData.agents.reduce((s, a) => s + a.requests.failed, 0),
+            totalTokensUsed: currentData.agents.reduce((s, a) => s + a.tokens.used, 0),
+        },
+        agents: currentData.agents,
+        failures: currentData.failureLog
+    };
+
+    const blob = new Blob([JSON.stringify(report, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'ai-agent-report-' + new Date().toISOString().slice(0, 10) + '.json';
+    a.click();
+    URL.revokeObjectURL(url);
+    showToast('📊 Report exported successfully!', 'success');
+}
+
+// ---- COPY CODE ----
+function copyCode(btn) {
+    const codeBlock = btn.parentElement.querySelector('pre');
+    const text = codeBlock.textContent;
+    navigator.clipboard.writeText(text).then(() => {
+        btn.textContent = '✅ Copied!';
+        setTimeout(() => btn.textContent = '📋 Copy', 2000);
+    });
+}
+</script>
+
+</body>
+</html>
