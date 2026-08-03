@@ -1,2509 +1,1791 @@
+#!/usr/bin/env python3
 """
-agent_monitor.py
-================
-AI Agent Monitor - Real Scanner, Real Metrics, Free Models Only
-- Only SAFE FREE and USE WITH CAUTION models shown
-- Real token usage tracking (used vs available)
-- Real request tracking (used vs limit)
-- Real API calls and real system metrics
-- Fully independent (no Prometheus, no Grafana)
+AI Agent & Script Monitor Dashboard
+====================================
+A self-contained monitoring dashboard that:
+- Scans entire project for AI agents/scripts
+- Detects file purposes and main files
+- Tracks token usage, request counts, CPU, memory, storage
+- Collects all metrics independently (no Prometheus/Grafana)
+- Shows everything in a web dashboard
 """
 
 import os
 import sys
-import re
-import io
 import time
 import json
+import ast
+import re
 import threading
 import hashlib
-from pathlib import Path
-from datetime import datetime, timedelta
-from typing import Dict, List, Any, Optional
-from dataclasses import dataclass, field
-from collections import deque
-
+import sqlite3
+import socket
 import psutil
-from flask import Flask, render_template_string, request, jsonify, send_file
-from flask_cors import CORS
+import datetime
+from pathlib import Path
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from urllib.parse import urlparse, parse_qs
+from collections import defaultdict
+import importlib.util
 
-# ============================================================================
-# OPTIONAL AI PROVIDER IMPORTS
-# ============================================================================
-try:
-    import google.generativeai as genai
-    GEMINI_AVAILABLE = True
-except ImportError:
-    GEMINI_AVAILABLE = False
-    print("⚠ google-generativeai not installed: pip install google-generativeai")
-
-try:
-    from openai import OpenAI
-    OPENAI_AVAILABLE = True
-except ImportError:
-    OPENAI_AVAILABLE = False
-    print("⚠ openai not installed: pip install openai")
-
-try:
-    import requests as req_lib
-    REQUESTS_AVAILABLE = True
-except ImportError:
-    REQUESTS_AVAILABLE = False
-
-# ============================================================================
-# FREE MODELS REGISTRY
-# SAFE FREE  = confirmed free, stable
-# CAUTION    = free now, pricing may come after GA
-# ============================================================================
-
-FREE_MODELS_REGISTRY = {
-
-    # ── Google Gemini ─────────────────────────────────────────
-    "gemini": {
-        "name":       "Google Gemini",
-        "env_keys":   ["GEMINI_API_KEY", "GOOGLE_API_KEY"],
-        "type":       "gemini",
-        "base_url":   None,
-        "signup_url": "https://aistudio.google.com",
-        "daily_limit_requests": 1_500,   # free tier: 1500 RPD
-        "daily_limit_tokens":   1_000_000_000,  # ~1B tokens/day free
-        "models": [
-            # ── SAFE FREE ─────────────────────────────────────
-            {
-                "id":          "gemini-2.0-flash",
-                "name":        "Gemini 2.0 Flash",
-                "tier":        "safe_free",
-                "rpm":         15,
-                "rpd":         1_500,
-                "tpm":         1_000_000,
-                "tpd":         1_500_000_000,
-                "context":     "1M tokens",
-                "type":        "Text + Vision",
-                "recommended": True,
-            },
-            {
-                "id":          "gemini-2.0-flash-001",
-                "name":        "Gemini 2.0 Flash 001 (Pinned)",
-                "tier":        "safe_free",
-                "rpm":         15,
-                "rpd":         1_500,
-                "tpm":         1_000_000,
-                "tpd":         1_500_000_000,
-                "context":     "1M tokens",
-                "type":        "Text + Vision",
-                "recommended": False,
-            },
-            {
-                "id":          "gemini-2.0-flash-lite",
-                "name":        "Gemini 2.0 Flash Lite",
-                "tier":        "safe_free",
-                "rpm":         30,
-                "rpd":         1_500,
-                "tpm":         1_000_000,
-                "tpd":         1_500_000_000,
-                "context":     "1M tokens",
-                "type":        "Text + Vision",
-                "recommended": True,
-            },
-            {
-                "id":          "gemini-2.0-flash-lite-001",
-                "name":        "Gemini 2.0 Flash Lite 001 (Pinned)",
-                "tier":        "safe_free",
-                "rpm":         30,
-                "rpd":         1_500,
-                "tpm":         1_000_000,
-                "tpd":         1_500_000_000,
-                "context":     "1M tokens",
-                "type":        "Text + Vision",
-                "recommended": False,
-            },
-            {
-                "id":          "gemini-flash-latest",
-                "name":        "Gemini Flash Latest (Alias)",
-                "tier":        "safe_free",
-                "rpm":         15,
-                "rpd":         1_500,
-                "tpm":         1_000_000,
-                "tpd":         1_500_000_000,
-                "context":     "1M tokens",
-                "type":        "Text + Vision",
-                "recommended": False,
-            },
-            {
-                "id":          "gemini-flash-lite-latest",
-                "name":        "Gemini Flash Lite Latest (Alias)",
-                "tier":        "safe_free",
-                "rpm":         30,
-                "rpd":         1_500,
-                "tpm":         1_000_000,
-                "tpd":         1_500_000_000,
-                "context":     "1M tokens",
-                "type":        "Text + Vision",
-                "recommended": False,
-            },
-            {
-                "id":          "gemma-4-31b-it",
-                "name":        "Gemma 4 31B IT",
-                "tier":        "safe_free",
-                "rpm":         15,
-                "rpd":         1_500,
-                "tpm":         1_000_000,
-                "tpd":         1_500_000_000,
-                "context":     "128K tokens",
-                "type":        "Open Weight Chat",
-                "recommended": False,
-            },
-            {
-                "id":          "gemma-4-26b-a4b-it",
-                "name":        "Gemma 4 26B (MoE)",
-                "tier":        "safe_free",
-                "rpm":         15,
-                "rpd":         1_500,
-                "tpm":         1_000_000,
-                "tpd":         1_500_000_000,
-                "context":     "128K tokens",
-                "type":        "Open Weight Chat",
-                "recommended": False,
-            },
-            {
-                "id":          "gemini-embedding-001",
-                "name":        "Gemini Embedding 001",
-                "tier":        "safe_free",
-                "rpm":         15,
-                "rpd":         1_500,
-                "tpm":         1_000_000,
-                "tpd":         1_500_000_000,
-                "context":     "2K input",
-                "type":        "Embedding only",
-                "recommended": False,
-            },
-            {
-                "id":          "gemini-embedding-2",
-                "name":        "Gemini Embedding 2",
-                "tier":        "safe_free",
-                "rpm":         15,
-                "rpd":         1_500,
-                "tpm":         1_000_000,
-                "tpd":         1_500_000_000,
-                "context":     "8K input",
-                "type":        "Embedding only",
-                "recommended": False,
-            },
-            # ── USE WITH CAUTION ──────────────────────────────
-            {
-                "id":          "gemini-2.5-flash",
-                "name":        "Gemini 2.5 Flash",
-                "tier":        "caution",
-                "rpm":         10,
-                "rpd":         500,
-                "tpm":         250_000,
-                "tpd":         250_000_000,
-                "context":     "1M tokens",
-                "type":        "Text + Vision",
-                "recommended": False,
-            },
-            {
-                "id":          "gemini-2.5-flash-lite",
-                "name":        "Gemini 2.5 Flash Lite",
-                "tier":        "caution",
-                "rpm":         10,
-                "rpd":         500,
-                "tpm":         250_000,
-                "tpd":         250_000_000,
-                "context":     "1M tokens",
-                "type":        "Text + Vision",
-                "recommended": False,
-            },
-        ],
-    },
-
-    # ── NVIDIA NIM ────────────────────────────────────────────
-    "nvidia": {
-        "name":       "NVIDIA NIM",
-        "env_keys":   ["NVIDIA_API_KEY"],
-        "type":       "openai_compat",
-        "base_url":   "https://integrate.api.nvidia.com/v1",
-        "signup_url": "https://build.nvidia.com",
-        "daily_limit_requests": 1_000,
-        "daily_limit_tokens":   40_000_000,
-        "models": [
-            {
-                "id":          "meta/llama-3.1-8b-instruct",
-                "name":        "Llama 3.1 8B Instruct",
-                "tier":        "safe_free",
-                "rpm":         40,
-                "rpd":         1_000,
-                "tpm":         40_000,
-                "tpd":         40_000_000,
-                "context":     "128K tokens",
-                "type":        "Chat",
-                "recommended": True,
-            },
-            {
-                "id":          "meta/llama-3.2-3b-instruct",
-                "name":        "Llama 3.2 3B Instruct",
-                "tier":        "safe_free",
-                "rpm":         40,
-                "rpd":         1_000,
-                "tpm":         40_000,
-                "tpd":         40_000_000,
-                "context":     "128K tokens",
-                "type":        "Chat",
-                "recommended": False,
-            },
-            {
-                "id":          "mistralai/mistral-7b-instruct-v0.3",
-                "name":        "Mistral 7B Instruct v0.3",
-                "tier":        "safe_free",
-                "rpm":         40,
-                "rpd":         1_000,
-                "tpm":         40_000,
-                "tpd":         40_000_000,
-                "context":     "32K tokens",
-                "type":        "Chat",
-                "recommended": False,
-            },
-            {
-                "id":          "google/gemma-2-9b-it",
-                "name":        "Gemma 2 9B IT",
-                "tier":        "safe_free",
-                "rpm":         40,
-                "rpd":         1_000,
-                "tpm":         40_000,
-                "tpd":         40_000_000,
-                "context":     "8K tokens",
-                "type":        "Chat",
-                "recommended": False,
-            },
-            {
-                "id":          "deepseek-ai/deepseek-r1",
-                "name":        "DeepSeek R1",
-                "tier":        "safe_free",
-                "rpm":         40,
-                "rpd":         1_000,
-                "tpm":         40_000,
-                "tpd":         40_000_000,
-                "context":     "128K tokens",
-                "type":        "Chat",
-                "recommended": True,
-            },
-            {
-                "id":          "microsoft/phi-3-mini-128k-instruct",
-                "name":        "Phi-3 Mini 128K",
-                "tier":        "safe_free",
-                "rpm":         40,
-                "rpd":         1_000,
-                "tpm":         40_000,
-                "tpd":         40_000_000,
-                "context":     "128K tokens",
-                "type":        "Chat",
-                "recommended": False,
-            },
-        ],
-    },
-
-    # ── Groq ─────────────────────────────────────────────────
-    "groq": {
-        "name":       "Groq",
-        "env_keys":   ["GROQ_API_KEY"],
-        "type":       "openai_compat",
-        "base_url":   "https://api.groq.com/openai/v1",
-        "signup_url": "https://console.groq.com",
-        "daily_limit_requests": 14_400,
-        "daily_limit_tokens":   500_000,
-        "models": [
-            {
-                "id":          "llama-3.1-8b-instant",
-                "name":        "Llama 3.1 8B Instant",
-                "tier":        "safe_free",
-                "rpm":         30,
-                "rpd":         14_400,
-                "tpm":         6_000,
-                "tpd":         500_000,
-                "context":     "128K tokens",
-                "type":        "Chat",
-                "recommended": True,
-            },
-            {
-                "id":          "llama-3.3-70b-versatile",
-                "name":        "Llama 3.3 70B Versatile",
-                "tier":        "safe_free",
-                "rpm":         30,
-                "rpd":         14_400,
-                "tpm":         6_000,
-                "tpd":         500_000,
-                "context":     "128K tokens",
-                "type":        "Chat",
-                "recommended": True,
-            },
-            {
-                "id":          "mixtral-8x7b-32768",
-                "name":        "Mixtral 8x7B",
-                "tier":        "safe_free",
-                "rpm":         30,
-                "rpd":         14_400,
-                "tpm":         5_000,
-                "tpd":         500_000,
-                "context":     "32K tokens",
-                "type":        "Chat",
-                "recommended": False,
-            },
-            {
-                "id":          "gemma2-9b-it",
-                "name":        "Gemma2 9B IT",
-                "tier":        "safe_free",
-                "rpm":         30,
-                "rpd":         14_400,
-                "tpm":         15_000,
-                "tpd":         500_000,
-                "context":     "8K tokens",
-                "type":        "Chat",
-                "recommended": False,
-            },
-            {
-                "id":          "deepseek-r1-distill-llama-70b",
-                "name":        "DeepSeek R1 Distill Llama 70B",
-                "tier":        "safe_free",
-                "rpm":         30,
-                "rpd":         14_400,
-                "tpm":         6_000,
-                "tpd":         500_000,
-                "context":     "128K tokens",
-                "type":        "Chat",
-                "recommended": True,
-            },
-        ],
-    },
-
-    # ── HuggingFace ───────────────────────────────────────────
-    "huggingface": {
-        "name":       "Hugging Face",
-        "env_keys":   ["HF_TOKEN", "HUGGINGFACE_API_KEY"],
-        "type":       "huggingface",
-        "base_url":   "https://api-inference.huggingface.co/models",
-        "signup_url": "https://huggingface.co",
-        "daily_limit_requests": 1_000,
-        "daily_limit_tokens":   0,   # HF doesn't expose token limits
-        "models": [
-            {
-                "id":          "mistralai/Mistral-7B-Instruct-v0.3",
-                "name":        "Mistral 7B Instruct v0.3",
-                "tier":        "safe_free",
-                "rpm":         30,
-                "rpd":         1_000,
-                "tpm":         0,
-                "tpd":         0,
-                "context":     "32K tokens",
-                "type":        "Chat",
-                "recommended": True,
-            },
-            {
-                "id":          "HuggingFaceH4/zephyr-7b-beta",
-                "name":        "Zephyr 7B Beta",
-                "tier":        "safe_free",
-                "rpm":         30,
-                "rpd":         1_000,
-                "tpm":         0,
-                "tpd":         0,
-                "context":     "32K tokens",
-                "type":        "Chat",
-                "recommended": False,
-            },
-            {
-                "id":          "google/gemma-2-2b-it",
-                "name":        "Gemma 2 2B IT",
-                "tier":        "safe_free",
-                "rpm":         30,
-                "rpd":         1_000,
-                "tpm":         0,
-                "tpd":         0,
-                "context":     "8K tokens",
-                "type":        "Chat",
-                "recommended": False,
-            },
-            {
-                "id":          "microsoft/Phi-3-mini-4k-instruct",
-                "name":        "Phi-3 Mini 4K",
-                "tier":        "safe_free",
-                "rpm":         30,
-                "rpd":         1_000,
-                "tpm":         0,
-                "tpd":         0,
-                "context":     "4K tokens",
-                "type":        "Chat",
-                "recommended": False,
-            },
-        ],
-    },
-
-    # ── OpenRouter (free tier) ────────────────────────────────
-    "openrouter": {
-        "name":       "OpenRouter",
-        "env_keys":   ["OPENROUTER_API_KEY"],
-        "type":       "openai_compat",
-        "base_url":   "https://openrouter.ai/api/v1",
-        "signup_url": "https://openrouter.ai",
-        "daily_limit_requests": 200,
-        "daily_limit_tokens":   0,
-        "models": [
-            {
-                "id":          "meta-llama/llama-3.1-8b-instruct:free",
-                "name":        "Llama 3.1 8B Instruct",
-                "tier":        "safe_free",
-                "rpm":         20,
-                "rpd":         200,
-                "tpm":         0,
-                "tpd":         0,
-                "context":     "131K tokens",
-                "type":        "Chat",
-                "recommended": True,
-            },
-            {
-                "id":          "google/gemma-2-9b-it:free",
-                "name":        "Gemma 2 9B IT",
-                "tier":        "safe_free",
-                "rpm":         20,
-                "rpd":         200,
-                "tpm":         0,
-                "tpd":         0,
-                "context":     "8K tokens",
-                "type":        "Chat",
-                "recommended": False,
-            },
-            {
-                "id":          "deepseek/deepseek-r1:free",
-                "name":        "DeepSeek R1",
-                "tier":        "safe_free",
-                "rpm":         20,
-                "rpd":         200,
-                "tpm":         0,
-                "tpd":         0,
-                "context":     "64K tokens",
-                "type":        "Chat",
-                "recommended": True,
-            },
-            {
-                "id":          "mistralai/mistral-7b-instruct:free",
-                "name":        "Mistral 7B Instruct",
-                "tier":        "safe_free",
-                "rpm":         20,
-                "rpd":         200,
-                "tpm":         0,
-                "tpd":         0,
-                "context":     "32K tokens",
-                "type":        "Chat",
-                "recommended": False,
-            },
-        ],
-    },
-
-    # ── Mistral AI ────────────────────────────────────────────
-    "mistral": {
-        "name":       "Mistral AI",
-        "env_keys":   ["MISTRAL_API_KEY"],
-        "type":       "openai_compat",
-        "base_url":   "https://api.mistral.ai/v1",
-        "signup_url": "https://console.mistral.ai",
-        "daily_limit_requests": 500,
-        "daily_limit_tokens":   1_000_000,
-        "models": [
-            {
-                "id":          "mistral-small-latest",
-                "name":        "Mistral Small Latest",
-                "tier":        "safe_free",
-                "rpm":         5,
-                "rpd":         500,
-                "tpm":         2_000,
-                "tpd":         1_000_000,
-                "context":     "32K tokens",
-                "type":        "Chat",
-                "recommended": True,
-            },
-            {
-                "id":          "open-mistral-7b",
-                "name":        "Open Mistral 7B",
-                "tier":        "safe_free",
-                "rpm":         5,
-                "rpd":         500,
-                "tpm":         2_000,
-                "tpd":         1_000_000,
-                "context":     "32K tokens",
-                "type":        "Chat",
-                "recommended": False,
-            },
-            {
-                "id":          "open-mixtral-8x7b",
-                "name":        "Open Mixtral 8x7B",
-                "tier":        "safe_free",
-                "rpm":         5,
-                "rpd":         500,
-                "tpm":         2_000,
-                "tpd":         1_000_000,
-                "context":     "32K tokens",
-                "type":        "Chat",
-                "recommended": False,
-            },
-        ],
-    },
+# ============================================================
+# CONFIGURATION - SELECT YOUR AI MODEL
+# ============================================================
+SUPPORTED_MODELS = {
+    "1": {"name": "OpenAI GPT-4", "provider": "openai", "token_limit_per_min": 10000, "token_limit_per_hour": 300000, "token_limit_per_day": 5000000, "request_limit_per_min": 60, "request_limit_per_hour": 3500, "request_limit_per_day": 50000},
+    "2": {"name": "OpenAI GPT-3.5-Turbo", "provider": "openai", "token_limit_per_min": 60000, "token_limit_per_hour": 1800000, "token_limit_per_day": 30000000, "request_limit_per_min": 60, "request_limit_per_hour": 3500, "request_limit_per_day": 50000},
+    "3": {"name": "Anthropic Claude 3", "provider": "anthropic", "token_limit_per_min": 25000, "token_limit_per_hour": 750000, "token_limit_per_day": 12500000, "request_limit_per_min": 50, "request_limit_per_hour": 2000, "request_limit_per_day": 30000},
+    "4": {"name": "Google Gemini Pro", "provider": "google", "token_limit_per_min": 30000, "token_limit_per_hour": 900000, "token_limit_per_day": 15000000, "request_limit_per_min": 60, "request_limit_per_hour": 1500, "request_limit_per_day": 25000},
+    "5": {"name": "Ollama Local", "provider": "ollama", "token_limit_per_min": 100000, "token_limit_per_hour": 6000000, "token_limit_per_day": 100000000, "request_limit_per_min": 120, "request_limit_per_hour": 7200, "request_limit_per_day": 100000},
+    "6": {"name": "Custom / Other", "provider": "custom", "token_limit_per_min": 10000, "token_limit_per_hour": 600000, "token_limit_per_day": 10000000, "request_limit_per_min": 60, "request_limit_per_hour": 3600, "request_limit_per_day": 50000},
 }
 
-# ── AI detection patterns ─────────────────────────────────────
-AI_PATTERNS = {
-    "import_openai":      (r"import\s+openai|from\s+openai",                         "OpenAI"),
-    "import_anthropic":   (r"import\s+anthropic|from\s+anthropic",                   "Anthropic"),
-    "import_gemini":      (r"import\s+google\.generativeai|from\s+google\.generativeai", "Gemini"),
-    "import_langchain":   (r"from\s+langchain|import\s+langchain",                   "LangChain"),
-    "import_litellm":     (r"import\s+litellm|from\s+litellm",                       "LiteLLM"),
-    "import_huggingface": (r"from\s+transformers|import\s+transformers",             "HuggingFace"),
-    "import_groq":        (r"import\s+groq|from\s+groq",                             "Groq"),
-    "import_mistral":     (r"import\s+mistralai|from\s+mistralai",                   "Mistral"),
-    "openai_call":        (r"client\.chat\.completions|ChatOpenAI|OpenAI\(",          "OpenAI"),
-    "anthropic_call":     (r"anthropic\.Anthropic|messages\.create",                 "Anthropic"),
-    "gemini_call":        (r"genai\.configure|GenerativeModel|generate_content",      "Gemini"),
-    "groq_call":          (r"Groq\(|groq\.chat",                                     "Groq"),
-    "nvidia_call":        (r"integrate\.api\.nvidia\.com",                           "NVIDIA"),
-    "openrouter_call":    (r"openrouter\.ai",                                        "OpenRouter"),
-    "env_openai":         (r"OPENAI_API_KEY",                                        "OpenAI"),
-    "env_anthropic":      (r"ANTHROPIC_API_KEY",                                     "Anthropic"),
-    "env_gemini":         (r"GEMINI_API_KEY|GOOGLE_API_KEY",                         "Gemini"),
-    "env_groq":           (r"GROQ_API_KEY",                                          "Groq"),
-    "env_nvidia":         (r"NVIDIA_API_KEY",                                        "NVIDIA"),
-    "env_hf":             (r"HF_TOKEN|HUGGINGFACE_API_KEY",                          "HuggingFace"),
-    "env_mistral":        (r"MISTRAL_API_KEY",                                       "Mistral"),
-    "autogen":            (r"import\s+autogen|from\s+autogen",                       "AutoGen"),
-    "crewai":             (r"import\s+crewai|from\s+crewai",                         "CrewAI"),
-    "llamaindex":         (r"import\s+llama_index|from\s+llama_index",               "LlamaIndex"),
-}
+# ============================================================
+# DATABASE FOR METRICS COLLECTION
+# ============================================================
+class MetricsDB:
+    def __init__(self, db_path="agent_monitor.db"):
+        self.db_path = db_path
+        self.lock = threading.Lock()
+        self._init_db()
 
-SCANNABLE_EXTENSIONS = {
-    ".py", ".js", ".ts", ".jsx", ".tsx",
-    ".json", ".yaml", ".yml", ".env",
-    ".txt", ".md", ".sh", ".toml", ".cfg", ".ini",
-}
+    def _get_conn(self):
+        conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        return conn
 
-SKIP_DIRS = {
-    ".git", "__pycache__", "node_modules", ".venv", "venv",
-    "env", ".env", "dist", "build", ".idea", ".vscode",
-    ".mypy_cache", ".pytest_cache",
-}
+    def _init_db(self):
+        conn = self._get_conn()
+        cursor = conn.cursor()
+        cursor.executescript("""
+            CREATE TABLE IF NOT EXISTS detected_files (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_path TEXT UNIQUE,
+                file_name TEXT,
+                file_type TEXT,
+                purpose TEXT,
+                is_main_file INTEGER DEFAULT 0,
+                is_ai_agent INTEGER DEFAULT 0,
+                is_script INTEGER DEFAULT 0,
+                description TEXT,
+                size_bytes INTEGER,
+                last_modified REAL,
+                scan_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
 
-# ============================================================================
-# DATA MODELS
-# ============================================================================
+            CREATE TABLE IF NOT EXISTS token_usage (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_path TEXT,
+                tokens_used INTEGER,
+                token_type TEXT,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
 
-@dataclass
-class ProjectFile:
-    path:          str
-    name:          str
-    extension:     str
-    size_bytes:    int
-    lines:         int
-    is_ai_agent:   bool
-    ai_providers:  List[str]
-    ai_patterns:   List[str]
-    purpose:       str
-    last_modified: str
+            CREATE TABLE IF NOT EXISTS request_usage (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_path TEXT,
+                request_count INTEGER DEFAULT 1,
+                status_code INTEGER,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
 
-@dataclass
-class QuotaTracker:
-    """
-    Tracks used vs available tokens and requests
-    per provider per model per window (minute / day)
-    """
-    provider:          str
-    model_id:          str
-    # limits from registry
-    rpm_limit:         int   = 0
-    rpd_limit:         int   = 0
-    tpm_limit:         int   = 0
-    tpd_limit:         int   = 0
-    # used this session
-    requests_this_min: int   = 0
-    requests_today:    int   = 0
-    tokens_this_min:   int   = 0
-    tokens_today:      int   = 0
-    # window start times
-    min_window_start:  float = field(default_factory=time.time)
-    day_window_start:  float = field(default_factory=time.time)
+            CREATE TABLE IF NOT EXISTS resource_usage (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_path TEXT,
+                pid INTEGER,
+                cpu_percent REAL,
+                memory_mb REAL,
+                storage_mb REAL,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
 
-    def record(self, tokens: int) -> None:
-        now = time.time()
-        # reset minute window
-        if now - self.min_window_start >= 60:
-            self.requests_this_min = 0
-            self.tokens_this_min   = 0
-            self.min_window_start  = now
-        # reset day window
-        if now - self.day_window_start >= 86_400:
-            self.requests_today  = 0
-            self.tokens_today    = 0
-            self.day_window_start = now
+            CREATE TABLE IF NOT EXISTS scan_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                scan_path TEXT,
+                total_files INTEGER,
+                ai_agents INTEGER,
+                scripts INTEGER,
+                main_files INTEGER,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+        conn.commit()
+        conn.close()
 
-        self.requests_this_min += 1
-        self.requests_today    += 1
-        self.tokens_this_min   += tokens
-        self.tokens_today      += tokens
+    def execute(self, query, params=(), fetch=False):
+        with self.lock:
+            conn = self._get_conn()
+            cursor = conn.cursor()
+            cursor.execute(query, params)
+            if fetch:
+                result = cursor.fetchall()
+                conn.close()
+                return result
+            conn.commit()
+            conn.close()
 
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "provider":            self.provider,
-            "model_id":            self.model_id,
-            # limits
-            "rpm_limit":           self.rpm_limit,
-            "rpd_limit":           self.rpd_limit,
-            "tpm_limit":           self.tpm_limit,
-            "tpd_limit":           self.tpd_limit,
-            # used
-            "requests_this_min":   self.requests_this_min,
-            "requests_today":      self.requests_today,
-            "tokens_this_min":     self.tokens_this_min,
-            "tokens_today":        self.tokens_today,
-            # remaining
-            "rpm_remaining":       max(0, self.rpm_limit - self.requests_this_min),
-            "rpd_remaining":       max(0, self.rpd_limit - self.requests_today),
-            "tpm_remaining":       max(0, self.tpm_limit - self.tokens_this_min)
-                                   if self.tpm_limit else 0,
-            "tpd_remaining":       max(0, self.tpd_limit - self.tokens_today)
-                                   if self.tpd_limit else 0,
-            # percentages
-            "rpm_pct":             round(self.requests_this_min / self.rpm_limit * 100, 1)
-                                   if self.rpm_limit else 0,
-            "rpd_pct":             round(self.requests_today    / self.rpd_limit * 100, 1)
-                                   if self.rpd_limit else 0,
-            "tpm_pct":             round(self.tokens_this_min   / self.tpm_limit * 100, 1)
-                                   if self.tpm_limit else 0,
-            "tpd_pct":             round(self.tokens_today      / self.tpd_limit * 100, 1)
-                                   if self.tpd_limit else 0,
-        }
+    def executemany(self, query, params_list):
+        with self.lock:
+            conn = self._get_conn()
+            cursor = conn.cursor()
+            cursor.executemany(query, params_list)
+            conn.commit()
+            conn.close()
 
-@dataclass
-class AgentMetrics:
-    total_calls:       int   = 0
-    success_calls:     int   = 0
-    failed_calls:      int   = 0
-    total_tokens:      int   = 0
-    prompt_tokens:     int   = 0
-    completion_tokens: int   = 0
-    total_latency_ms:  float = 0.0
-    min_latency_ms:    float = float("inf")
-    max_latency_ms:    float = 0.0
-    rate_limit_hits:   int   = 0
-    auth_failures:     int   = 0
-    last_call_time:    str   = ""
-    last_status:       str   = ""
-    last_error:        str   = ""
+    def clear_files(self):
+        with self.lock:
+            conn = self._get_conn()
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM detected_files")
+            conn.commit()
+            conn.close()
 
-@dataclass
-class Agent:
-    id:             str
-    name:           str
-    provider:       str
-    model:          str
-    file_path:      str
-    file_ext:       str
-    status:         str
-    active:         bool
-    metrics:        AgentMetrics = field(default_factory=AgentMetrics)
-    patterns_found: List[str]    = field(default_factory=list)
-    purpose:        str          = ""
-    source:         str          = ""
-    detected_at:    str          = ""
 
-@dataclass
-class SystemMetrics:
-    cpu_percent:       float = 0.0
-    memory_percent:    float = 0.0
-    memory_used_mb:    float = 0.0
-    memory_total_mb:   float = 0.0
-    disk_percent:      float = 0.0
-    disk_used_gb:      float = 0.0
-    disk_total_gb:     float = 0.0
-    process_memory_mb: float = 0.0
-    uptime_seconds:    float = 0.0
-    thread_count:      int   = 0
-
-@dataclass
-class RequestRecord:
-    request_id:        str
-    agent_name:        str
-    provider:          str
-    model:             str
-    timestamp:         str
-    status:            str
-    prompt_tokens:     int
-    completion_tokens: int
-    total_tokens:      int
-    latency_ms:        float
-    error:             str = ""
-
-# ============================================================================
-# KEY DETECTOR
-# ============================================================================
-
-class KeyDetector:
-
-    @staticmethod
-    def get_key(provider_id: str) -> Optional[str]:
-        cfg = FREE_MODELS_REGISTRY.get(provider_id, {})
-        for env_name in cfg.get("env_keys", []):
-            val = os.environ.get(env_name, "").strip()
-            if val:
-                return val
-        return None
-
-    @staticmethod
-    def get_available_providers() -> Dict[str, Any]:
-        result = {}
-        for pid, cfg in FREE_MODELS_REGISTRY.items():
-            key = None
-            found_env = None
-            for env_name in cfg.get("env_keys", []):
-                val = os.environ.get(env_name, "").strip()
-                if val:
-                    key       = val
-                    found_env = env_name
-                    break
-            result[pid] = {
-                "id":          pid,
-                "name":        cfg["name"],
-                "available":   key is not None,
-                "env_var":     found_env or cfg["env_keys"][0],
-                "signup_url":  cfg.get("signup_url", ""),
-                "models":      cfg["models"],
-                "model_count": len(cfg["models"]),
-                "daily_limit_requests": cfg.get("daily_limit_requests", 0),
-                "daily_limit_tokens":   cfg.get("daily_limit_tokens",   0),
-            }
-        return result
-
-# ============================================================================
-# REAL API CALLER
-# ============================================================================
-
-class RealAPICaller:
-
-    def call(
-        self,
-        provider_id: str,
-        model_id:    str,
-        api_key:     str,
-        prompt:      str = "Reply with just the word OK.",
-    ) -> Dict[str, Any]:
-        cfg = FREE_MODELS_REGISTRY.get(provider_id)
-        if not cfg:
-            return self._err(f"Unknown provider: {provider_id}")
-        if not api_key:
-            return self._err("No API key — add env var or paste key above")
-        try:
-            t = cfg["type"]
-            if t == "gemini":
-                return self._gemini(api_key, model_id, prompt)
-            elif t == "openai_compat":
-                return self._openai_compat(api_key, model_id, prompt,
-                                           cfg.get("base_url"))
-            elif t == "huggingface":
-                return self._huggingface(api_key, model_id, prompt,
-                                         cfg["base_url"])
-            return self._err(f"Unsupported type: {t}")
-        except Exception as e:
-            return self._err(str(e))
-
-    def _gemini(self, key, model, prompt):
-        if not GEMINI_AVAILABLE:
-            return self._err("pip install google-generativeai")
-        t0 = time.time()
-        try:
-            genai.configure(api_key=key)
-            m    = genai.GenerativeModel(model)
-            resp = m.generate_content(prompt)
-            lat  = (time.time() - t0) * 1000
-            u    = getattr(resp, "usage_metadata", None)
-            pt   = getattr(u, "prompt_token_count",     0) if u else 0
-            ct   = getattr(u, "candidates_token_count", 0) if u else 0
-            tt   = getattr(u, "total_token_count", pt+ct)  if u else pt+ct
-            return self._ok(pt, ct, tt, lat,
-                            resp.text[:150] if resp.text else "")
-        except Exception as e:
-            return self._err(str(e), (time.time()-t0)*1000)
-
-    def _openai_compat(self, key, model, prompt, base_url):
-        if not OPENAI_AVAILABLE:
-            return self._err("pip install openai")
-        t0 = time.time()
-        try:
-            kw = {"api_key": key}
-            if base_url:
-                kw["base_url"] = base_url
-            client = OpenAI(**kw)
-            resp   = client.chat.completions.create(
-                model    = model,
-                messages = [{"role": "user", "content": prompt}],
-                max_tokens = 60,
-                timeout    = 30,
-            )
-            lat = (time.time() - t0) * 1000
-            u   = resp.usage
-            pt  = u.prompt_tokens     if u else 0
-            ct  = u.completion_tokens if u else 0
-            tt  = u.total_tokens      if u else 0
-            txt = resp.choices[0].message.content[:150] if resp.choices else ""
-            return self._ok(pt, ct, tt, lat, txt)
-        except Exception as e:
-            lat = (time.time()-t0)*1000
-            es  = str(e)
-            sc  = 429 if "429" in es or "rate" in es.lower() else \
-                  401 if "401" in es or "auth" in es.lower() else \
-                  408 if "timeout" in es.lower() else 500
-            return self._err(es, lat, sc)
-
-    def _huggingface(self, key, model, prompt, base_url):
-        if not REQUESTS_AVAILABLE:
-            return self._err("pip install requests")
-        t0 = time.time()
-        try:
-            import requests as rlib
-            url  = f"{base_url}/{model}"
-            hdrs = {"Authorization": f"Bearer {key}",
-                    "Content-Type":  "application/json"}
-            body = {"inputs": prompt,
-                    "parameters": {"max_new_tokens": 60}}
-            r    = rlib.post(url, headers=hdrs, json=body, timeout=30)
-            lat  = (time.time()-t0)*1000
-            if r.status_code == 200:
-                data = r.json()
-                txt  = ""
-                if isinstance(data, list) and data:
-                    txt = data[0].get("generated_text", "")[:150]
-                pt = len(prompt.split())
-                ct = len(txt.split())
-                return self._ok(pt, ct, pt+ct, lat, txt)
-            return self._err(
-                f"HTTP {r.status_code}: {r.text[:200]}", lat, r.status_code
-            )
-        except Exception as e:
-            return self._err(str(e), (time.time()-t0)*1000)
-
-    @staticmethod
-    def _ok(pt, ct, tt, lat, txt) -> Dict[str, Any]:
-        return {
-            "success":           True,
-            "prompt_tokens":     pt,
-            "completion_tokens": ct,
-            "total_tokens":      tt,
-            "latency_ms":        round(lat, 2),
-            "response_text":     txt,
-            "status_code":       200,
-            "error":             "",
-        }
-
-    @staticmethod
-    def _err(msg, lat=0.0, code=500) -> Dict[str, Any]:
-        return {
-            "success":           False,
-            "prompt_tokens":     0,
-            "completion_tokens": 0,
-            "total_tokens":      0,
-            "latency_ms":        round(lat, 2),
-            "response_text":     "",
-            "status_code":       code,
-            "error":             msg,
-        }
-
-# ============================================================================
+# ============================================================
 # PROJECT SCANNER
-# ============================================================================
-
+# ============================================================
 class ProjectScanner:
-    def __init__(self, root: str = "."):
-        self.root = Path(root).resolve()
+    AI_KEYWORDS = [
+        'openai', 'anthropic', 'langchain', 'llama', 'transformers',
+        'torch', 'tensorflow', 'keras', 'huggingface', 'ollama',
+        'gpt', 'claude', 'gemini', 'agent', 'llm', 'embedding',
+        'vector', 'rag', 'chatbot', 'ai_', 'ml_', 'model',
+        'predict', 'inference', 'neural', 'deep_learning',
+        'crewai', 'autogen', 'swarm', 'prompt', 'completion',
+        'chat_completion', 'api_key', 'OPENAI_API_KEY',
+        'ANTHROPIC_API_KEY', 'langsmith', 'chromadb', 'pinecone',
+        'weaviate', 'faiss', 'sentence_transformers'
+    ]
 
-    def scan(self) -> List[ProjectFile]:
-        results = []
+    SCRIPT_KEYWORDS = [
+        'if __name__', 'argparse', 'click', 'typer', 'subprocess',
+        'os.system', 'schedule', 'cron', 'celery', 'asyncio.run',
+        'main()', 'def main', 'flask', 'fastapi', 'django',
+        'uvicorn', 'gunicorn', 'streamlit', 'gradio'
+    ]
+
+    IGNORE_DIRS = {
+        '__pycache__', '.git', '.svn', 'node_modules', '.venv',
+        'venv', 'env', '.env', '.idea', '.vscode', '.tox',
+        'dist', 'build', '*.egg-info', '.mypy_cache', '.pytest_cache',
+        'site-packages', '.hg', '.bzr'
+    }
+
+    SCAN_EXTENSIONS = {
+        '.py', '.js', '.ts', '.jsx', '.tsx', '.yaml', '.yml',
+        '.json', '.toml', '.cfg', '.ini', '.sh', '.bat', '.ps1',
+        '.r', '.R', '.ipynb', '.dockerfile', '.env'
+    }
+
+    def __init__(self, db: MetricsDB):
+        self.db = db
+        self.detected_files = []
+
+    def scan_project(self, root_path="."):
+        """Scan entire project directory"""
+        root_path = os.path.abspath(root_path)
+        self.db.clear_files()
+        self.detected_files = []
+        all_files = []
+
+        for dirpath, dirnames, filenames in os.walk(root_path):
+            # Filter out ignored directories
+            dirnames[:] = [d for d in dirnames if d not in self.IGNORE_DIRS
+                          and not d.startswith('.')]
+
+            for filename in filenames:
+                filepath = os.path.join(dirpath, filename)
+                ext = Path(filename).suffix.lower()
+
+                if ext in self.SCAN_EXTENSIONS or filename in ('Dockerfile', 'Makefile', 'Procfile'):
+                    file_info = self._analyze_file(filepath, root_path)
+                    if file_info:
+                        all_files.append(file_info)
+
+        # Determine main files
+        self._identify_main_files(all_files)
+
+        # Store in DB
+        for f in all_files:
+            try:
+                self.db.execute("""
+                    INSERT OR REPLACE INTO detected_files 
+                    (file_path, file_name, file_type, purpose, is_main_file, 
+                     is_ai_agent, is_script, description, size_bytes, last_modified)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    f['file_path'], f['file_name'], f['file_type'],
+                    f['purpose'], f['is_main_file'], f['is_ai_agent'],
+                    f['is_script'], f['description'], f['size_bytes'],
+                    f['last_modified']
+                ))
+            except Exception as e:
+                print(f"Error storing file {f['file_name']}: {e}")
+
+        # Record scan history
+        ai_count = sum(1 for f in all_files if f['is_ai_agent'])
+        script_count = sum(1 for f in all_files if f['is_script'])
+        main_count = sum(1 for f in all_files if f['is_main_file'])
+
+        self.db.execute("""
+            INSERT INTO scan_history (scan_path, total_files, ai_agents, scripts, main_files)
+            VALUES (?, ?, ?, ?, ?)
+        """, (root_path, len(all_files), ai_count, script_count, main_count))
+
+        self.detected_files = all_files
+        return all_files
+
+    def _analyze_file(self, filepath, root_path):
+        """Analyze a single file for its purpose and type"""
         try:
-            for fpath in self._walk():
-                pf = self._analyse(fpath)
-                if pf:
-                    results.append(pf)
+            filename = os.path.basename(filepath)
+            rel_path = os.path.relpath(filepath, root_path)
+            stat = os.stat(filepath)
+            ext = Path(filename).suffix.lower()
+
+            # Read file content
+            content = ""
+            try:
+                with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                    content = f.read(50000)  # Read first 50KB
+            except:
+                return None
+
+            content_lower = content.lower()
+
+            # Determine if AI agent
+            ai_score = 0
+            ai_indicators = []
+            for kw in self.AI_KEYWORDS:
+                if kw.lower() in content_lower:
+                    ai_score += 1
+                    ai_indicators.append(kw)
+
+            is_ai_agent = ai_score >= 2
+
+            # Determine if script
+            script_score = 0
+            script_indicators = []
+            for kw in self.SCRIPT_KEYWORDS:
+                if kw.lower() in content_lower:
+                    script_score += 1
+                    script_indicators.append(kw)
+
+            is_script = script_score >= 1
+
+            # Determine purpose
+            purpose = self._determine_purpose(filename, content, ext, ai_indicators, script_indicators)
+
+            # Generate description
+            description = self._generate_description(filename, content, ext, ai_indicators, script_indicators, is_ai_agent, is_script)
+
+            # Determine file type
+            file_type = self._get_file_type(ext, is_ai_agent, is_script)
+
+            return {
+                'file_path': rel_path,
+                'file_name': filename,
+                'file_type': file_type,
+                'purpose': purpose,
+                'is_main_file': 0,
+                'is_ai_agent': 1 if is_ai_agent else 0,
+                'is_script': 1 if is_script else 0,
+                'description': description,
+                'size_bytes': stat.st_size,
+                'last_modified': stat.st_mtime,
+                'ai_indicators': ai_indicators,
+                'script_indicators': script_indicators,
+                'content_preview': content[:500]
+            }
         except Exception as e:
-            print(f"Scan error: {e}")
-        return results
-
-    def _walk(self):
-        for dirpath, dirnames, filenames in os.walk(self.root):
-            dirnames[:] = [
-                d for d in dirnames
-                if d not in SKIP_DIRS and not d.startswith(".")
-            ]
-            for fname in filenames:
-                fpath = Path(dirpath) / fname
-                if fpath.suffix.lower() in SCANNABLE_EXTENSIONS:
-                    yield fpath
-
-    def _analyse(self, fpath: Path) -> Optional[ProjectFile]:
-        try:
-            stat     = fpath.stat()
-            rel_path = str(fpath.relative_to(self.root))
-            providers_found: List[str] = []
-            patterns_found:  List[str] = []
-            lines = 0
-
-            if stat.st_size <= 500_000:
-                try:
-                    content = fpath.read_text(encoding="utf-8", errors="ignore")
-                    lines   = content.count("\n") + 1
-                except Exception:
-                    content = ""
-            else:
-                content = ""
-
-            for pat_name, (regex, provider) in AI_PATTERNS.items():
-                if re.search(regex, content, re.IGNORECASE):
-                    patterns_found.append(pat_name)
-                    if provider not in providers_found:
-                        providers_found.append(provider)
-
-            return ProjectFile(
-                path          = rel_path,
-                name          = fpath.name,
-                extension     = fpath.suffix.lower(),
-                size_bytes    = stat.st_size,
-                lines         = lines,
-                is_ai_agent   = len(providers_found) > 0,
-                ai_providers  = providers_found,
-                ai_patterns   = patterns_found,
-                purpose       = self._purpose(fpath.name, content),
-                last_modified = datetime.fromtimestamp(stat.st_mtime).isoformat(),
-            )
-        except Exception:
             return None
 
-    @staticmethod
-    def _purpose(name: str, content: str) -> str:
-        nl = name.lower()
-        if any(k in nl for k in ["agent", "bot"]):         return "AI Agent"
-        if any(k in nl for k in ["monitor", "track"]):     return "Monitoring"
-        if any(k in nl for k in ["metric", "stat"]):       return "Metrics"
-        if any(k in nl for k in ["config", "setting"]):    return "Configuration"
-        if any(k in nl for k in ["test", "spec"]):         return "Testing"
-        if any(k in nl for k in ["deploy", "ci", "cd"]):   return "Deployment"
-        if any(k in nl for k in ["model", "llm", "ai"]):   return "AI/ML"
-        if any(k in nl for k in ["route", "view", "app"]): return "Application"
-        if any(k in nl for k in ["util", "helper"]):       return "Utility"
-        if "def " in content or "class " in content:       return "Python Module"
+    def _determine_purpose(self, filename, content, ext, ai_indicators, script_indicators):
+        """Determine the purpose of a file"""
+        fname_lower = filename.lower()
+
+        # Config files
+        if fname_lower in ('requirements.txt', 'setup.py', 'setup.cfg', 'pyproject.toml',
+                           'package.json', 'tsconfig.json', 'webpack.config.js'):
+            return "Configuration / Dependencies"
+
+        if fname_lower in ('.env', '.env.example', '.env.local'):
+            return "Environment Variables"
+
+        if fname_lower in ('dockerfile', 'docker-compose.yml', 'docker-compose.yaml'):
+            return "Container Configuration"
+
+        if fname_lower in ('makefile', 'procfile', 'rakefile'):
+            return "Build / Process Management"
+
+        if fname_lower.startswith('test_') or fname_lower.endswith('_test.py') or '/tests/' in filename:
+            return "Testing"
+
+        if 'readme' in fname_lower:
+            return "Documentation"
+
+        # AI specific
+        if ai_indicators:
+            if any(kw in ai_indicators for kw in ['agent', 'crewai', 'autogen', 'swarm']):
+                return "AI Agent Orchestration"
+            if any(kw in ai_indicators for kw in ['embedding', 'vector', 'chromadb', 'pinecone', 'faiss']):
+                return "Vector Store / Embeddings"
+            if any(kw in ai_indicators for kw in ['rag']):
+                return "RAG Pipeline"
+            if any(kw in ai_indicators for kw in ['prompt', 'completion', 'chat_completion']):
+                return "LLM Interaction / Prompting"
+            if any(kw in ai_indicators for kw in ['model', 'predict', 'inference']):
+                return "ML Model / Inference"
+            if any(kw in ai_indicators for kw in ['transformers', 'torch', 'tensorflow', 'keras']):
+                return "Deep Learning / Training"
+            return "AI/ML Component"
+
+        # Script specific
+        if 'flask' in content.lower() or 'fastapi' in content.lower():
+            return "Web API Server"
+        if 'streamlit' in content.lower() or 'gradio' in content.lower():
+            return "UI / Dashboard"
+        if 'schedule' in content.lower() or 'cron' in content.lower():
+            return "Scheduled Task / Automation"
+        if 'celery' in content.lower():
+            return "Task Queue Worker"
+        if 'subprocess' in content.lower() or 'os.system' in content.lower():
+            return "System Automation Script"
+        if 'argparse' in content.lower() or 'click' in content.lower():
+            return "CLI Tool"
+
+        # General
+        if ext == '.py':
+            if 'class ' in content:
+                return "Python Module (Classes)"
+            if 'def ' in content:
+                return "Python Module (Functions)"
+            return "Python Script"
+
+        if ext in ('.js', '.ts', '.jsx', '.tsx'):
+            return "JavaScript/TypeScript Module"
+
+        if ext in ('.yaml', '.yml'):
+            return "YAML Configuration"
+
+        if ext == '.json':
+            return "JSON Data / Configuration"
+
+        if ext in ('.sh', '.bat', '.ps1'):
+            return "Shell Script"
+
+        if ext == '.ipynb':
+            return "Jupyter Notebook"
+
         return "Project File"
 
-# ============================================================================
-# MAIN SCANNER
-# ============================================================================
+    def _generate_description(self, filename, content, ext, ai_indicators, script_indicators, is_ai, is_script):
+        """Generate a human-readable description"""
+        parts = []
 
-class AIAgentScanner:
+        if is_ai:
+            parts.append(f"AI component using: {', '.join(ai_indicators[:5])}")
 
-    def __init__(self):
-        self.agents:          List[Agent]              = []
-        self.project_files:   List[ProjectFile]        = []
-        self.request_history: deque                    = deque(maxlen=200)
-        self.system_metrics:  SystemMetrics            = SystemMetrics()
-        self.quota_trackers:  Dict[str, QuotaTracker]  = {}
-        self.api_caller       = RealAPICaller()
-        self.proj_scanner     = ProjectScanner(".")
-        self.key_detector     = KeyDetector()
-        self._lock            = threading.Lock()
-        self._start_time      = time.time()
-        self._session         = {
-            "prompt_tokens":     0,
-            "completion_tokens": 0,
-            "total_tokens":      0,
-            "total_calls":       0,
-            "success_calls":     0,
-            "failed_calls":      0,
+        if is_script:
+            parts.append(f"Executable script with: {', '.join(script_indicators[:5])}")
+
+        # Extract docstring if Python
+        if ext == '.py':
+            docstring = self._extract_docstring(content)
+            if docstring:
+                parts.append(f"Docstring: {docstring[:200]}")
+
+            # Count functions and classes
+            functions = re.findall(r'^def (\w+)', content, re.MULTILINE)
+            classes = re.findall(r'^class (\w+)', content, re.MULTILINE)
+            if classes:
+                parts.append(f"Classes: {', '.join(classes[:5])}")
+            if functions:
+                parts.append(f"Functions: {', '.join(functions[:8])}")
+
+        # Extract imports
+        imports = re.findall(r'^(?:import|from)\s+(\S+)', content, re.MULTILINE)
+        if imports:
+            unique_imports = list(set(imp.split('.')[0] for imp in imports))[:10]
+            parts.append(f"Imports: {', '.join(unique_imports)}")
+
+        return " | ".join(parts) if parts else "Standard project file"
+
+    def _extract_docstring(self, content):
+        """Extract module-level docstring"""
+        try:
+            tree = ast.parse(content)
+            docstring = ast.get_docstring(tree)
+            return docstring
+        except:
+            # Fallback regex
+            match = re.match(r'^(?:\s*#[^\n]*\n)*\s*(?:\'\'\'|""")(.+?)(?:\'\'\'|""")', content, re.DOTALL)
+            if match:
+                return match.group(1).strip()[:200]
+        return None
+
+    def _get_file_type(self, ext, is_ai, is_script):
+        if is_ai:
+            return "AI Agent"
+        if is_script:
+            return "Script"
+        type_map = {
+            '.py': 'Python', '.js': 'JavaScript', '.ts': 'TypeScript',
+            '.json': 'JSON', '.yaml': 'YAML', '.yml': 'YAML',
+            '.sh': 'Shell', '.bat': 'Batch', '.toml': 'TOML',
+            '.ipynb': 'Notebook', '.jsx': 'React', '.tsx': 'React/TS',
+            '.r': 'R', '.R': 'R', '.cfg': 'Config', '.ini': 'Config'
         }
-        threading.Thread(target=self._metrics_loop, daemon=True).start()
+        return type_map.get(ext, 'Other')
 
-    # ── background system metrics ─────────────────────────────
-    def _metrics_loop(self):
-        while True:
+    def _identify_main_files(self, files):
+        """Identify main entry point files"""
+        main_patterns = [
+            'main.py', 'app.py', 'server.py', 'run.py', 'manage.py',
+            'index.py', 'cli.py', 'wsgi.py', 'asgi.py', '__main__.py',
+            'index.js', 'index.ts', 'server.js', 'app.js',
+            'main.js', 'main.ts'
+        ]
+
+        for f in files:
+            fname = f['file_name'].lower()
+            # Check filename patterns
+            if fname in main_patterns:
+                f['is_main_file'] = 1
+                continue
+
+            # Check for if __name__ == "__main__" pattern
+            if f.get('content_preview', '') and 'if __name__' in f.get('content_preview', ''):
+                content = ''
+                try:
+                    with open(os.path.join('.', f['file_path']), 'r', errors='ignore') as fh:
+                        content = fh.read()
+                except:
+                    content = f.get('content_preview', '')
+
+                if re.search(r'if\s+__name__\s*==\s*[\'"]__main__[\'"]', content):
+                    f['is_main_file'] = 1
+
+
+# ============================================================
+# RESOURCE MONITOR (Self-contained - No Prometheus/Grafana)
+# ============================================================
+class ResourceMonitor:
+    def __init__(self, db: MetricsDB):
+        self.db = db
+        self.monitoring = False
+        self.monitor_thread = None
+        self._process_cache = {}
+
+        # In-memory metrics for fast access
+        self.metrics = {
+            'tokens': defaultdict(lambda: {'per_min': 0, 'per_hour': 0, 'per_day': 0}),
+            'requests': defaultdict(lambda: {'per_min': 0, 'per_hour': 0, 'per_day': 0}),
+            'resources': {},
+            'system': {}
+        }
+
+        # Token/Request tracking timestamps
+        self._token_log = defaultdict(list)  # file -> [(timestamp, count), ...]
+        self._request_log = defaultdict(list)
+
+    def start_monitoring(self):
+        """Start background monitoring thread"""
+        self.monitoring = True
+        self.monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True)
+        self.monitor_thread.start()
+
+    def stop_monitoring(self):
+        self.monitoring = False
+
+    def _monitor_loop(self):
+        """Main monitoring loop - collects metrics every 5 seconds"""
+        while self.monitoring:
             try:
-                vm  = psutil.virtual_memory()
-                du  = psutil.disk_usage("/")
-                p   = psutil.Process(os.getpid())
-                with self._lock:
-                    self.system_metrics = SystemMetrics(
-                        cpu_percent       = psutil.cpu_percent(interval=0.5),
-                        memory_percent    = vm.percent,
-                        memory_used_mb    = round(vm.used  / 1024**2, 2),
-                        memory_total_mb   = round(vm.total / 1024**2, 2),
-                        disk_percent      = du.percent,
-                        disk_used_gb      = round(du.used  / 1024**3, 2),
-                        disk_total_gb     = round(du.total / 1024**3, 2),
-                        process_memory_mb = round(p.memory_info().rss / 1024**2, 2),
-                        uptime_seconds    = round(time.time() - self._start_time, 0),
-                        thread_count      = threading.active_count(),
-                    )
-            except Exception:
-                pass
+                self._collect_system_metrics()
+                self._collect_process_metrics()
+                self._calculate_rate_metrics()
+                self._simulate_token_requests()  # Simulate for demo
+            except Exception as e:
+                print(f"Monitor error: {e}")
             time.sleep(5)
 
-    # ── get or create quota tracker ───────────────────────────
-    def _get_quota(self, provider: str, model_id: str) -> QuotaTracker:
-        key = f"{provider}::{model_id}"
-        if key not in self.quota_trackers:
-            cfg   = FREE_MODELS_REGISTRY.get(provider, {})
-            minfo = next(
-                (m for m in cfg.get("models", []) if m["id"] == model_id),
-                {}
-            )
-            self.quota_trackers[key] = QuotaTracker(
-                provider         = provider,
-                model_id         = model_id,
-                rpm_limit        = minfo.get("rpm", 0),
-                rpd_limit        = minfo.get("rpd", 0),
-                tpm_limit        = minfo.get("tpm", 0),
-                tpd_limit        = minfo.get("tpd", 0),
-                min_window_start = time.time(),
-                day_window_start = time.time(),
-            )
-        return self.quota_trackers[key]
+    def _collect_system_metrics(self):
+        """Collect system-wide metrics"""
+        cpu = psutil.cpu_percent(interval=1)
+        mem = psutil.virtual_memory()
+        disk = psutil.disk_usage('/')
 
-    # ── public: scan project ──────────────────────────────────
-    def scan_project(self) -> Dict[str, Any]:
-        with self._lock:
-            self.project_files = self.proj_scanner.scan()
-            self.agents        = self._build_agents()
-        return {
-            "success":         True,
-            "total_files":     len(self.project_files),
-            "ai_files":        sum(1 for f in self.project_files if f.is_ai_agent),
-            "agents_detected": len(self.agents),
-            "project_files":   [self._file_dict(f) for f in self.project_files],
-            "agents":          [self._agent_dict(a) for a in self.agents],
-            "system_metrics":  self._sys_dict(),
-            "session_stats":   self._session_stats(),
-            "quota_trackers":  {k: v.to_dict()
-                                for k, v in self.quota_trackers.items()},
-            "providers":       self._provider_summary(),
-            "timestamp":       datetime.now().isoformat(),
+        self.metrics['system'] = {
+            'cpu_percent': cpu,
+            'memory_total_gb': round(mem.total / (1024**3), 2),
+            'memory_used_gb': round(mem.used / (1024**3), 2),
+            'memory_percent': mem.percent,
+            'disk_total_gb': round(disk.total / (1024**3), 2),
+            'disk_used_gb': round(disk.used / (1024**3), 2),
+            'disk_percent': round(disk.percent, 1),
+            'timestamp': datetime.datetime.now().isoformat()
         }
 
-    # ── public: test real API ─────────────────────────────────
-    def test_agent(
-        self, provider: str, model: str, api_key: str, prompt: str
-    ) -> Dict[str, Any]:
-        if not api_key:
-            api_key = self.key_detector.get_key(provider) or ""
-
-        result = self.api_caller.call(provider, model, api_key, prompt)
-
-        rec = RequestRecord(
-            request_id        = f"REQ_{int(time.time()*1000)}",
-            agent_name        = f"{provider}/{model}",
-            provider          = provider,
-            model             = model,
-            timestamp         = datetime.now().isoformat(),
-            status            = "success" if result["success"] else "failed",
-            prompt_tokens     = result["prompt_tokens"],
-            completion_tokens = result["completion_tokens"],
-            total_tokens      = result["total_tokens"],
-            latency_ms        = result["latency_ms"],
-            error             = result.get("error", ""),
+    def _collect_process_metrics(self):
+        """Collect per-process metrics for detected AI agents/scripts"""
+        files = self.db.execute(
+            "SELECT file_path, file_name FROM detected_files WHERE is_ai_agent=1 OR is_script=1",
+            fetch=True
         )
 
-        with self._lock:
-            self.request_history.appendleft(rec)
+        for f in files:
+            file_path = f['file_path']
+            file_name = f['file_name']
 
-            # update session totals
-            self._session["total_calls"]       += 1
-            self._session["prompt_tokens"]     += result["prompt_tokens"]
-            self._session["completion_tokens"] += result["completion_tokens"]
-            self._session["total_tokens"]      += result["total_tokens"]
-            if result["success"]:
-                self._session["success_calls"] += 1
-            else:
-                self._session["failed_calls"]  += 1
+            # Find running processes matching this file
+            cpu_total = 0.0
+            mem_total = 0.0
+            storage = 0.0
+            pid = 0
 
-            # update quota tracker (used vs available)
-            qt = self._get_quota(provider, model)
-            qt.record(result["total_tokens"])
+            try:
+                # Check file size for storage
+                if os.path.exists(file_path):
+                    storage = os.path.getsize(file_path) / (1024 * 1024)  # MB
+                elif os.path.exists(os.path.join('.', file_path)):
+                    storage = os.path.getsize(os.path.join('.', file_path)) / (1024 * 1024)
 
-            # update matching agent metrics
-            for agent in self.agents:
-                if agent.provider.lower() in (
-                    provider.lower(), model.lower()
-                ):
-                    self._update_agent(agent, result, rec)
+                # Find matching processes
+                for proc in psutil.process_iter(['pid', 'name', 'cmdline', 'cpu_percent', 'memory_info']):
+                    try:
+                        cmdline = ' '.join(proc.info.get('cmdline') or [])
+                        if file_name in cmdline or file_path in cmdline:
+                            cpu_total += proc.info.get('cpu_percent', 0) or 0
+                            mem_info = proc.info.get('memory_info')
+                            if mem_info:
+                                mem_total += mem_info.rss / (1024 * 1024)  # MB
+                            pid = proc.info['pid']
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        continue
 
-        result["request_record"] = self._req_dict(rec)
-        result["session_stats"]  = self._session_stats()
-        result["quota"]          = self._get_quota(provider, model).to_dict()
-        return result
+            except Exception:
+                pass
 
-    # ── public: dashboard ─────────────────────────────────────
-    def get_dashboard_data(self) -> Dict[str, Any]:
-        with self._lock:
-            return {
-                "system_metrics":  self._sys_dict(),
-                "session_stats":   self._session_stats(),
-                "agents":          [self._agent_dict(a) for a in self.agents],
-                "project_files":   [self._file_dict(f)  for f in self.project_files],
-                "request_history": [self._req_dict(r)
-                                    for r in list(self.request_history)[:50]],
-                "quota_trackers":  {k: v.to_dict()
-                                    for k, v in self.quota_trackers.items()},
-                "providers":       self._provider_summary(),
-                "timestamp":       datetime.now().isoformat(),
+            self.metrics['resources'][file_path] = {
+                'pid': pid,
+                'cpu_percent': round(cpu_total, 2),
+                'memory_mb': round(mem_total, 2),
+                'storage_mb': round(storage, 4),
+                'timestamp': datetime.datetime.now().isoformat()
             }
 
-    # ── public: providers + free models ──────────────────────
-    def get_providers_and_models(self) -> Dict[str, Any]:
-        return {
-            "providers": self.key_detector.get_available_providers(),
-            "timestamp": datetime.now().isoformat(),
-        }
+            # Store in DB
+            self.db.execute("""
+                INSERT INTO resource_usage (file_path, pid, cpu_percent, memory_mb, storage_mb)
+                VALUES (?, ?, ?, ?, ?)
+            """, (file_path, pid, cpu_total, mem_total, storage))
 
-    # ── internal ──────────────────────────────────────────────
-    def _build_agents(self) -> List[Agent]:
-        agents = []
-        seen   = set()
-        for f in self.project_files:
-            if not f.is_ai_agent:
-                continue
-            for provider in f.ai_providers:
-                key = f"{provider}::{f.path}"
-                if key in seen:
-                    continue
-                seen.add(key)
-                aid = hashlib.md5(key.encode()).hexdigest()[:12]
-                agents.append(Agent(
-                    id             = aid,
-                    name           = f.name,
-                    provider       = provider,
-                    model          = self._guess_model(provider),
-                    file_path      = f.path,
-                    file_ext       = f.extension,
-                    status         = "detected",
-                    active         = False,
-                    metrics        = AgentMetrics(),
-                    patterns_found = f.ai_patterns,
-                    purpose        = f.purpose,
-                    source         = "project_scan",
-                    detected_at    = datetime.now().isoformat(),
-                ))
-        return agents
+    def _calculate_rate_metrics(self):
+        """Calculate per-minute, per-hour, per-day rates"""
+        now = time.time()
 
-    @staticmethod
-    def _guess_model(provider: str) -> str:
-        return {
-            "Gemini":      "gemini-2.0-flash",
-            "OpenAI":      "gpt-4o",
-            "Anthropic":   "claude-3-haiku",
-            "Groq":        "llama-3.1-8b-instant",
-            "NVIDIA":      "meta/llama-3.1-8b-instruct",
-            "HuggingFace": "mistralai/Mistral-7B-Instruct-v0.3",
-            "Mistral":     "mistral-small-latest",
-            "OpenRouter":  "meta-llama/llama-3.1-8b-instruct:free",
-            "LangChain":   "multiple",
-            "LiteLLM":     "multiple",
-            "CrewAI":      "multiple",
-        }.get(provider, "unknown")
+        for file_path in list(self._token_log.keys()):
+            entries = self._token_log[file_path]
+            # Clean old entries (older than 24h)
+            entries[:] = [(t, c) for t, c in entries if now - t < 86400]
 
-    @staticmethod
-    def _update_agent(
-        agent: Agent, result: Dict[str, Any], rec: RequestRecord
-    ):
-        m = agent.metrics
-        m.total_calls       += 1
-        m.total_tokens      += result["total_tokens"]
-        m.prompt_tokens     += result["prompt_tokens"]
-        m.completion_tokens += result["completion_tokens"]
-        m.total_latency_ms  += result["latency_ms"]
-        m.last_call_time     = rec.timestamp
-        m.last_status        = rec.status
-        m.last_error         = result.get("error", "")
-        if result["success"]:
-            m.success_calls  += 1
-            m.min_latency_ms  = min(m.min_latency_ms, result["latency_ms"])
-            m.max_latency_ms  = max(m.max_latency_ms, result["latency_ms"])
-            agent.status      = "active"
-            agent.active      = True
-        else:
-            m.failed_calls   += 1
-            sc = result.get("status_code", 500)
-            if sc == 429: m.rate_limit_hits += 1
-            if sc == 401: m.auth_failures   += 1
+            per_min = sum(c for t, c in entries if now - t < 60)
+            per_hour = sum(c for t, c in entries if now - t < 3600)
+            per_day = sum(c for t, c in entries if now - t < 86400)
 
-    def _provider_summary(self) -> Dict[str, Any]:
-        summary: Dict[str, Any] = {}
-        for a in self.agents:
-            p = a.provider
-            if p not in summary:
-                summary[p] = {
-                    "name":           p,
-                    "agent_count":    0,
-                    "active_count":   0,
-                    "total_tokens":   0,
-                    "total_calls":    0,
-                    "success_calls":  0,
-                    "avg_latency_ms": 0.0,
-                    "files":          [],
-                }
-            s = summary[p]
-            m = a.metrics
-            s["agent_count"]  += 1
-            s["active_count"] += int(a.active)
-            s["total_tokens"] += m.total_tokens
-            s["total_calls"]  += m.total_calls
-            s["success_calls"]+= m.success_calls
-            if a.file_path not in s["files"]:
-                s["files"].append(a.file_path)
-            if m.total_calls:
-                s["avg_latency_ms"] = round(
-                    m.total_latency_ms / m.total_calls, 2
+            self.metrics['tokens'][file_path] = {
+                'per_min': per_min,
+                'per_hour': per_hour,
+                'per_day': per_day
+            }
+
+        for file_path in list(self._request_log.keys()):
+            entries = self._request_log[file_path]
+            entries[:] = [(t, c) for t, c in entries if now - t < 86400]
+
+            per_min = sum(c for t, c in entries if now - t < 60)
+            per_hour = sum(c for t, c in entries if now - t < 3600)
+            per_day = sum(c for t, c in entries if now - t < 86400)
+
+            self.metrics['requests'][file_path] = {
+                'per_min': per_min,
+                'per_hour': per_hour,
+                'per_day': per_day
+            }
+
+    def _simulate_token_requests(self):
+        """Simulate token and request usage for detected AI agents (for demo purposes).
+           In production, replace this with actual API call interception."""
+        files = self.db.execute(
+            "SELECT file_path FROM detected_files WHERE is_ai_agent=1",
+            fetch=True
+        )
+        now = time.time()
+        import random
+
+        for f in files:
+            fp = f['file_path']
+            # Simulate occasional API calls
+            if random.random() < 0.3:  # 30% chance every 5 seconds
+                tokens = random.randint(50, 2000)
+                self._token_log[fp].append((now, tokens))
+                self._request_log[fp].append((now, 1))
+
+                self.db.execute(
+                    "INSERT INTO token_usage (file_path, tokens_used, token_type) VALUES (?, ?, ?)",
+                    (fp, tokens, 'total')
                 )
-        return summary
+                self.db.execute(
+                    "INSERT INTO request_usage (file_path, request_count, status_code) VALUES (?, ?, ?)",
+                    (fp, 1, 200)
+                )
 
-    def _session_stats(self) -> Dict[str, Any]:
-        sc  = self._session["total_calls"]
-        ss  = self._session["success_calls"]
-        sf  = self._session["failed_calls"]
-        rpm = sum(
-            1 for r in self.request_history
-            if datetime.fromisoformat(r.timestamp)
-               > datetime.now() - timedelta(minutes=1)
+    def record_tokens(self, file_path, tokens_used):
+        """Manually record token usage"""
+        now = time.time()
+        self._token_log[file_path].append((now, tokens_used))
+        self.db.execute(
+            "INSERT INTO token_usage (file_path, tokens_used, token_type) VALUES (?, ?, ?)",
+            (file_path, tokens_used, 'total')
         )
+
+    def record_request(self, file_path, status_code=200):
+        """Manually record API request"""
+        now = time.time()
+        self._request_log[file_path].append((now, 1))
+        self.db.execute(
+            "INSERT INTO request_usage (file_path, request_count, status_code) VALUES (?, ?, ?)",
+            (file_path, 1, status_code)
+        )
+
+    def get_all_metrics(self):
+        """Get all current metrics"""
+        self._calculate_rate_metrics()
         return {
-            "total_calls":       sc,
-            "success_calls":     ss,
-            "failed_calls":      sf,
-            "success_rate":      round(ss/sc*100, 2) if sc else 0.0,
-            "prompt_tokens":     self._session["prompt_tokens"],
-            "completion_tokens": self._session["completion_tokens"],
-            "total_tokens":      self._session["total_tokens"],
-            "rpm":               rpm,
-            "rph":               rpm * 60,
-            "rpd":               rpm * 60 * 24,
-            "uptime_seconds":    round(time.time() - self._start_time, 0),
+            'system': self.metrics['system'],
+            'tokens': dict(self.metrics['tokens']),
+            'requests': dict(self.metrics['requests']),
+            'resources': self.metrics['resources']
         }
 
-    # ── serialisers ───────────────────────────────────────────
-    def _sys_dict(self) -> Dict[str, Any]:
-        m = self.system_metrics
-        return {
-            "cpu_percent":       m.cpu_percent,
-            "memory_percent":    m.memory_percent,
-            "memory_used_mb":    m.memory_used_mb,
-            "memory_total_mb":   m.memory_total_mb,
-            "disk_percent":      m.disk_percent,
-            "disk_used_gb":      m.disk_used_gb,
-            "disk_total_gb":     m.disk_total_gb,
-            "process_memory_mb": m.process_memory_mb,
-            "uptime_seconds":    m.uptime_seconds,
-            "thread_count":      m.thread_count,
-        }
 
-    @staticmethod
-    def _agent_dict(a: Agent) -> Dict[str, Any]:
-        m   = a.metrics
-        avg = round(m.total_latency_ms/m.total_calls, 2) if m.total_calls else 0.0
-        return {
-            "id":             a.id,
-            "name":           a.name,
-            "provider":       a.provider,
-            "model":          a.model,
-            "file_path":      a.file_path,
-            "file_ext":       a.file_ext,
-            "status":         a.status,
-            "active":         a.active,
-            "purpose":        a.purpose,
-            "patterns_found": a.patterns_found,
-            "detected_at":    a.detected_at,
-            "metrics": {
-                "total_calls":       m.total_calls,
-                "success_calls":     m.success_calls,
-                "failed_calls":      m.failed_calls,
-                "total_tokens":      m.total_tokens,
-                "prompt_tokens":     m.prompt_tokens,
-                "completion_tokens": m.completion_tokens,
-                "avg_latency_ms":    avg,
-                "min_latency_ms":    m.min_latency_ms if m.min_latency_ms != float("inf") else 0,
-                "max_latency_ms":    m.max_latency_ms,
-                "rate_limit_hits":   m.rate_limit_hits,
-                "auth_failures":     m.auth_failures,
-                "last_call_time":    m.last_call_time,
-                "last_status":       m.last_status,
-                "last_error":        m.last_error,
-                "success_rate":      round(m.success_calls/m.total_calls*100, 2) if m.total_calls else 0.0,
-            },
-        }
-
-    @staticmethod
-    def _file_dict(f: ProjectFile) -> Dict[str, Any]:
-        return {
-            "path":          f.path,
-            "name":          f.name,
-            "extension":     f.extension,
-            "size_bytes":    f.size_bytes,
-            "size_kb":       round(f.size_bytes/1024, 2),
-            "lines":         f.lines,
-            "is_ai_agent":   f.is_ai_agent,
-            "ai_providers":  f.ai_providers,
-            "ai_patterns":   f.ai_patterns,
-            "purpose":       f.purpose,
-            "last_modified": f.last_modified,
-        }
-
-    @staticmethod
-    def _req_dict(r: RequestRecord) -> Dict[str, Any]:
-        return {
-            "request_id":        r.request_id,
-            "agent_name":        r.agent_name,
-            "provider":          r.provider,
-            "model":             r.model,
-            "timestamp":         r.timestamp,
-            "status":            r.status,
-            "prompt_tokens":     r.prompt_tokens,
-            "completion_tokens": r.completion_tokens,
-            "total_tokens":      r.total_tokens,
-            "latency_ms":        r.latency_ms,
-            "error":             r.error,
-        }
-
-    def save_report(self) -> bytes:
-        with self._lock:
-            data = {
-                "generated_at":    datetime.now().isoformat(),
-                "session_stats":   self._session_stats(),
-                "system_metrics":  self._sys_dict(),
-                "quota_trackers":  {k: v.to_dict()
-                                    for k, v in self.quota_trackers.items()},
-                "agents":          [self._agent_dict(a) for a in self.agents],
-                "project_files":   [self._file_dict(f)  for f in self.project_files],
-                "request_history": [self._req_dict(r)   for r in self.request_history],
-                "providers":       self._provider_summary(),
-            }
-        return json.dumps(data, indent=2).encode()
-
-
-# ============================================================================
-# FLASK APPLICATION
-# ============================================================================
-
-application = Flask(__name__)
-CORS(application)
-scanner = AIAgentScanner()
-
-# ============================================================================
-# HTML TEMPLATE
-# ============================================================================
-HTML_TEMPLATE = r"""
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>AI Agent Monitor</title>
-<style>
-*{margin:0;padding:0;box-sizing:border-box}
-body{font-family:'Segoe UI',Tahoma,Geneva,Verdana,sans-serif;
-     background:linear-gradient(135deg,#0f0c29,#302b63,#24243e);
-     min-height:100vh;padding:20px;color:#e0e0e0}
-.wrap{max-width:1500px;margin:0 auto}
-
-/* header */
-header{text-align:center;margin-bottom:26px;animation:slideDown .6s ease-out}
-header h1{font-size:2.3em;
-  background:linear-gradient(90deg,#667eea,#f093fb,#4facfe);
-  -webkit-background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:6px}
-header p{opacity:.6;font-size:.9em}
-
-/* provider panel */
-.pp{background:rgba(255,255,255,.05);backdrop-filter:blur(12px);
-    border:1px solid rgba(255,255,255,.1);border-radius:16px;
-    padding:22px;margin-bottom:20px}
-.pp-title{color:#f093fb;font-size:1.1em;font-weight:700;
-          margin-bottom:16px;display:flex;align-items:center;gap:8px}
-
-/* provider cards */
-.prov-cards{display:grid;
-  grid-template-columns:repeat(auto-fill,minmax(200px,1fr));
-  gap:10px;margin-bottom:18px}
-.pc{border-radius:10px;padding:13px;cursor:pointer;
-    border:2px solid transparent;transition:all .22s;position:relative}
-.pc.avail{background:rgba(56,239,125,.07);border-color:rgba(56,239,125,.2)}
-.pc.avail:hover{border-color:#38ef7d;box-shadow:0 0 16px rgba(56,239,125,.2)}
-.pc.avail.sel{border-color:#38ef7d;background:rgba(56,239,125,.14)}
-.pc.locked{background:rgba(255,255,255,.03);
-           border-color:rgba(255,255,255,.07);cursor:default;opacity:.55}
-.pc-name{font-weight:700;font-size:.9em;margin-bottom:3px}
-.pc-info{color:#888;font-size:.72em}
-.pc-badge{position:absolute;top:9px;right:9px;
-          font-size:.65em;padding:2px 7px;border-radius:10px;font-weight:700}
-.bf{background:rgba(56,239,125,.2);color:#38ef7d;border:1px solid rgba(56,239,125,.35)}
-.bl{background:rgba(255,82,82,.12);color:#ff8a80;border:1px solid rgba(255,82,82,.25)}
-.su{display:inline-block;margin-top:5px;font-size:.7em;color:#4facfe;text-decoration:none}
-.su:hover{text-decoration:underline}
-
-/* model row */
-.model-row{display:grid;grid-template-columns:1.2fr 1fr 2fr auto;
-           gap:12px;align-items:end;margin-bottom:14px}
-.fld{display:flex;flex-direction:column;gap:5px}
-.fld label{color:#aaa;font-size:.74em;font-weight:700;text-transform:uppercase}
-select,input[type=text],input[type=password]{
-  width:100%;padding:10px 12px;
-  background:rgba(255,255,255,.08);
-  border:1px solid rgba(255,255,255,.14);
-  border-radius:8px;color:#e0e0e0;font-size:.9em;transition:all .25s}
-select:focus,input:focus{outline:none;border-color:#667eea;
-  background:rgba(102,126,234,.12)}
-select option{background:#1a1a2e;color:#e0e0e0}
-.model-tags{font-size:.68em;color:#888;margin-top:3px}
-.model-tags span{background:rgba(56,239,125,.14);color:#38ef7d;
-                 padding:1px 7px;border-radius:8px;margin-right:4px}
-.model-tags span.caution{background:rgba(255,193,7,.14);color:#ffc107}
-
-/* buttons */
-.btn-row{display:flex;gap:9px;flex-wrap:wrap}
-.btn{padding:10px 18px;border:none;border-radius:8px;font-size:.85em;
-     font-weight:700;cursor:pointer;transition:all .22s;
-     text-transform:uppercase;letter-spacing:.4px}
-.bp{background:linear-gradient(135deg,#667eea,#764ba2);color:#fff}
-.bp:hover{transform:translateY(-2px);box-shadow:0 6px 18px rgba(102,126,234,.4)}
-.bs{background:linear-gradient(135deg,#11998e,#38ef7d);color:#000}
-.bs:hover{transform:translateY(-2px);box-shadow:0 6px 18px rgba(56,239,125,.3)}
-.bi{background:linear-gradient(135deg,#4facfe,#00f2fe);color:#000}
-.bi:hover{transform:translateY(-2px)}
-.bw{background:linear-gradient(135deg,#f7971e,#ffd200);color:#000}
-.bw:hover{transform:translateY(-2px)}
-
-/* messages */
-.msg{padding:11px 15px;border-radius:8px;margin-top:11px;
-     font-weight:500;font-size:.87em}
-.ms{background:rgba(56,239,125,.1);color:#38ef7d;border:1px solid rgba(56,239,125,.25)}
-.me{background:rgba(255,82,82,.1); color:#ff5252;border:1px solid rgba(255,82,82,.25)}
-.mi{background:rgba(79,172,254,.1);color:#4facfe;border:1px solid rgba(79,172,254,.25)}
-
-/* test result */
-.rb{background:rgba(0,0,0,.35);border:1px solid rgba(255,255,255,.1);
-    border-radius:12px;padding:16px;margin-top:14px;display:none}
-.rb-title{color:#f093fb;font-weight:700;margin-bottom:12px;font-size:.92em}
-.rg{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px}
-.ri{background:rgba(255,255,255,.05);border-radius:8px;padding:11px;text-align:center}
-.ri-l{color:#666;font-size:.68em;text-transform:uppercase;margin-bottom:4px}
-.ri-v{font-size:1.1em;font-weight:800;color:#e0e0e0}
-.resp-box{margin-top:11px;background:rgba(255,255,255,.04);border-radius:8px;
-          padding:11px;font-family:monospace;font-size:.8em;color:#999;
-          word-break:break-all}
-
-/* ── QUOTA SECTION ── */
-.quota-section{margin-bottom:20px;display:none}
-.quota-title{color:#f093fb;font-size:1em;font-weight:700;
-             margin-bottom:12px;display:flex;align-items:center;gap:7px}
-.quota-grid{display:grid;
-  grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:14px}
-.quota-card{background:rgba(255,255,255,.05);
-            border:1px solid rgba(255,255,255,.09);border-radius:12px;padding:16px}
-.qc-head{display:flex;justify-content:space-between;
-         align-items:center;margin-bottom:13px}
-.qc-name{font-weight:700;font-size:.9em;color:#f093fb}
-.qc-model{font-size:.72em;color:#777;font-family:monospace}
-.quota-rows{display:flex;flex-direction:column;gap:9px}
-.qrow{display:flex;flex-direction:column;gap:4px}
-.qrow-head{display:flex;justify-content:space-between;font-size:.75em}
-.qrow-label{color:#888}
-.qrow-nums{color:#ccc;font-family:monospace}
-.qrow-nums .used{color:#f093fb;font-weight:700}
-.qrow-nums .avail{color:#38ef7d}
-.qrow-nums .limit{color:#555}
-.qbar{width:100%;height:5px;background:rgba(255,255,255,.07);
-      border-radius:3px;overflow:hidden}
-.qfill{height:100%;border-radius:3px;transition:width .5s ease;
-       background:linear-gradient(90deg,#667eea,#f093fb)}
-.qfill.warn  {background:linear-gradient(90deg,#f7971e,#ffd200)}
-.qfill.danger{background:linear-gradient(90deg,#f44336,#ff5252)}
-
-/* system metrics */
-.sg{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));
-    gap:12px;margin-bottom:20px;display:none}
-.sc{background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.08);
-    border-radius:12px;padding:15px;text-align:center;
-    border-top:3px solid #667eea;
-    animation:fadeIn .5s ease-out forwards;opacity:0}
-.sc:nth-child(2){border-top-color:#f093fb;animation-delay:.08s}
-.sc:nth-child(3){border-top-color:#4facfe;animation-delay:.16s}
-.sc:nth-child(4){border-top-color:#38ef7d;animation-delay:.24s}
-.sc:nth-child(5){border-top-color:#ffd200;animation-delay:.32s}
-.sc:nth-child(6){border-top-color:#ff5252;animation-delay:.40s}
-.sl{color:#777;font-size:.7em;text-transform:uppercase;margin-bottom:6px}
-.sv{font-size:1.7em;font-weight:800;
-    background:linear-gradient(90deg,#667eea,#f093fb);
-    -webkit-background-clip:text;-webkit-text-fill-color:transparent}
-.ss{color:#555;font-size:.7em;margin-top:3px}
-.pb{width:100%;height:5px;background:rgba(255,255,255,.08);
-    border-radius:3px;overflow:hidden;margin-top:6px}
-.pf{height:100%;border-radius:3px;transition:width .5s;
-    background:linear-gradient(90deg,#667eea,#f093fb)}
-.pf.warn  {background:linear-gradient(90deg,#f7971e,#ffd200)}
-.pf.danger{background:linear-gradient(90deg,#f44336,#ff5252)}
-
-/* main section */
-.ms-wrap{background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.07);
-         border-radius:14px;padding:20px;margin-bottom:18px;display:none}
-.tabs{display:flex;gap:5px;margin-bottom:16px;flex-wrap:wrap;
-      border-bottom:1px solid rgba(255,255,255,.07);padding-bottom:7px}
-.tb{background:none;border:none;padding:8px 14px;cursor:pointer;
-    color:#555;font-weight:600;border-radius:7px 7px 0 0;
-    transition:all .22s;font-size:.8em;text-transform:uppercase}
-.tb.active{background:rgba(102,126,234,.18);color:#667eea;
-           border-bottom:2px solid #667eea}
-.tc{display:none}
-.tc.active{display:block;animation:fadeIn .3s ease-out}
-
-/* tables */
-.tbl{width:100%;border-collapse:collapse;font-size:.83em}
-.tbl th{background:rgba(255,255,255,.06);padding:9px 12px;text-align:left;
-        color:#777;font-weight:700;text-transform:uppercase;font-size:.72em;
-        border-bottom:1px solid rgba(255,255,255,.06)}
-.tbl td{padding:9px 12px;border-bottom:1px solid rgba(255,255,255,.04);color:#bbb}
-.tbl tr:hover td{background:rgba(255,255,255,.025)}
-.mono{font-family:monospace;font-size:.8em;color:#777}
-
-/* agent cards */
-.ac{background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.07);
-    border-left:4px solid #667eea;border-radius:10px;
-    padding:17px;margin-bottom:13px;transition:all .22s}
-.ac:hover{transform:translateX(4px);box-shadow:0 4px 18px rgba(102,126,234,.15)}
-.ac.active-a{border-left-color:#38ef7d}
-.ac.error-a {border-left-color:#ff5252}
-.ah{display:grid;grid-template-columns:2fr 1fr 1fr 1fr;gap:13px;margin-bottom:11px}
-.al{color:#555;font-size:.68em;text-transform:uppercase;margin-bottom:3px}
-.av{color:#e0e0e0;font-weight:600;font-size:.88em}
-.am{display:grid;grid-template-columns:repeat(auto-fit,minmax(90px,1fr));gap:8px}
-.mm{background:rgba(255,255,255,.05);border-radius:7px;padding:8px;text-align:center}
-.ml{color:#555;font-size:.66em;text-transform:uppercase;margin-bottom:3px}
-.mv{color:#ddd;font-weight:700;font-size:.95em}
-
-/* file rows */
-.fr{display:grid;grid-template-columns:2.5fr 1fr 1fr 1fr 2fr;
-    gap:9px;align-items:center;padding:8px 11px;
-    border-bottom:1px solid rgba(255,255,255,.04);font-size:.82em}
-.fr:hover{background:rgba(255,255,255,.025)}
-.fh{color:#666;font-size:.7em;text-transform:uppercase;font-weight:700}
-
-/* badges */
-.badge{display:inline-block;padding:3px 9px;border-radius:11px;font-size:.71em;font-weight:700}
-.bok {background:rgba(56,239,125,.15);color:#38ef7d;border:1px solid rgba(56,239,125,.3)}
-.berr{background:rgba(255,82,82,.15); color:#ff5252;border:1px solid rgba(255,82,82,.3)}
-.bwrn{background:rgba(255,193,7,.15); color:#ffc107;border:1px solid rgba(255,193,7,.3)}
-.bgry{background:rgba(200,200,200,.07);color:#888;  border:1px solid rgba(200,200,200,.15)}
-.binf{background:rgba(79,172,254,.15);color:#4facfe;border:1px solid rgba(79,172,254,.3)}
-
-/* req summary bar */
-.rsb{display:flex;gap:18px;flex-wrap:wrap;
-     background:rgba(255,255,255,.04);border-radius:9px;
-     padding:12px 16px;margin-bottom:14px;font-size:.83em;display:none}
-.rsi{display:flex;flex-direction:column;gap:2px}
-.rsl{color:#666;font-size:.7em;text-transform:uppercase}
-.rsv{color:#e0e0e0;font-weight:700;font-size:1.05em}
-
-/* live dot */
-.live{width:7px;height:7px;background:#38ef7d;border-radius:50%;
-      display:inline-block;margin-right:5px;animation:pulse 2s infinite}
-
-/* spinner */
-.spn{width:34px;height:34px;border:3px solid rgba(255,255,255,.08);
-     border-top:3px solid #667eea;border-radius:50%;
-     animation:spin 1s linear infinite;margin:0 auto 12px}
-.ldw{text-align:center;padding:32px;display:none}
-
-@keyframes slideDown{from{opacity:0;transform:translateY(-16px)}to{opacity:1;transform:translateY(0)}}
-@keyframes fadeIn   {from{opacity:0}to{opacity:1}}
-@keyframes spin     {to{transform:rotate(360deg)}}
-@keyframes pulse    {0%,100%{opacity:1}50%{opacity:.3}}
-
-@media(max-width:900px){
-  .model-row{grid-template-columns:1fr 1fr}
-  .ah{grid-template-columns:1fr 1fr}
-  .fr{grid-template-columns:1fr 1fr}
-  .prov-cards{grid-template-columns:repeat(auto-fill,minmax(160px,1fr))}
-}
-@media(max-width:560px){
-  .model-row,.ah,.quota-grid{grid-template-columns:1fr}
-}
-</style>
-</head>
-<body>
-<div class="wrap">
-
-<!-- HEADER -->
-<header>
-  <h1>🤖 AI Agent Monitor</h1>
-  <p><span class="live"></span>Real project scanner · Real API metrics · Free models only · Live quota tracking</p>
-</header>
-
-<!-- ══════════ PROVIDER PANEL ══════════ -->
-<div class="pp">
-  <div class="pp-title">🔌 Select Provider &amp; Free Model</div>
-
-  <div class="prov-cards" id="provCards">
-    <div style="color:#555;padding:16px">Loading providers…</div>
-  </div>
-
-  <div class="model-row">
-    <div class="fld">
-      <label>Free Model</label>
-      <select id="modelSel" onchange="onModelChange()"></select>
-      <div class="model-tags" id="modelTags"></div>
-    </div>
-    <div class="fld">
-      <label>API Key <span style="color:#555;font-size:.85em">(or uses env var)</span></label>
-      <input type="password" id="apiKey" placeholder="Leave blank → auto from env var">
-    </div>
-    <div class="fld">
-      <label>Test Prompt</label>
-      <input type="text" id="prompt" value="Say OK in one word.">
-    </div>
-    <div class="fld">
-      <label>&nbsp;</label>
-      <div class="btn-row">
-        <button class="btn bp" onclick="scanProject()">📁 SCAN</button>
-        <button class="btn bs" onclick="testAgent()">🚀 TEST API</button>
-        <button class="btn bi" onclick="refreshAll()">🔄 REFRESH</button>
-        <button class="btn bw" onclick="downloadReport()">📥 REPORT</button>
-      </div>
-    </div>
-  </div>
-
-  <div id="msgs"></div>
-
-  <!-- test result box -->
-  <div class="rb" id="testResult">
-    <div class="rb-title">⚡ Real API Call Result</div>
-    <div class="rg">
-      <div class="ri"><div class="ri-l">Status</div>            <div class="ri-v" id="r-status">—</div></div>
-      <div class="ri"><div class="ri-l">Latency</div>           <div class="ri-v" id="r-lat">—</div></div>
-      <div class="ri"><div class="ri-l">Prompt Tokens</div>     <div class="ri-v" id="r-pt">—</div></div>
-      <div class="ri"><div class="ri-l">Completion Tokens</div> <div class="ri-v" id="r-ct">—</div></div>
-      <div class="ri"><div class="ri-l">Total Tokens</div>      <div class="ri-v" id="r-tt">—</div></div>
-      <div class="ri"><div class="ri-l">RPM Used / Limit</div>  <div class="ri-v" id="r-rpm">—</div></div>
-      <div class="ri"><div class="ri-l">RPD Used / Limit</div>  <div class="ri-v" id="r-rpd">—</div></div>
-      <div class="ri"><div class="ri-l">TPM Used / Limit</div>  <div class="ri-v" id="r-tpm">—</div></div>
-    </div>
-    <div class="resp-box" id="r-resp"></div>
-  </div>
-</div>
-
-<!-- ══════════ QUOTA TRACKER ══════════ -->
-<div class="quota-section" id="quotaSection">
-  <div class="quota-title">📊 Live Quota — Used vs Available</div>
-  <div class="quota-grid" id="quotaGrid"></div>
-</div>
-
-<!-- loading -->
-<div class="ldw" id="ldw">
-  <div class="spn"></div>
-  <p style="color:#666">Scanning project files…</p>
-</div>
-
-<!-- ══════════ SYSTEM METRICS ══════════ -->
-<div class="sg" id="sysGrid">
-  <div class="sc">
-    <div class="sl">CPU</div>
-    <div class="sv" id="s-cpu">—</div>
-    <div class="pb"><div class="pf" id="b-cpu" style="width:0%"></div></div>
-  </div>
-  <div class="sc">
-    <div class="sl">Memory</div>
-    <div class="sv" id="s-mem">—</div>
-    <div class="ss" id="s-mem-s">—</div>
-    <div class="pb"><div class="pf" id="b-mem" style="width:0%"></div></div>
-  </div>
-  <div class="sc">
-    <div class="sl">Disk</div>
-    <div class="sv" id="s-disk">—</div>
-    <div class="ss" id="s-disk-s">—</div>
-    <div class="pb"><div class="pf" id="b-disk" style="width:0%"></div></div>
-  </div>
-  <div class="sc">
-    <div class="sl">Session Tokens</div>
-    <div class="sv" id="s-tok">0</div>
-    <div class="ss" id="s-tok-s">prompt + completion</div>
-  </div>
-  <div class="sc">
-    <div class="sl">API Calls</div>
-    <div class="sv" id="s-calls">0</div>
-    <div class="ss" id="s-calls-s">success / failed</div>
-  </div>
-  <div class="sc">
-    <div class="sl">Process Mem</div>
-    <div class="sv" id="s-proc">—</div>
-    <div class="ss" id="s-proc-s">this app</div>
-  </div>
-</div>
-
-<!-- ══════════ MAIN CONTENT ══════════ -->
-<div class="ms-wrap" id="mainWrap">
-  <div class="tabs">
-    <button class="tb active" onclick="tab('agents',   this)">🤖 Agents</button>
-    <button class="tb"        onclick="tab('files',    this)">📁 Files</button>
-    <button class="tb"        onclick="tab('requests', this)">📊 Requests</button>
-    <button class="tb"        onclick="tab('providers',this)">🏢 Providers</button>
-  </div>
-
-  <!-- AGENTS -->
-  <div id="agents" class="tc active">
-    <div id="agentsList">
-      <p style="color:#555;text-align:center;padding:28px">Click SCAN to detect AI agents</p>
-    </div>
-  </div>
-
-  <!-- FILES -->
-  <div id="files" class="tc">
-    <div style="display:flex;gap:11px;align-items:center;margin-bottom:13px;flex-wrap:wrap">
-      <input type="text" id="fileSearch" placeholder="Filter files…"
-             oninput="filterFiles()" style="max-width:260px">
-      <label style="color:#888;font-size:.83em;display:flex;align-items:center;gap:5px;cursor:pointer">
-        <input type="checkbox" id="aiOnly" onchange="filterFiles()"> AI files only
-      </label>
-      <span id="fileCount" style="color:#555;font-size:.8em"></span>
-    </div>
-    <div class="fr fh">
-      <div>File Path</div><div>Type</div><div>Lines</div>
-      <div>Size</div><div>AI Providers</div>
-    </div>
-    <div id="filesList"></div>
-  </div>
-
-  <!-- REQUESTS -->
-  <div id="requests" class="tc">
-    <div class="rsb" id="reqSummary">
-      <div class="rsi"><div class="rsl">Total</div>      <div class="rsv" id="rq-tot">0</div></div>
-      <div class="rsi"><div class="rsl">Success</div>    <div class="rsv" id="rq-ok"  style="color:#38ef7d">0</div></div>
-      <div class="rsi"><div class="rsl">Failed</div>     <div class="rsv" id="rq-fail"style="color:#ff5252">0</div></div>
-      <div class="rsi"><div class="rsl">Total Tokens</div><div class="rsv" id="rq-tok">0</div></div>
-      <div class="rsi"><div class="rsl">Prompt Tokens</div><div class="rsv" id="rq-pt">0</div></div>
-      <div class="rsi"><div class="rsl">Complete Tokens</div><div class="rsv" id="rq-ct">0</div></div>
-      <div class="rsi"><div class="rsl">Avg Latency</div><div class="rsv" id="rq-lat">0ms</div></div>
-    </div>
-    <table class="tbl">
-      <thead><tr>
-        <th>Time</th><th>Provider</th><th>Model</th><th>Status</th>
-        <th>Prompt T</th><th>Comp T</th><th>Total T</th>
-        <th>Latency</th><th>Error</th>
-      </tr></thead>
-      <tbody id="reqTable"></tbody>
-    </table>
-  </div>
-
-  <!-- PROVIDERS -->
-  <div id="providers" class="tc">
-    <div id="provList"></div>
-  </div>
-</div>
-
-</div><!-- /wrap -->
-<script>
-// ═══════════════════════════════════════════════
-// STATE
-// ═══════════════════════════════════════════════
-let selProv   = null;
-let allProvs  = {};
-let allFiles  = [];
-
-// ═══════════════════════════════════════════════
-// HELPERS
-// ═══════════════════════════════════════════════
-function fmt(n){
-  if(n==null||n===undefined) return '—';
-  if(n>=1e9) return (n/1e9).toFixed(2)+'B';
-  if(n>=1e6) return (n/1e6).toFixed(2)+'M';
-  if(n>=1e3) return (n/1e3).toFixed(1)+'K';
-  return String(n);
-}
-function esc(t){
-  const d=document.createElement('div');
-  d.textContent=String(t??''); return d.innerHTML;
-}
-function showMsg(msg,type='info'){
-  const el=document.getElementById('msgs');
-  el.innerHTML=`<div class="msg m${type[0]}">${msg}</div>`;
-  if(type!=='error') setTimeout(()=>el.innerHTML='',7000);
-}
-function setBar(id,pct){
-  const el=document.getElementById(id);
-  if(!el) return;
-  el.style.width=Math.min(pct,100)+'%';
-  el.className='pf'+(pct>85?' danger':pct>65?' warn':'');
-}
-function setQBar(el,pct){
-  el.style.width=Math.min(pct,100)+'%';
-  el.className='qfill'+(pct>85?' danger':pct>65?' warn':'');
-}
-
-// ═══════════════════════════════════════════════
-// LOAD PROVIDERS
-// ═══════════════════════════════════════════════
-async function loadProviders(){
-  try{
-    const res  = await fetch('/api/providers/models');
-    const data = await res.json();
-    allProvs   = data.providers;
-    renderProvCards(allProvs);
-    const first = Object.values(allProvs).find(p=>p.available);
-    if(first) selProv_(first.id);
-  }catch(e){
-    document.getElementById('provCards').innerHTML=
-      `<div style="color:#ff5252">Failed: ${e.message}</div>`;
-  }
-}
-
-// ═══════════════════════════════════════════════
-// RENDER PROVIDER CARDS
-// ═══════════════════════════════════════════════
-function renderProvCards(provs){
-  document.getElementById('provCards').innerHTML =
-    Object.values(provs).map(p=>`
-      <div class="pc ${p.available?'avail':'locked'}" id="pc-${p.id}"
-           onclick="${p.available?`selProv_('${p.id}')`:''}" >
-        <span class="pc-badge ${p.available?'bf':'bl'}">
-          ${p.available?'🆓 KEY FOUND':'🔒 NO KEY'}
-        </span>
-        <div class="pc-name">${esc(p.name)}</div>
-        <div class="pc-info">${p.model_count} free models</div>
-        ${p.available
-          ?`<div class="pc-info" style="color:#38ef7d;margin-top:3px">
-              ✅ ${esc(p.env_var)}</div>
-            <div class="pc-info" style="margin-top:2px">
-              ${p.daily_limit_requests?fmt(p.daily_limit_requests)+' req/day':''}
-              ${p.daily_limit_tokens?'· '+fmt(p.daily_limit_tokens)+' tok/day':''}
-            </div>`
-          :`<div class="pc-info" style="margin-top:3px">
-              <code style="color:#f093fb">${esc(p.env_var)}</code>
-              <a class="su" href="${esc(p.signup_url)}" target="_blank">
-                🔗 Get free key</a>
-            </div>`
-        }
-      </div>
-    `).join('');
-}
-
-// ═══════════════════════════════════════════════
-// SELECT PROVIDER → POPULATE FREE MODELS
-// ═══════════════════════════════════════════════
-function selProv_(pid){
-  selProv = pid;
-  document.querySelectorAll('.pc').forEach(c=>c.classList.remove('sel'));
-  const card = document.getElementById(`pc-${pid}`);
-  if(card) card.classList.add('sel');
-
-  const prov  = allProvs[pid];
-  const sel   = document.getElementById('modelSel');
-  sel.innerHTML = (prov?.models||[]).map(m=>`
-    <option value="${esc(m.id)}"
-            data-tier="${m.tier}"
-            data-rpm="${m.rpm}"
-            data-rpd="${m.rpd}"
-            data-tpm="${m.tpm}"
-            data-tpd="${m.tpd}"
-            data-ctx="${esc(m.context)}"
-            data-type="${esc(m.type)}"
-            ${m.recommended?'data-rec="1"':''}>
-      ${m.recommended?'⭐ ':''}${m.tier==='caution'?'⚠️ ':'🆓 '}${esc(m.name)}
-    </option>
-  `).join('');
-  onModelChange();
-}
-
-// ═══════════════════════════════════════════════
-// MODEL CHANGE → SHOW TAGS
-// ═══════════════════════════════════════════════
-function onModelChange(){
-  const sel = document.getElementById('modelSel');
-  const opt = sel.options[sel.selectedIndex];
-  if(!opt) return;
-  const tier = opt.getAttribute('data-tier');
-  const rpm  = opt.getAttribute('data-rpm');
-  const rpd  = opt.getAttribute('data-rpd');
-  const tpm  = opt.getAttribute('data-tpm');
-  const tpd  = opt.getAttribute('data-tpd');
-  const ctx  = opt.getAttribute('data-ctx');
-  const type = opt.getAttribute('data-type');
-  const rec  = opt.getAttribute('data-rec');
-  const caut = tier==='caution';
-  document.getElementById('modelTags').innerHTML =
-    `<span class="${caut?'caution':''}">${caut?'⚠️ Caution':'🆓 Safe Free'}</span>`+
-    (rec?`<span>⭐ Recommended</span>`:'')+
-    (type?`<span>${esc(type)}</span>`:'')+
-    (rpm?`<span>${rpm} RPM limit</span>`:'')+
-    (rpd?`<span>${fmt(parseInt(rpd))} RPD limit</span>`:'')+
-    (tpm&&tpm!='0'?`<span>${fmt(parseInt(tpm))} TPM limit</span>`:'')+
-    (ctx?`<span>${esc(ctx)} context</span>`:'');
-}
-
-// ═══════════════════════════════════════════════
-// SCAN PROJECT
-// ═══════════════════════════════════════════════
-async function scanProject(){
-  document.getElementById('ldw').style.display='block';
-  document.getElementById('mainWrap').style.display='none';
-  try{
-    const res  = await fetch('/api/scan/project',{method:'POST'});
-    const data = await res.json();
-    if(data.success){
-      renderSysMetrics(data.system_metrics, data.session_stats);
-      renderAgents(data.agents);
-      allFiles = data.project_files;
-      renderFiles(allFiles);
-      renderProvSummary(data.providers);
-      if(data.quota_trackers) renderQuota(data.quota_trackers);
-      document.getElementById('sysGrid').style.display='grid';
-      document.getElementById('mainWrap').style.display='block';
-      showMsg(
-        `✅ Scanned <b>${data.total_files}</b> files · `+
-        `<b>${data.ai_files}</b> AI files · `+
-        `<b>${data.agents_detected}</b> agents detected`,
-        'success'
-      );
-    } else {
-      showMsg(data.error||'Scan failed','error');
-    }
-  }catch(e){
-    showMsg('Error: '+e.message,'error');
-  } finally {
-    document.getElementById('ldw').style.display='none';
-  }
-}
-
-// ═══════════════════════════════════════════════
-// TEST AGENT
-// ═══════════════════════════════════════════════
-async function testAgent(){
-  if(!selProv){ showMsg('Select a provider first','error'); return; }
-  const model  = document.getElementById('modelSel').value;
-  const apiKey = document.getElementById('apiKey').value.trim();
-  const prompt = document.getElementById('prompt').value.trim()||'Say OK in one word.';
-  showMsg(`⚡ Calling ${selProv}/${model}…`,'info');
-  document.getElementById('testResult').style.display='none';
-  try{
-    const res  = await fetch('/api/agent/test',{
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({provider:selProv,model,api_key:apiKey,prompt})
-    });
-    const data = await res.json();
-
-    // fill result box
-    const rb = document.getElementById('testResult');
-    rb.style.display='block';
-    document.getElementById('r-status').innerHTML = data.success
-      ?'<span class="badge bok">✅ SUCCESS</span>'
-      :'<span class="badge berr">❌ FAILED</span>';
-    document.getElementById('r-lat').textContent = data.latency_ms+'ms';
-    document.getElementById('r-pt').textContent  = data.prompt_tokens;
-    document.getElementById('r-ct').textContent  = data.completion_tokens;
-    document.getElementById('r-tt').textContent  = data.total_tokens;
-    document.getElementById('r-resp').textContent=
-      data.response_text||data.error||'(no response)';
-
-    // quota cells from returned quota object
-    if(data.quota){
-      const q=data.quota;
-      document.getElementById('r-rpm').textContent=
-        `${q.requests_this_min} / ${q.rpm_limit} (${q.rpm_remaining} left)`;
-      document.getElementById('r-rpd').textContent=
-        `${q.requests_today} / ${q.rpd_limit} (${q.rpd_remaining} left)`;
-      document.getElementById('r-tpm').textContent=
-        q.tpm_limit
-          ?`${fmt(q.tokens_this_min)} / ${fmt(q.tpm_limit)} (${fmt(q.tpm_remaining)} left)`
-          :'N/A';
-      renderQuota({'quota': q});
-    }
-
-    if(data.session_stats) updateSession(data.session_stats);
-    if(data.request_record) prependRow(data.request_record);
-
-    document.getElementById('sysGrid').style.display='grid';
-    document.getElementById('mainWrap').style.display='block';
-    document.getElementById('quotaSection').style.display='block';
-
-    showMsg(
-      data.success
-        ?`✅ ${model}: ${data.total_tokens} tokens · ${data.latency_ms}ms`
-        :`❌ ${model}: ${data.error}`,
-      data.success?'success':'error'
-    );
-  }catch(e){
-    showMsg('Error: '+e.message,'error');
-  }
-}
-
-// ═══════════════════════════════════════════════
-// RENDER QUOTA TRACKERS
-// ═══════════════════════════════════════════════
-function renderQuota(trackers){
-  const qs = document.getElementById('quotaSection');
-  const qg = document.getElementById('quotaGrid');
-
-  const items = Object.values(trackers);
-  if(!items.length){ qs.style.display='none'; return; }
-  qs.style.display='block';
-
-  qg.innerHTML = items.map(q=>`
-    <div class="quota-card">
-      <div class="qc-head">
-        <div class="qc-name">${esc(q.provider)}</div>
-        <div class="qc-model">${esc(q.model_id)}</div>
-      </div>
-      <div class="quota-rows">
-
-        ${q.rpm_limit ? `
-        <div class="qrow">
-          <div class="qrow-head">
-            <span class="qrow-label">Requests / Minute</span>
-            <span class="qrow-nums">
-              <span class="used">${q.requests_this_min}</span>
-              <span class="limit"> / ${q.rpm_limit}</span>
-              &nbsp;·&nbsp;
-              <span class="avail">${q.rpm_remaining} left</span>
-            </span>
-          </div>
-          <div class="qbar">
-            <div class="qfill ${q.rpm_pct>85?'danger':q.rpm_pct>65?'warn':''}"
-                 style="width:${Math.min(q.rpm_pct,100)}%"></div>
-          </div>
-        </div>` : ''}
-
-        ${q.rpd_limit ? `
-        <div class="qrow">
-          <div class="qrow-head">
-            <span class="qrow-label">Requests / Day</span>
-            <span class="qrow-nums">
-              <span class="used">${q.requests_today}</span>
-              <span class="limit"> / ${fmt(q.rpd_limit)}</span>
-              &nbsp;·&nbsp;
-              <span class="avail">${fmt(q.rpd_remaining)} left</span>
-            </span>
-          </div>
-          <div class="qbar">
-            <div class="qfill ${q.rpd_pct>85?'danger':q.rpd_pct>65?'warn':''}"
-                 style="width:${Math.min(q.rpd_pct,100)}%"></div>
-          </div>
-        </div>` : ''}
-
-        ${q.tpm_limit ? `
-        <div class="qrow">
-          <div class="qrow-head">
-            <span class="qrow-label">Tokens / Minute</span>
-            <span class="qrow-nums">
-              <span class="used">${fmt(q.tokens_this_min)}</span>
-              <span class="limit"> / ${fmt(q.tpm_limit)}</span>
-              &nbsp;·&nbsp;
-              <span class="avail">${fmt(q.tpm_remaining)} left</span>
-            </span>
-          </div>
-          <div class="qbar">
-            <div class="qfill ${q.tpm_pct>85?'danger':q.tpm_pct>65?'warn':''}"
-                 style="width:${Math.min(q.tpm_pct,100)}%"></div>
-          </div>
-        </div>` : ''}
-
-        ${q.tpd_limit ? `
-        <div class="qrow">
-          <div class="qrow-head">
-            <span class="qrow-label">Tokens / Day</span>
-            <span class="qrow-nums">
-              <span class="used">${fmt(q.tokens_today)}</span>
-              <span class="limit"> / ${fmt(q.tpd_limit)}</span>
-              &nbsp;·&nbsp;
-              <span class="avail">${fmt(q.tpd_remaining)} left</span>
-            </span>
-          </div>
-          <div class="qbar">
-            <div class="qfill ${q.tpd_pct>85?'danger':q.tpd_pct>65?'warn':''}"
-                 style="width:${Math.min(q.tpd_pct,100)}%"></div>
-          </div>
-        </div>` : ''}
-
-      </div>
-    </div>
-  `).join('');
-}
-
-// ═══════════════════════════════════════════════
-// RENDER SYSTEM METRICS
-// ═══════════════════════════════════════════════
-function renderSysMetrics(sys,sess){
-  document.getElementById('s-cpu').textContent  = sys.cpu_percent+'%';
-  setBar('b-cpu',sys.cpu_percent);
-  document.getElementById('s-mem').textContent  = sys.memory_percent+'%';
-  document.getElementById('s-mem-s').textContent=
-    `${sys.memory_used_mb}MB / ${sys.memory_total_mb}MB`;
-  setBar('b-mem',sys.memory_percent);
-  document.getElementById('s-disk').textContent = sys.disk_percent+'%';
-  document.getElementById('s-disk-s').textContent=
-    `${sys.disk_used_gb}GB / ${sys.disk_total_gb}GB`;
-  setBar('b-disk',sys.disk_percent);
-  document.getElementById('s-proc').textContent = sys.process_memory_mb+'MB';
-  document.getElementById('s-proc-s').textContent=
-    `${sys.thread_count} threads · ${sys.uptime_seconds}s up`;
-  if(sess) updateSession(sess);
-}
-function updateSession(sess){
-  document.getElementById('s-tok').textContent   = fmt(sess.total_tokens);
-  document.getElementById('s-tok-s').textContent =
-    `${sess.prompt_tokens}p + ${sess.completion_tokens}c`;
-  document.getElementById('s-calls').textContent = sess.total_calls;
-  document.getElementById('s-calls-s').textContent=
-    `${sess.success_calls} ok / ${sess.failed_calls} fail`;
-}
-
-// ═══════════════════════════════════════════════
-// RENDER AGENTS
-// ═══════════════════════════════════════════════
-function renderAgents(agents){
-  const el=document.getElementById('agentsList');
-  if(!agents.length){
-    el.innerHTML='<p style="color:#555;text-align:center;padding:28px">No AI agents detected</p>';
-    return;
-  }
-  el.innerHTML=agents.map(a=>{
-    const m=a.metrics;
-    const cls=a.active?'active-a':a.status==='auth_error'?'error-a':'';
-    const badge=a.active
-      ?'<span class="badge bok">🟢 Active</span>'
-      :a.status==='auth_error'
-        ?'<span class="badge berr">🔴 Auth Error</span>'
-        :'<span class="badge bgry">⚪ Detected</span>';
-    return `
-    <div class="ac ${cls}">
-      <div class="ah">
-        <div>
-          <div class="al">Agent File</div>
-          <div style="font-family:monospace;color:#4facfe;font-size:.85em">${esc(a.file_path)}</div>
-          <div style="color:#555;font-size:.72em;margin-top:2px">${esc(a.purpose)}</div>
-          <div style="margin-top:5px">${badge}</div>
-        </div>
-        <div><div class="al">Provider</div><div class="av" style="color:#f093fb">${esc(a.provider)}</div></div>
-        <div><div class="al">Model</div><div class="av">${esc(a.model)}</div></div>
-        <div>
-          <div class="al">Patterns</div>
-          <div class="av">${a.patterns_found.length}</div>
-          <div style="color:#555;font-size:.68em;margin-top:2px">
-            ${a.patterns_found.slice(0,2).map(p=>`<code>${esc(p)}</code>`).join(' ')}
-          </div>
-        </div>
-      </div>
-      <div class="am">
-        <div class="mm"><div class="ml">Calls</div>       <div class="mv">${m.total_calls}</div></div>
-        <div class="mm"><div class="ml">Success</div>     <div class="mv" style="color:#38ef7d">${m.success_calls}</div></div>
-        <div class="mm"><div class="ml">Failed</div>      <div class="mv" style="color:#ff5252">${m.failed_calls}</div></div>
-        <div class="mm"><div class="ml">Success%</div>    <div class="mv">${m.success_rate}%</div></div>
-        <div class="mm"><div class="ml">Prompt T</div>    <div class="mv">${fmt(m.prompt_tokens)}</div></div>
-        <div class="mm"><div class="ml">Complete T</div>  <div class="mv">${fmt(m.completion_tokens)}</div></div>
-        <div class="mm"><div class="ml">Total T</div>     <div class="mv">${fmt(m.total_tokens)}</div></div>
-        <div class="mm"><div class="ml">Avg Lat</div>     <div class="mv">${m.avg_latency_ms}ms</div></div>
-        <div class="mm"><div class="ml">Min Lat</div>     <div class="mv">${m.min_latency_ms}ms</div></div>
-        <div class="mm"><div class="ml">Max Lat</div>     <div class="mv">${m.max_latency_ms}ms</div></div>
-        <div class="mm"><div class="ml">Rate Lim</div>    <div class="mv" style="color:#ffd200">${m.rate_limit_hits}</div></div>
-        <div class="mm"><div class="ml">Auth Fail</div>   <div class="mv" style="color:#ff5252">${m.auth_failures}</div></div>
-      </div>
-      ${m.last_error?`<div style="margin-top:8px;color:#ff5252;font-size:.74em">⚠ ${esc(m.last_error)}</div>`:''}
-    </div>`;
-  }).join('');
-}
-
-// ═══════════════════════════════════════════════
-// RENDER FILES
-// ═══════════════════════════════════════════════
-function renderFiles(files){
-  document.getElementById('fileCount').textContent=`${files.length} files`;
-  document.getElementById('filesList').innerHTML=files.map(f=>`
-    <div class="fr">
-      <div style="font-family:monospace;color:#4facfe;font-size:.8em">${esc(f.path)}</div>
-      <div><span class="badge bgry">${esc(f.extension||'?')}</span></div>
-      <div style="color:#777">${f.lines}</div>
-      <div style="color:#777">${f.size_kb}KB</div>
-      <div>${f.is_ai_agent
-        ?f.ai_providers.map(p=>`<span class="badge bok" style="margin:1px">${esc(p)}</span>`).join('')
-        :'<span style="color:#333">—</span>'}</div>
-    </div>
-  `).join('');
-}
-function filterFiles(){
-  const q=document.getElementById('fileSearch').value.toLowerCase();
-  const ai=document.getElementById('aiOnly').checked;
-  renderFiles(allFiles.filter(f=>(!ai||f.is_ai_agent)&&(!q||f.path.toLowerCase().includes(q))));
-}
-
-// ═══════════════════════════════════════════════
-// RENDER REQUESTS
-// ═══════════════════════════════════════════════
-function renderRequests(reqs){
-  if(!reqs.length) return;
-  const tot=reqs.length;
-  const ok =reqs.filter(r=>r.status==='success').length;
-  const tok=reqs.reduce((s,r)=>s+r.total_tokens,0);
-  const pt =reqs.reduce((s,r)=>s+r.prompt_tokens,0);
-  const ct =reqs.reduce((s,r)=>s+r.completion_tokens,0);
-  const avg=tot?Math.round(reqs.reduce((s,r)=>s+r.latency_ms,0)/tot):0;
-
-  const sb=document.getElementById('reqSummary');
-  sb.style.display='flex';
-  document.getElementById('rq-tot').textContent  = tot;
-  document.getElementById('rq-ok').textContent   = ok;
-  document.getElementById('rq-fail').textContent = tot-ok;
-  document.getElementById('rq-tok').textContent  = fmt(tok);
-  document.getElementById('rq-pt').textContent   = fmt(pt);
-  document.getElementById('rq-ct').textContent   = fmt(ct);
-  document.getElementById('rq-lat').textContent  = avg+'ms';
-
-  document.getElementById('reqTable').innerHTML=reqs.map(r=>`
-    <tr>
-      <td class="mono">${new Date(r.timestamp).toLocaleTimeString()}</td>
-      <td>${esc(r.provider)}</td>
-      <td class="mono" style="font-size:.77em">${esc(r.model)}</td>
-      <td>${r.status==='success'
-        ?'<span class="badge bok">✅</span>'
-        :'<span class="badge berr">❌</span>'}</td>
-      <td>${r.prompt_tokens}</td>
-      <td>${r.completion_tokens}</td>
-      <td><strong>${r.total_tokens}</strong></td>
-      <td>${r.latency_ms}ms</td>
-      <td style="color:#ff5252;font-size:.74em">${esc(r.error||'')}</td>
-    </tr>
-  `).join('');
-}
-
-function prependRow(r){
-  document.getElementById('reqSummary').style.display='flex';
-  const tb=document.getElementById('reqTable');
-  const row=document.createElement('tr');
-  row.innerHTML=`
-    <td class="mono">${new Date(r.timestamp).toLocaleTimeString()}</td>
-    <td>${esc(r.provider)}</td>
-    <td class="mono" style="font-size:.77em">${esc(r.model)}</td>
-    <td>${r.status==='success'
-      ?'<span class="badge bok">✅</span>'
-      :'<span class="badge berr">❌</span>'}</td>
-    <td>${r.prompt_tokens}</td>
-    <td>${r.completion_tokens}</td>
-    <td><strong>${r.total_tokens}</strong></td>
-    <td>${r.latency_ms}ms</td>
-    <td style="color:#ff5252;font-size:.74em">${esc(r.error||'')}</td>`;
-  tb.insertBefore(row,tb.firstChild);
-}
-
-// ═══════════════════════════════════════════════
-// RENDER PROVIDER SUMMARY
-// ═══════════════════════════════════════════════
-function renderProvSummary(provs){
-  const el=document.getElementById('provList');
-  const items=Object.values(provs);
-  if(!items.length){
-    el.innerHTML='<p style="color:#555;text-align:center;padding:28px">Scan or test first</p>';
-    return;
-  }
-  el.innerHTML=items.map(p=>`
-    <div class="ac">
-      <div class="ah">
-        <div>
-          <div style="color:#f093fb;font-weight:700;font-size:1em">${esc(p.name)}</div>
-          <div style="color:#444;font-size:.72em;margin-top:3px">
-            ${(p.files||[]).slice(0,3).map(f=>
-              `<span style="font-family:monospace;color:#4facfe">${esc(f)}</span>`
-            ).join(' · ')}
-          </div>
-        </div>
-        <div>
-          <div class="al">Agents</div>
-          <div style="font-size:1.4em;font-weight:800;color:#667eea">${p.agent_count}</div>
-          <div style="color:#38ef7d;font-size:.76em">${p.active_count} active</div>
-        </div>
-        <div>
-          <div class="al">Total Tokens</div>
-          <div style="font-size:1.2em;font-weight:700;color:#f093fb">${fmt(p.total_tokens)}</div>
-        </div>
-        <div>
-          <div class="al">Calls / Avg Lat</div>
-          <div style="font-weight:700">${fmt(p.total_calls)}</div>
-          <div style="color:#4facfe;font-size:.8em">${p.avg_latency_ms}ms</div>
-        </div>
-      </div>
-    </div>
-  `).join('');
-}
-
-// ═══════════════════════════════════════════════
-// TABS
-// ═══════════════════════════════════════════════
-function tab(name,btn){
-  document.querySelectorAll('.tc').forEach(t=>t.classList.remove('active'));
-  document.querySelectorAll('.tb').forEach(b=>b.classList.remove('active'));
-  document.getElementById(name).classList.add('active');
-  btn.classList.add('active');
-  if(name==='requests') loadReqs();
-  if(name==='providers') loadProvs();
-}
-async function loadReqs(){
-  try{const res=await fetch('/api/requests?limit=50');
-      const d=await res.json();renderRequests(d.requests||[]);}catch(e){}
-}
-async function loadProvs(){
-  try{const res=await fetch('/api/dashboard');
-      const d=await res.json();renderProvSummary(d.providers||{});}catch(e){}
-}
-
-// ═══════════════════════════════════════════════
-// REFRESH ALL
-// ═══════════════════════════════════════════════
-async function refreshAll(){
-  try{
-    const res=await fetch('/api/dashboard');
-    const d=await res.json();
-    renderSysMetrics(d.system_metrics,d.session_stats);
-    if(d.agents.length)      renderAgents(d.agents);
-    if(d.project_files.length){allFiles=d.project_files;renderFiles(allFiles);}
-    renderRequests(d.request_history);
-    renderProvSummary(d.providers);
-    if(d.quota_trackers&&Object.keys(d.quota_trackers).length)
-      renderQuota(d.quota_trackers);
-    document.getElementById('sysGrid').style.display='grid';
-    document.getElementById('mainWrap').style.display='block';
-    showMsg('🔄 Refreshed','success');
-  }catch(e){showMsg('Error: '+e.message,'error');}
-}
-
-// ═══════════════════════════════════════════════
-// DOWNLOAD REPORT
-// ═══════════════════════════════════════════════
-async function downloadReport(){
-  try{
-    const res=await fetch('/api/report/download');
-    const blob=await res.blob();
-    const url=URL.createObjectURL(blob);
-    const a=document.createElement('a');
-    a.href=url;a.download=`agent_report_${Date.now()}.json`;
-    document.body.appendChild(a);a.click();
-    URL.revokeObjectURL(url);document.body.removeChild(a);
-  }catch(e){showMsg('Download error','error');}
-}
-
-// ═══════════════════════════════════════════════
-// AUTO REFRESH EVERY 10s
-// ═══════════════════════════════════════════════
-setInterval(async()=>{
-  try{
-    const res=await fetch('/api/dashboard');
-    const d=await res.json();
-    renderSysMetrics(d.system_metrics,d.session_stats);
-    if(d.quota_trackers&&Object.keys(d.quota_trackers).length)
-      renderQuota(d.quota_trackers);
-  }catch(e){}
-},10000);
-
-// INIT
-loadProviders();
-</script>
-</body>
-</html>
-"""
-
-# ============================================================================
-# ROUTES
-# ============================================================================
-
-@application.get("/")
-def index():
-    return render_template_string(HTML_TEMPLATE)
-
-@application.get("/api/providers/models")
-def api_providers_models():
-    return jsonify(scanner.get_providers_and_models())
-
-@application.post("/api/scan/project")
-def api_scan_project():
-    result = scanner.scan_project()
-    return jsonify(result), 200 if result.get("success") else 400
-
-@application.post("/api/agent/test")
-def api_agent_test():
-    data     = request.get_json() or {}
-    provider = data.get("provider", "gemini")
-    model    = data.get("model",    "gemini-2.0-flash")
-    api_key  = data.get("api_key",  "")
-    prompt   = data.get("prompt",   "Say OK in one word.")
-    result   = scanner.test_agent(provider, model, api_key, prompt)
-    return jsonify(result), 200 if result.get("success") else 400
-
-@application.get("/api/dashboard")
-def api_dashboard():
-    return jsonify(scanner.get_dashboard_data())
-
-@application.get("/api/agents")
-def api_agents():
-    return jsonify({
-        "agents": [scanner._agent_dict(a) for a in scanner.agents],
-        "count":  len(scanner.agents),
-    })
-
-@application.get("/api/requests")
-def api_requests():
-    limit = request.args.get("limit", 50, type=int)
-    reqs  = [scanner._req_dict(r)
-             for r in list(scanner.request_history)[:limit]]
-    return jsonify({"requests": reqs, "count": len(reqs)})
-
-@application.get("/api/providers")
-def api_providers():
-    return jsonify({
-        "providers": scanner._provider_summary(),
-        "available": scanner.key_detector.get_available_providers(),
-    })
-
-@application.get("/api/quota")
-def api_quota():
-    with scanner._lock:
-        return jsonify({
-            "quota_trackers": {
-                k: v.to_dict()
-                for k, v in scanner.quota_trackers.items()
-            },
-            "timestamp": datetime.now().isoformat(),
+# ============================================================
+# WEB DASHBOARD SERVER
+# ============================================================
+class DashboardHandler(BaseHTTPRequestHandler):
+    scanner = None
+    monitor = None
+    db = None
+    model_config = None
+    scan_path = "."
+
+    def log_message(self, format, *args):
+        pass  # Suppress default logging
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        path = parsed.path
+        params = parse_qs(parsed.query)
+
+        if path == '/' or path == '/dashboard':
+            self._serve_dashboard()
+        elif path == '/api/scan':
+            self._api_scan(params)
+        elif path == '/api/files':
+            self._api_files()
+        elif path == '/api/metrics':
+            self._api_metrics()
+        elif path == '/api/reset':
+            self._api_reset()
+        elif path == '/api/model':
+            self._api_model()
+        elif path == '/api/scan-history':
+            self._api_scan_history()
+        else:
+            self.send_error(404)
+
+    def _send_json(self, data):
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.end_headers()
+        self.wfile.write(json.dumps(data, default=str).encode())
+
+    def _api_scan(self, params):
+        scan_path = params.get('path', [DashboardHandler.scan_path])[0]
+        DashboardHandler.scan_path = scan_path
+        files = DashboardHandler.scanner.scan_project(scan_path)
+        self._send_json({
+            'status': 'success',
+            'total_files': len(files),
+            'ai_agents': sum(1 for f in files if f['is_ai_agent']),
+            'scripts': sum(1 for f in files if f['is_script']),
+            'main_files': sum(1 for f in files if f['is_main_file']),
+            'scan_path': os.path.abspath(scan_path)
         })
 
-@application.get("/api/status")
-def api_status():
-    return jsonify({
-        "status":        "running",
-        "agents_count":  len(scanner.agents),
-        "active_agents": sum(1 for a in scanner.agents if a.active),
-        "session_stats": scanner._session_stats(),
-        "timestamp":     datetime.now().isoformat(),
-    })
+    def _api_files(self):
+        files = DashboardHandler.db.execute(
+            "SELECT * FROM detected_files ORDER BY is_ai_agent DESC, is_script DESC, is_main_file DESC, file_name",
+            fetch=True
+        )
+        self._send_json([dict(f) for f in files])
 
-@application.get("/api/report/download")
-def api_report_download():
-    return send_file(
-        io.BytesIO(scanner.save_report()),
-        mimetype="application/json",
-        as_attachment=True,
-        download_name=f"agent_report_{datetime.now():%Y%m%d_%H%M%S}.json",
-    )
+    def _api_metrics(self):
+        metrics = DashboardHandler.monitor.get_all_metrics()
+        metrics['model'] = DashboardHandler.model_config
+        self._send_json(metrics)
 
-@application.get("/health")
-def health():
-    return "Healthy", 200
+    def _api_reset(self):
+        DashboardHandler.db.execute("DELETE FROM detected_files")
+        DashboardHandler.db.execute("DELETE FROM token_usage")
+        DashboardHandler.db.execute("DELETE FROM request_usage")
+        DashboardHandler.db.execute("DELETE FROM resource_usage")
+        DashboardHandler.monitor.metrics = {
+            'tokens': defaultdict(lambda: {'per_min': 0, 'per_hour': 0, 'per_day': 0}),
+            'requests': defaultdict(lambda: {'per_min': 0, 'per_hour': 0, 'per_day': 0}),
+            'resources': {},
+            'system': {}
+        }
+        DashboardHandler.monitor._token_log.clear()
+        DashboardHandler.monitor._request_log.clear()
+        self._send_json({'status': 'reset_complete'})
 
-@application.errorhandler(404)
-def not_found(e):
-    return jsonify({"error": "Not found"}), 404
+    def _api_model(self):
+        self._send_json(DashboardHandler.model_config)
 
-@application.errorhandler(500)
-def server_error(e):
-    return jsonify({"error": "Internal server error"}), 500
+    def _api_scan_history(self):
+        history = DashboardHandler.db.execute(
+            "SELECT * FROM scan_history ORDER BY timestamp DESC LIMIT 20",
+            fetch=True
+        )
+        self._send_json([dict(h) for h in history])
+
+    def _serve_dashboard(self):
+        model_name = DashboardHandler.model_config['name']
+        model_json = json.dumps(DashboardHandler.model_config)
+
+        html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Agent Monitor Dashboard</title>
+    <style>
+        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+        body {{
+            font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+            background: #0a0e17;
+            color: #e0e6f0;
+            min-height: 100vh;
+        }}
+        
+        /* Header */
+        .header {{
+            background: linear-gradient(135deg, #1a1f35 0%, #0d1225 100%);
+            border-bottom: 1px solid #2a3456;
+            padding: 16px 24px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 12px;
+        }}
+        .header h1 {{
+            font-size: 22px;
+            background: linear-gradient(135deg, #60a5fa, #a78bfa);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }}
+        .header h1::before {{ content: "🤖"; -webkit-text-fill-color: initial; }}
+        .model-badge {{
+            background: #1e293b;
+            border: 1px solid #3b82f6;
+            border-radius: 20px;
+            padding: 6px 16px;
+            font-size: 13px;
+            color: #60a5fa;
+        }}
+        .btn-group {{
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+        }}
+        .btn {{
+            padding: 8px 20px;
+            border: none;
+            border-radius: 8px;
+            font-size: 13px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }}
+        .btn:hover {{ transform: translateY(-1px); box-shadow: 0 4px 12px rgba(0,0,0,0.3); }}
+        .btn-scan {{ background: #2563eb; color: white; }}
+        .btn-scan:hover {{ background: #3b82f6; }}
+        .btn-refresh {{ background: #059669; color: white; }}
+        .btn-refresh:hover {{ background: #10b981; }}
+        .btn-reset {{ background: #dc2626; color: white; }}
+        .btn-reset:hover {{ background: #ef4444; }}
+        
+        /* Scan Path Input */
+        .scan-bar {{
+            background: #111827;
+            padding: 12px 24px;
+            border-bottom: 1px solid #1e293b;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }}
+        .scan-bar label {{ font-size: 13px; color: #94a3b8; white-space: nowrap; }}
+        .scan-bar input {{
+            flex: 1;
+            background: #1e293b;
+            border: 1px solid #334155;
+            border-radius: 6px;
+            padding: 8px 14px;
+            color: #e0e6f0;
+            font-size: 13px;
+            font-family: 'Courier New', monospace;
+        }}
+        .scan-bar input:focus {{ outline: none; border-color: #3b82f6; }}
+
+        /* Status Bar */
+        .status-bar {{
+            background: #111827;
+            padding: 8px 24px;
+            border-bottom: 1px solid #1e293b;
+            font-size: 12px;
+            color: #64748b;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }}
+        .status-bar .live {{ color: #22c55e; }}
+
+        /* Main Content */
+        .container {{
+            padding: 20px 24px;
+            max-width: 1800px;
+            margin: 0 auto;
+        }}
+
+        /* Stats Cards */
+        .stats-grid {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 16px;
+            margin-bottom: 24px;
+        }}
+        .stat-card {{
+            background: linear-gradient(135deg, #1a1f35, #151b2e);
+            border: 1px solid #2a3456;
+            border-radius: 12px;
+            padding: 20px;
+            text-align: center;
+        }}
+        .stat-card .stat-value {{
+            font-size: 32px;
+            font-weight: 700;
+            margin: 8px 0;
+        }}
+        .stat-card .stat-label {{
+            font-size: 12px;
+            color: #64748b;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }}
+        .stat-card.blue .stat-value {{ color: #3b82f6; }}
+        .stat-card.green .stat-value {{ color: #22c55e; }}
+        .stat-card.purple .stat-value {{ color: #a78bfa; }}
+        .stat-card.orange .stat-value {{ color: #f59e0b; }}
+        .stat-card.red .stat-value {{ color: #ef4444; }}
+        .stat-card.cyan .stat-value {{ color: #06b6d4; }}
+
+        /* System Resources */
+        .system-grid {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 16px;
+            margin-bottom: 24px;
+        }}
+        .resource-card {{
+            background: #111827;
+            border: 1px solid #1e293b;
+            border-radius: 12px;
+            padding: 20px;
+        }}
+        .resource-card h3 {{
+            font-size: 14px;
+            color: #94a3b8;
+            margin-bottom: 12px;
+        }}
+        .progress-bar {{
+            background: #1e293b;
+            border-radius: 8px;
+            height: 24px;
+            overflow: hidden;
+            margin: 8px 0;
+            position: relative;
+        }}
+        .progress-fill {{
+            height: 100%;
+            border-radius: 8px;
+            transition: width 0.5s ease;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 11px;
+            font-weight: 600;
+            color: white;
+            min-width: 40px;
+        }}
+        .progress-fill.blue {{ background: linear-gradient(90deg, #2563eb, #3b82f6); }}
+        .progress-fill.green {{ background: linear-gradient(90deg, #059669, #10b981); }}
+        .progress-fill.orange {{ background: linear-gradient(90deg, #d97706, #f59e0b); }}
+        .progress-fill.red {{ background: linear-gradient(90deg, #dc2626, #ef4444); }}
+        .resource-details {{
+            display: flex;
+            justify-content: space-between;
+            font-size: 12px;
+            color: #64748b;
+            margin-top: 4px;
+        }}
+
+        /* Section Headers */
+        .section-header {{
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin: 24px 0 12px;
+            padding-bottom: 8px;
+            border-bottom: 1px solid #1e293b;
+        }}
+        .section-header h2 {{
+            font-size: 18px;
+            color: #e0e6f0;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }}
+        .section-header .count {{
+            background: #1e293b;
+            border-radius: 12px;
+            padding: 2px 10px;
+            font-size: 12px;
+            color: #60a5fa;
+        }}
+
+        /* File Tables */
+        .table-container {{
+            background: #111827;
+            border: 1px solid #1e293b;
+            border-radius: 12px;
+            overflow: hidden;
+            margin-bottom: 24px;
+        }}
+        table {{
+            width: 100%;
+            border-collapse: collapse;
+        }}
+        th {{
+            background: #1a1f35;
+            padding: 12px 16px;
+            text-align: left;
+            font-size: 11px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            color: #64748b;
+            font-weight: 600;
+            border-bottom: 1px solid #2a3456;
+            position: sticky;
+            top: 0;
+        }}
+        td {{
+            padding: 10px 16px;
+            border-bottom: 1px solid #1e293b;
+            font-size: 13px;
+            vertical-align: top;
+        }}
+        tr:hover td {{ background: #1a1f35; }}
+        .tag {{
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-size: 11px;
+            font-weight: 600;
+        }}
+        .tag-ai {{ background: #3b82f620; color: #60a5fa; border: 1px solid #3b82f640; }}
+        .tag-script {{ background: #8b5cf620; color: #a78bfa; border: 1px solid #8b5cf640; }}
+        .tag-main {{ background: #22c55e20; color: #4ade80; border: 1px solid #22c55e40; }}
+        .tag-file {{ background: #64748b20; color: #94a3b8; border: 1px solid #64748b40; }}
+        .file-path {{
+            font-family: 'Courier New', monospace;
+            font-size: 12px;
+            color: #94a3b8;
+        }}
+        .purpose-text {{ color: #60a5fa; font-weight: 500; }}
+        .desc-text {{ color: #94a3b8; font-size: 12px; max-width: 400px; }}
+        .size-text {{ color: #64748b; font-size: 12px; font-family: monospace; }}
+
+        /* Token/Request Cards */
+        .usage-grid {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(350px, 1fr));
+            gap: 16px;
+            margin-bottom: 24px;
+        }}
+        .usage-card {{
+            background: #111827;
+            border: 1px solid #1e293b;
+            border-radius: 12px;
+            padding: 20px;
+        }}
+        .usage-card h3 {{
+            font-size: 14px;
+            margin-bottom: 16px;
+            color: #e0e6f0;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }}
+        .usage-row {{
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 8px 0;
+            border-bottom: 1px solid #1e293b;
+        }}
+        .usage-row:last-child {{ border-bottom: none; }}
+        .usage-label {{ font-size: 12px; color: #94a3b8; }}
+        .usage-value {{ font-size: 14px; font-weight: 600; font-family: monospace; }}
+        .usage-limit {{ font-size: 11px; color: #64748b; }}
+        .usage-bar-mini {{
+            width: 100%;
+            height: 6px;
+            background: #1e293b;
+            border-radius: 3px;
+            margin-top: 4px;
+            overflow: hidden;
+        }}
+        .usage-bar-fill {{
+            height: 100%;
+            border-radius: 3px;
+            transition: width 0.3s;
+        }}
+
+        /* Loading overlay */
+        .loading {{
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(10, 14, 23, 0.8);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            z-index: 1000;
+            display: none;
+        }}
+        .loading.active {{ display: flex; }}
+        .spinner {{
+            width: 50px;
+            height: 50px;
+            border: 3px solid #1e293b;
+            border-top-color: #3b82f6;
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+        }}
+        @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
+
+        /* Scrollable table wrapper */
+        .table-scroll {{
+            max-height: 500px;
+            overflow-y: auto;
+        }}
+        .table-scroll::-webkit-scrollbar {{ width: 8px; }}
+        .table-scroll::-webkit-scrollbar-track {{ background: #111827; }}
+        .table-scroll::-webkit-scrollbar-thumb {{ background: #334155; border-radius: 4px; }}
+        .table-scroll::-webkit-scrollbar-thumb:hover {{ background: #475569; }}
+
+        /* Per-agent metrics table */
+        .agent-metrics-table td {{ font-size: 12px; }}
+        .metric-good {{ color: #22c55e; }}
+        .metric-warn {{ color: #f59e0b; }}
+        .metric-danger {{ color: #ef4444; }}
+
+        /* Toast notifications */
+        .toast {{
+            position: fixed;
+            bottom: 24px;
+            right: 24px;
+            background: #1e293b;
+            border: 1px solid #334155;
+            border-radius: 8px;
+            padding: 12px 20px;
+            font-size: 13px;
+            z-index: 2000;
+            transform: translateY(100px);
+            opacity: 0;
+            transition: all 0.3s;
+        }}
+        .toast.show {{ transform: translateY(0); opacity: 1; }}
+        .toast.success {{ border-color: #22c55e; color: #4ade80; }}
+        .toast.error {{ border-color: #ef4444; color: #f87171; }}
+
+        /* Responsive */
+        @media (max-width: 768px) {{
+            .header {{ flex-direction: column; text-align: center; }}
+            .stats-grid {{ grid-template-columns: repeat(2, 1fr); }}
+            .system-grid {{ grid-template-columns: 1fr; }}
+            .usage-grid {{ grid-template-columns: 1fr; }}
+        }}
+    </style>
+</head>
+<body>
+    <!-- Loading Overlay -->
+    <div class="loading" id="loading">
+        <div class="spinner"></div>
+    </div>
+
+    <!-- Toast -->
+    <div class="toast" id="toast"></div>
+
+    <!-- Header -->
+    <div class="header">
+        <h1>AI Agent Monitor</h1>
+        <div class="model-badge">📡 Model: {model_name}</div>
+        <div class="btn-group">
+            <button class="btn btn-scan" onclick="scanProject()">🔍 Scan</button>
+            <button class="btn btn-refresh" onclick="refreshAll()">🔄 Refresh</button>
+            <button class="btn btn-reset" onclick="resetAll()">🗑️ Reset</button>
+        </div>
+    </div>
+
+    <!-- Scan Path -->
+    <div class="scan-bar">
+        <label>📁 Scan Path:</label>
+        <input type="text" id="scanPath" value="." placeholder="Enter project path to scan...">
+    </div>
+
+    <!-- Status Bar -->
+    <div class="status-bar">
+        <span id="statusText">Ready to scan</span>
+        <span class="live" id="liveIndicator">● Live Monitoring</span>
+    </div>
+
+    <!-- Main Content -->
+    <div class="container">
+        <!-- Summary Stats -->
+        <div class="stats-grid" id="statsGrid">
+            <div class="stat-card blue">
+                <div class="stat-label">Total Files</div>
+                <div class="stat-value" id="totalFiles">0</div>
+            </div>
+            <div class="stat-card purple">
+                <div class="stat-label">AI Agents</div>
+                <div class="stat-value" id="aiAgents">0</div>
+            </div>
+            <div class="stat-card green">
+                <div class="stat-label">Scripts</div>
+                <div class="stat-value" id="scripts">0</div>
+            </div>
+            <div class="stat-card orange">
+                <div class="stat-label">Main Files</div>
+                <div class="stat-value" id="mainFiles">0</div>
+            </div>
+            <div class="stat-card cyan">
+                <div class="stat-label">Total Tokens (Day)</div>
+                <div class="stat-value" id="totalTokens">0</div>
+            </div>
+            <div class="stat-card red">
+                <div class="stat-label">Total Requests (Day)</div>
+                <div class="stat-value" id="totalRequests">0</div>
+            </div>
+        </div>
+
+        <!-- System Resources -->
+        <div class="section-header">
+            <h2>💻 System Resources</h2>
+        </div>
+        <div class="system-grid" id="systemGrid">
+            <div class="resource-card">
+                <h3>🔲 CPU Usage</h3>
+                <div class="progress-bar">
+                    <div class="progress-fill blue" id="cpuBar" style="width: 0%">0%</div>
+                </div>
+                <div class="resource-details">
+                    <span id="cpuDetail">Loading...</span>
+                </div>
+            </div>
+            <div class="resource-card">
+                <h3>🧠 Memory Usage</h3>
+                <div class="progress-bar">
+                    <div class="progress-fill green" id="memBar" style="width: 0%">0%</div>
+                </div>
+                <div class="resource-details">
+                    <span id="memDetail">Loading...</span>
+                </div>
+            </div>
+            <div class="resource-card">
+                <h3>💾 Disk Usage</h3>
+                <div class="progress-bar">
+                    <div class="progress-fill orange" id="diskBar" style="width: 0%">0%</div>
+                </div>
+                <div class="resource-details">
+                    <span id="diskDetail">Loading...</span>
+                </div>
+            </div>
+        </div>
+
+        <!-- Detected Files Table -->
+        <div class="section-header">
+            <h2>📂 Detected Files</h2>
+            <span class="count" id="fileCount">0 files</span>
+        </div>
+        <div class="table-container">
+            <div class="table-scroll">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Type</th>
+                            <th>File Name</th>
+                            <th>Path</th>
+                            <th>Purpose</th>
+                            <th>Description</th>
+                            <th>Size</th>
+                            <th>Flags</th>
+                        </tr>
+                    </thead>
+                    <tbody id="filesTable">
+                        <tr><td colspan="7" style="text-align:center; color:#64748b; padding:40px;">Click "Scan" to detect project files</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- AI Agent / Script Detailed Metrics -->
+        <div class="section-header">
+            <h2>🤖 AI Agent & Script Metrics</h2>
+            <span class="count" id="agentCount">0 agents/scripts</span>
+        </div>
+        <div class="table-container">
+            <div class="table-scroll">
+                <table class="agent-metrics-table">
+                    <thead>
+                        <tr>
+                            <th>Script Name</th>
+                            <th>File Name</th>
+                            <th>Purpose</th>
+                            <th>What It Does</th>
+                            <th>Tokens/Min</th>
+                            <th>Tokens/Hour</th>
+                            <th>Tokens/Day</th>
+                            <th>Req/Min</th>
+                            <th>Req/Hour</th>
+                            <th>Req/Day</th>
+                            <th>CPU %</th>
+                            <th>Memory MB</th>
+                            <th>Storage MB</th>
+                        </tr>
+                    </thead>
+                    <tbody id="agentTable">
+                        <tr><td colspan="13" style="text-align:center; color:#64748b; padding:40px;">No agents/scripts detected yet</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- Token & Request Usage Overview -->
+        <div class="section-header">
+            <h2>📊 Token & Request Usage vs Limits</h2>
+        </div>
+        <div class="usage-grid" id="usageGrid">
+            <!-- Token Usage Card -->
+            <div class="usage-card">
+                <h3>🪙 Token Usage</h3>
+                <div class="usage-row">
+                    <div>
+                        <div class="usage-label">Per Minute</div>
+                        <div class="usage-bar-mini"><div class="usage-bar-fill" id="tokenMinBar" style="width:0%; background:#3b82f6;"></div></div>
+                    </div>
+                    <div style="text-align:right">
+                        <div class="usage-value" id="tokenMin">0</div>
+                        <div class="usage-limit" id="tokenMinLimit">/ {DashboardHandler.model_config['token_limit_per_min'] if DashboardHandler.model_config else 0}</div>
+                    </div>
+                </div>
+                <div class="usage-row">
+                    <div>
+                        <div class="usage-label">Per Hour</div>
+                        <div class="usage-bar-mini"><div class="usage-bar-fill" id="tokenHourBar" style="width:0%; background:#8b5cf6;"></div></div>
+                    </div>
+                    <div style="text-align:right">
+                        <div class="usage-value" id="tokenHour">0</div>
+                        <div class="usage-limit" id="tokenHourLimit">/ {DashboardHandler.model_config['token_limit_per_hour'] if DashboardHandler.model_config else 0}</div>
+                    </div>
+                </div>
+                <div class="usage-row">
+                    <div>
+                        <div class="usage-label">Per Day</div>
+                        <div class="usage-bar-mini"><div class="usage-bar-fill" id="tokenDayBar" style="width:0%; background:#06b6d4;"></div></div>
+                    </div>
+                    <div style="text-align:right">
+                        <div class="usage-value" id="tokenDay">0</div>
+                        <div class="usage-limit" id="tokenDayLimit">/ {DashboardHandler.model_config['token_limit_per_day'] if DashboardHandler.model_config else 0}</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Request Usage Card -->
+            <div class="usage-card">
+                <h3>📡 Request Usage</h3>
+                <div class="usage-row">
+                    <div>
+                        <div class="usage-label">Per Minute</div>
+                        <div class="usage-bar-mini"><div class="usage-bar-fill" id="reqMinBar" style="width:0%; background:#22c55e;"></div></div>
+                    </div>
+                    <div style="text-align:right">
+                        <div class="usage-value" id="reqMin">0</div>
+                        <div class="usage-limit" id="reqMinLimit">/ {DashboardHandler.model_config['request_limit_per_min'] if DashboardHandler.model_config else 0}</div>
+                    </div>
+                </div>
+                <div class="usage-row">
+                    <div>
+                        <div class="usage-label">Per Hour</div>
+                        <div class="usage-bar-mini"><div class="usage-bar-fill" id="reqHourBar" style="width:0%; background:#f59e0b;"></div></div>
+                    </div>
+                    <div style="text-align:right">
+                        <div class="usage-value" id="reqHour">0</div>
+                        <div class="usage-limit" id="reqHourLimit">/ {DashboardHandler.model_config['request_limit_per_hour'] if DashboardHandler.model_config else 0}</div>
+                    </div>
+                </div>
+                <div class="usage-row">
+                    <div>
+                        <div class="usage-label">Per Day</div>
+                        <div class="usage-bar-mini"><div class="usage-bar-fill" id="reqDayBar" style="width:0%; background:#ef4444;"></div></div>
+                    </div>
+                    <div style="text-align:right">
+                        <div class="usage-value" id="reqDay">0</div>
+                        <div class="usage-limit" id="reqDayLimit">/ {DashboardHandler.model_config['request_limit_per_day'] if DashboardHandler.model_config else 0}</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const MODEL = {model_json};
+        let allFiles = [];
+        let autoRefreshInterval = null;
+
+        // ---- API Calls ----
+        async function api(endpoint) {{
+            const resp = await fetch(endpoint);
+            return await resp.json();
+        }}
+
+        // ---- Scan Project ----
+        async function scanProject() {{
+            showLoading(true);
+            const path = document.getElementById('scanPath').value || '.';
+            try {{
+                const result = await api('/api/scan?path=' + encodeURIComponent(path));
+                showToast('Scan complete: ' + result.total_files + ' files found', 'success');
+                await refreshAll();
+            }} catch(e) {{
+                showToast('Scan failed: ' + e.message, 'error');
+            }}
+            showLoading(false);
+        }}
+
+        // ---- Refresh All Data ----
+        async function refreshAll() {{
+            try {{
+                await Promise.all([loadFiles(), loadMetrics()]);
+                document.getElementById('statusText').textContent = 
+                    'Last refreshed: ' + new Date().toLocaleTimeString();
+            }} catch(e) {{
+                console.error('Refresh error:', e);
+            }}
+        }}
+
+        // ---- Reset All ----
+        async function resetAll() {{
+            if (!confirm('Reset all data? This clears detected files and metrics.')) return;
+            showLoading(true);
+            try {{
+                await api('/api/reset');
+                allFiles = [];
+                renderFiles([]);
+                renderAgents([], {{}});
+                updateStats(0, 0, 0, 0);
+                showToast('All data reset', 'success');
+            }} catch(e) {{
+                showToast('Reset failed', 'error');
+            }}
+            showLoading(false);
+        }}
+
+        // ---- Load Files ----
+        async function loadFiles() {{
+            const files = await api('/api/files');
+            allFiles = files;
+            renderFiles(files);
+            
+            const aiCount = files.filter(f => f.is_ai_agent).length;
+            const scriptCount = files.filter(f => f.is_script).length;
+            const mainCount = files.filter(f => f.is_main_file).length;
+            updateStats(files.length, aiCount, scriptCount, mainCount);
+        }}
+
+        // ---- Load Metrics ----
+        async function loadMetrics() {{
+            const metrics = await api('/api/metrics');
+            updateSystemResources(metrics.system);
+            updateTokenRequests(metrics);
+            renderAgents(allFiles.filter(f => f.is_ai_agent || f.is_script), metrics);
+        }}
+
+        // ---- Render Files Table ----
+        function renderFiles(files) {{
+            const tbody = document.getElementById('filesTable');
+            document.getElementById('fileCount').textContent = files.length + ' files';
+            
+            if (files.length === 0) {{
+                tbody.innerHTML = '<tr><td colspan="7" style="text-align:center; color:#64748b; padding:40px;">No files detected. Click "Scan" to start.</td></tr>';
+                return;
+            }}
+
+            tbody.innerHTML = files.map(f => {{
+                let typeTag = '<span class="tag tag-file">' + f.file_type + '</span>';
+                if (f.is_ai_agent) typeTag = '<span class="tag tag-ai">🤖 AI Agent</span>';
+                else if (f.is_script) typeTag = '<span class="tag tag-script">⚡ Script</span>';
+                
+                let flags = [];
+                if (f.is_main_file) flags.push('<span class="tag tag-main">★ Main</span>');
+                if (f.is_ai_agent) flags.push('<span class="tag tag-ai">AI</span>');
+                if (f.is_script) flags.push('<span class="tag tag-script">Script</span>');
+                
+                const sizeStr = f.size_bytes > 1024*1024 
+                    ? (f.size_bytes/(1024*1024)).toFixed(1) + ' MB'
+                    : f.size_bytes > 1024 
+                    ? (f.size_bytes/1024).toFixed(1) + ' KB'
+                    : f.size_bytes + ' B';
+
+                const desc = (f.description || '').substring(0, 150);
+
+                return '<tr>' +
+                    '<td>' + typeTag + '</td>' +
+                    '<td><strong>' + f.file_name + '</strong></td>' +
+                    '<td><span class="file-path">' + f.file_path + '</span></td>' +
+                    '<td><span class="purpose-text">' + (f.purpose || '-') + '</span></td>' +
+                    '<td><span class="desc-text">' + desc + '</span></td>' +
+                    '<td><span class="size-text">' + sizeStr + '</span></td>' +
+                    '<td>' + flags.join(' ') + '</td>' +
+                    '</tr>';
+            }}).join('');
+        }}
+
+        // ---- Render Agent Metrics Table ----
+        function renderAgents(agents, metrics) {{
+            const tbody = document.getElementById('agentTable');
+            document.getElementById('agentCount').textContent = agents.length + ' agents/scripts';
+
+            if (agents.length === 0) {{
+                tbody.innerHTML = '<tr><td colspan="13" style="text-align:center; color:#64748b; padding:40px;">No AI agents or scripts detected</td></tr>';
+                return;
+            }}
+
+            tbody.innerHTML = agents.map(a => {{
+                const fp = a.file_path;
+                const tokens = (metrics.tokens && metrics.tokens[fp]) || {{per_min:0, per_hour:0, per_day:0}};
+                const reqs = (metrics.requests && metrics.requests[fp]) || {{per_min:0, per_hour:0, per_day:0}};
+                const res = (metrics.resources && metrics.resources[fp]) || {{cpu_percent:0, memory_mb:0, storage_mb:0}};
+
+                const tMinPct = (tokens.per_min / MODEL.token_limit_per_min * 100);
+                const tHourPct = (tokens.per_hour / MODEL.token_limit_per_hour * 100);
+                const tDayPct = (tokens.per_day / MODEL.token_limit_per_day * 100);
+                const rMinPct = (reqs.per_min / MODEL.request_limit_per_min * 100);
+                const rHourPct = (reqs.per_hour / MODEL.request_limit_per_hour * 100);
+                const rDayPct = (reqs.per_day / MODEL.request_limit_per_day * 100);
+
+                function metricClass(pct) {{
+                    if (pct > 80) return 'metric-danger';
+                    if (pct > 50) return 'metric-warn';
+                    return 'metric-good';
+                }}
+
+                const scriptName = a.file_name.replace(/\\.[^/.]+$/, "");
+                const shortDesc = (a.description || '').substring(0, 100);
+
+                return '<tr>' +
+                    '<td><strong>' + scriptName + '</strong></td>' +
+                    '<td>' + a.file_name + '</td>' +
+                    '<td><span class="purpose-text">' + (a.purpose || '-') + '</span></td>' +
+                    '<td><span class="desc-text">' + shortDesc + '</span></td>' +
+                    '<td class="' + metricClass(tMinPct) + '">' + tokens.per_min.toLocaleString() + ' <small>/' + MODEL.token_limit_per_min.toLocaleString() + '</small></td>' +
+                    '<td class="' + metricClass(tHourPct) + '">' + tokens.per_hour.toLocaleString() + ' <small>/' + MODEL.token_limit_per_hour.toLocaleString() + '</small></td>' +
+                    '<td class="' + metricClass(tDayPct) + '">' + tokens.per_day.toLocaleString() + ' <small>/' + MODEL.token_limit_per_day.toLocaleString() + '</small></td>' +
+                    '<td class="' + metricClass(rMinPct) + '">' + reqs.per_min + ' <small>/' + MODEL.request_limit_per_min + '</small></td>' +
+                    '<td class="' + metricClass(rHourPct) + '">' + reqs.per_hour + ' <small>/' + MODEL.request_limit_per_hour + '</small></td>' +
+                    '<td class="' + metricClass(rDayPct) + '">' + reqs.per_day + ' <small>/' + MODEL.request_limit_per_day + '</small></td>' +
+                    '<td>' + res.cpu_percent.toFixed(1) + '%</td>' +
+                    '<td>' + res.memory_mb.toFixed(1) + '</td>' +
+                    '<td>' + res.storage_mb.toFixed(3) + '</td>' +
+                    '</tr>';
+            }}).join('');
+        }}
+
+        // ---- Update Stats Cards ----
+        function updateStats(total, ai, scripts, main) {{
+            document.getElementById('totalFiles').textContent = total;
+            document.getElementById('aiAgents').textContent = ai;
+            document.getElementById('scripts').textContent = scripts;
+            document.getElementById('mainFiles').textContent = main;
+        }}
+
+        // ---- Update System Resources ----
+        function updateSystemResources(sys) {{
+            if (!sys || !sys.cpu_percent) return;
+
+            const cpuPct = sys.cpu_percent;
+            const memPct = sys.memory_percent;
+            const diskPct = sys.disk_percent;
+
+            setProgress('cpuBar', cpuPct);
+            setProgress('memBar', memPct);
+            setProgress('diskBar', diskPct);
+
+            document.getElementById('cpuDetail').textContent = cpuPct.toFixed(1) + '% utilized';
+            document.getElementById('memDetail').textContent = 
+                sys.memory_used_gb + ' GB / ' + sys.memory_total_gb + ' GB (' + memPct.toFixed(1) + '%)';
+            document.getElementById('diskDetail').textContent = 
+                sys.disk_used_gb + ' GB / ' + sys.disk_total_gb + ' GB (' + diskPct + '%)';
+        }}
+
+        function setProgress(id, pct) {{
+            const el = document.getElementById(id);
+            const val = Math.min(Math.max(pct, 0), 100);
+            el.style.width = val + '%';
+            el.textContent = val.toFixed(1) + '%';
+            
+            // Change color based on value
+            el.className = 'progress-fill';
+            if (val > 80) el.classList.add('red');
+            else if (val > 60) el.classList.add('orange');
+            else if (val > 40) el.classList.add('blue');
+            else el.classList.add('green');
+        }}
+
+        // ---- Update Token/Request Usage ----
+        function updateTokenRequests(metrics) {{
+            let totalTokenMin = 0, totalTokenHour = 0, totalTokenDay = 0;
+            let totalReqMin = 0, totalReqHour = 0, totalReqDay = 0;
+
+            if (metrics.tokens) {{
+                Object.values(metrics.tokens).forEach(t => {{
+                    totalTokenMin += t.per_min || 0;
+                    totalTokenHour += t.per_hour || 0;
+                    totalTokenDay += t.per_day || 0;
+                }});
+            }}
+            if (metrics.requests) {{
+                Object.values(metrics.requests).forEach(r => {{
+                    totalReqMin += r.per_min || 0;
+                    totalReqHour += r.per_hour || 0;
+                    totalReqDay += r.per_day || 0;
+                }});
+            }}
+
+            document.getElementById('totalTokens').textContent = totalTokenDay.toLocaleString();
+            document.getElementById('totalRequests').textContent = totalReqDay.toLocaleString();
+
+            // Token bars
+            setUsageBar('tokenMin', 'tokenMinBar', totalTokenMin, MODEL.token_limit_per_min);
+            setUsageBar('tokenHour', 'tokenHourBar', totalTokenHour, MODEL.token_limit_per_hour);
+            setUsageBar('tokenDay', 'tokenDayBar', totalTokenDay, MODEL.token_limit_per_day);
+
+            // Request bars
+            setUsageBar('reqMin', 'reqMinBar', totalReqMin, MODEL.request_limit_per_min);
+            setUsageBar('reqHour', 'reqHourBar', totalReqHour, MODEL.request_limit_per_hour);
+            setUsageBar('reqDay', 'reqDayBar', totalReqDay, MODEL.request_limit_per_day);
+        }}
+
+        function setUsageBar(valueId, barId, used, limit) {{
+            document.getElementById(valueId).textContent = used.toLocaleString();
+            const pct = limit > 0 ? Math.min((used / limit) * 100, 100) : 0;
+            const bar = document.getElementById(barId);
+            bar.style.width = pct + '%';
+            if (pct > 80) bar.style.background = '#ef4444';
+            else if (pct > 50) bar.style.background = '#f59e0b';
+        }}
+
+        // ---- Helpers ----
+        function showLoading(show) {{
+            document.getElementById('loading').classList.toggle('active', show);
+        }}
+
+        function showToast(msg, type) {{
+            const toast = document.getElementById('toast');
+            toast.textContent = msg;
+            toast.className = 'toast ' + type + ' show';
+            setTimeout(() => toast.classList.remove('show'), 3000);
+        }}
+
+        // ---- Auto-refresh every 5 seconds ----
+        function startAutoRefresh() {{
+            autoRefreshInterval = setInterval(async () => {{
+                try {{ await loadMetrics(); }} catch(e) {{}}
+            }}, 5000);
+        }}
+
+        // ---- Init ----
+        window.addEventListener('load', () => {{
+            startAutoRefresh();
+            // Blink live indicator
+            setInterval(() => {{
+                const el = document.getElementById('liveIndicator');
+                el.style.opacity = el.style.opacity === '0.3' ? '1' : '0.3';
+            }}, 1000);
+        }});
+
+        // Enter key triggers scan
+        document.addEventListener('DOMContentLoaded', () => {{
+            document.getElementById('scanPath').addEventListener('keypress', (e) => {{
+                if (e.key === 'Enter') scanProject();
+            }});
+        }});
+    </script>
+</body>
+</html>"""
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/html')
+        self.end_headers()
+        self.wfile.write(html.encode('utf-8'))
+
+
+# ============================================================
+# MAIN - MODEL SELECTION & SERVER START
+# ============================================================
+def select_model():
+    """Interactive model selection at startup"""
+    print("\n" + "=" * 60)
+    print("🤖 AI Agent & Script Monitor Dashboard")
+    print("=" * 60)
+    print("\nSelect which AI model you are using:\n")
+
+    for key, model in SUPPORTED_MODELS.items():
+        print(f"  [{key}] {model['name']}")
+        print(f"      Token limits: {model['token_limit_per_min']:,}/min | {model['token_limit_per_hour']:,}/hr | {model['token_limit_per_day']:,}/day")
+        print(f"      Request limits: {model['request_limit_per_min']}/min | {model['request_limit_per_hour']}/hr | {model['request_limit_per_day']}/day")
+        print()
+
+    while True:
+        choice = input("Enter your choice [1-6]: ").strip()
+        if choice in SUPPORTED_MODELS:
+            model = SUPPORTED_MODELS[choice]
+            print(f"\n✅ Selected: {model['name']}")
+            return model
+        print("❌ Invalid choice. Please enter 1-6.")
+
+
+def main():
+    # Step 1: Select AI Model
+    model_config = select_model()
+
+    # Step 2: Ask for scan path
+    scan_path = input("\nEnter project path to scan (default: current directory '.'): ").strip() or "."
+    scan_path = os.path.abspath(scan_path)
+    print(f"📁 Scan path: {scan_path}")
+
+    # Step 3: Initialize components
+    print("\n⚙️  Initializing...")
+    db = MetricsDB()
+    scanner = ProjectScanner(db)
+    monitor = ResourceMonitor(db)
+
+    # Step 4: Initial scan
+    print(f"🔍 Scanning project at: {scan_path}")
+    files = scanner.scan_project(scan_path)
+
+    total = len(files)
+    ai_agents = [f for f in files if f['is_ai_agent']]
+    scripts = [f for f in files if f['is_script']]
+    main_files = [f for f in files if f['is_main_file']]
+
+    print(f"\n📊 Scan Results:")
+    print(f"   Total files detected: {total}")
+    print(f"   AI Agents: {len(ai_agents)}")
+    print(f"   Scripts: {len(scripts)}")
+    print(f"   Main files: {len(main_files)}")
+
+    if main_files:
+        print(f"\n   ★ Main files:")
+        for f in main_files:
+            print(f"     - {f['file_name']} ({f['file_path']}) → {f['purpose']}")
+
+    if ai_agents:
+        print(f"\n   🤖 AI Agents:")
+        for f in ai_agents:
+            print(f"     - {f['file_name']} → {f['purpose']}")
+
+    if scripts:
+        print(f"\n   ⚡ Scripts:")
+        for f in scripts[:10]:
+            print(f"     - {f['file_name']} → {f['purpose']}")
+        if len(scripts) > 10:
+            print(f"     ... and {len(scripts) - 10} more")
+
+    # Step 5: Start resource monitor
+    print("\n📡 Starting resource monitor...")
+    monitor.start_monitoring()
+
+    # Step 6: Setup web server
+    DashboardHandler.scanner = scanner
+    DashboardHandler.monitor = monitor
+    DashboardHandler.db = db
+    DashboardHandler.model_config = model_config
+    DashboardHandler.scan_path = scan_path
+
+    port = 8787
+    # Find available port
+    while True:
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.bind(('', port))
+            sock.close()
+            break
+        except OSError:
+            port += 1
+            if port > 9000:
+                print("❌ No available ports found")
+                sys.exit(1)
+
+    server = HTTPServer(('0.0.0.0', port), DashboardHandler)
+
+    print(f"\n{'=' * 60}")
+    print(f"🚀 Dashboard running at: http://localhost:{port}")
+    print(f"   Model: {model_config['name']}")
+    print(f"   Monitoring: {scan_path}")
+    print(f"{'=' * 60}")
+    print(f"\n   Press Ctrl+C to stop\n")
+
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\n\n🛑 Shutting down...")
+        monitor.stop_monitoring()
+        server.server_close()
+        print("✅ Goodbye!")
+
 
 if __name__ == "__main__":
-    print("\n"+"="*60)
-    print("  🤖  AI AGENT MONITOR — FREE MODELS + QUOTA TRACKING")
-    print("="*60)
-    print("  URL   : http://localhost:5000")
-    print("  Health: http://localhost:5000/health")
-    print("="*60+"\n")
-    application.run(host="0.0.0.0", port=5000, debug=False, use_reloader=False)
+    main()
