@@ -472,6 +472,21 @@ def debug6():
         info["traceback"] = traceback.format_exc()
     return jsonify(info), 200
 
+@application.get("/debug7")
+def debug7():
+    return jsonify({
+        "monitoring_flag": getattr(_monitor, "monitoring", None),
+        "tok_log_keys":    list(getattr(_monitor, "_tok_log", {}).keys()),
+        "req_log_keys":    list(getattr(_monitor, "_req_log", {}).keys()),
+        "tok_log_sample":  {
+            k: len(v) for k, v in
+            list(getattr(_monitor, "_tok_log", {}).items())[:5]
+        },
+        "metrics_tokens":  dict(_monitor.metrics.get("tokens", {})),
+        "metrics_system":  _monitor.metrics.get("system", {}),
+    })
+
+    
 @application.get("/rescan")
 def rescan():
     try:

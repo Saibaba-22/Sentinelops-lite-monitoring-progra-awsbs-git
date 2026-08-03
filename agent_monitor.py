@@ -130,6 +130,14 @@ MODEL_REGISTRY = {
                 "cost_output_per_1k": 0.00375,
                 "context_window":     1_048_576,
             },
+            "gemini-3.5-flash": {
+                "tpm_limit": 1_000_000,     "tph_limit": 60_000_000,
+                "tpd_limit": 1_000_000_000, "rpm_limit": 10_000,
+                "rph_limit": 600_000,       "rpd_limit": 10_000_000,
+                "cost_input_per_1k":  0.00015,
+                "cost_output_per_1k": 0.00060,
+                "context_window":     1_048_576,
+            },
         },
     },
     "openai": {
@@ -232,17 +240,23 @@ def _build_active_config() -> dict:
         print(f"[monitor] ❌ Provider '{ACTIVE_PROVIDER}' not in registry")
 
     if not mcfg:
-        print(
-            f"[monitor] ❌ Model '{ACTIVE_MODEL}' not found "
-            f"under '{ACTIVE_PROVIDER}' — using zero limits"
-        )
-        mcfg = {
-            "tpm_limit": 0, "tph_limit": 0, "tpd_limit": 0,
-            "rpm_limit": 0, "rph_limit": 0, "rpd_limit": 0,
-            "cost_input_per_1k":  0.0,
-            "cost_output_per_1k": 0.0,
-            "context_window":     0,
-        }
+        # Fallback to first available model of this provider
+        fallback_name = next(iter(pcfg.get("models", {})), None)
+        if fallback_name:
+            mcfg = pcfg["models"][fallback_name]
+            print(
+                f"[monitor] ⚠ '{ACTIVE_MODEL}' not in registry, "
+                f"using limits from '{fallback_name}'"
+            )
+        else:
+            print(f"[monitor] ❌ No fallback for '{ACTIVE_PROVIDER}'")
+            mcfg = {
+                "tpm_limit": 0, "tph_limit": 0, "tpd_limit": 0,
+                "rpm_limit": 0, "rph_limit": 0, "rpd_limit": 0,
+                "cost_input_per_1k":  0.0,
+                "cost_output_per_1k": 0.0,
+                "context_window":     0,
+            }
 
     return {
         # ── Identity ──────────────────────────────────────────
