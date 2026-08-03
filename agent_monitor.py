@@ -284,7 +284,7 @@ class MetricsDB:
         c = sqlite3.connect(self.db_path, check_same_thread=False)
         c.row_factory = sqlite3.Row
         return c
-
+        
     def _init_db(self):
         c = self._conn()
         c.executescript("""
@@ -739,43 +739,43 @@ class ResourceMonitor:
             )
 
     def _sim(self):
-    """
-    Simulate token/request usage for detected AI agents.
-    Runs every cycle — guaranteed data on dashboard.
-    """
-    files = self.db.execute(
-        "SELECT file_path FROM detected_files "
-        "WHERE is_ai_agent=1",
-        fetch=True
-    )
-    if not files:
-        return
-
-    now = time.time()
-    cfg = ACTIVE_CONFIG  # Use the active config
-
-    for row in files:
-        fp = row['file_path']
-
-        # Generate realistic random values based on limits
-        tok = random.randint(100, min(5000, cfg['tpm']//10))
-        req = random.randint(1, min(5, cfg['rpm']//10))
-
-        self._tok_log[fp].append((now, tok))
-        self._req_log[fp].append((now, req))
-
-        self.db.execute(
-            "INSERT INTO token_usage "
-            "(file_path,tokens_used,token_type) "
-            "VALUES (?,?,?)",
-            (fp, tok, 'total')
+        """
+        Simulate token/request usage for detected AI agents.
+        Runs every cycle — guaranteed data on dashboard.
+        """
+        files = self.db.execute(
+            "SELECT file_path FROM detected_files "
+            "WHERE is_ai_agent=1",
+            fetch=True
         )
-        self.db.execute(
-            "INSERT INTO request_usage "
-            "(file_path,request_count,status_code) "
-            "VALUES (?,?,?)",
-            (fp, req, 200)
-        )
+        if not files:
+            return
+
+        now = time.time()
+        cfg = ACTIVE_CONFIG  # Use the active config
+
+        for row in files:
+            fp = row['file_path']
+
+            # Generate realistic random values based on limits
+            tok = random.randint(100, min(5000, cfg['tpm']//10))
+            req = random.randint(1, min(5, cfg['rpm']//10))
+
+            self._tok_log[fp].append((now, tok))
+            self._req_log[fp].append((now, req))
+
+            self.db.execute(
+                "INSERT INTO token_usage "
+                "(file_path,tokens_used,token_type) "
+                "VALUES (?,?,?)",
+                (fp, tok, 'total')
+            )
+            self.db.execute(
+                "INSERT INTO request_usage "
+                "(file_path,request_count,status_code) "
+                "VALUES (?,?,?)",
+                (fp, req, 200)
+            )
 
     def get_all_metrics(self):
         """
