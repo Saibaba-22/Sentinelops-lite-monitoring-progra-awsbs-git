@@ -16,9 +16,15 @@ from prometheus_client import (
     Counter, Gauge, Histogram, REGISTRY,
 )
 
+# ══════════════════════════════════════════════════════════════
+# PATHS + DB LOCATION
+# ══════════════════════════════════════════════════════════════
 BASE_DIR = Path(__file__).resolve().parent
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
+
+# Force absolute DB path so all workers/threads share the same file
+os.environ.setdefault("METRICS_DB_PATH", "/tmp/agent_monitor.db")
 
 _START_TIME = time.time()
 _IMPORT_ERROR = None
@@ -36,10 +42,14 @@ _CFG = {
     "target_cloud":  os.environ.get("TARGET_CLOUD",  "aws"),
     "aws_region":    os.environ.get("AWS_REGION",    "us-east-1"),
     "scan_path":     os.environ.get("SCAN_PATH",     ""),
+    "db_path":       os.environ.get("METRICS_DB_PATH", "/tmp/agent_monitor.db"),
 }
 
 application = Flask(__name__)
 
+# ══════════════════════════════════════════════════════════════
+# IMPORT agent_monitor
+# ══════════════════════════════════════════════════════════════
 _MetricsDB = _ProjectScanner = _ResourceMonitor = None
 _HTMLBuilder = None
 _ACTIVE_CONFIG = {"name": _CFG["ai_model"], "provider": _CFG["ai_provider"]}
@@ -62,22 +72,41 @@ except Exception as e:
     _IMPORT_ERROR = f"{type(e).__name__}: {e}"
     print(f"[app] agent_monitor not fully available: {_IMPORT_ERROR}")
 
-if _MetricsDB and _ProjectScanner and _ResourceMonitor:
+
+def _init_components():
+    """Called on startup AND lazily if worker has None components."""
+    global _db, _scanner, _monitor
+    if not (_MetricsDB and _ProjectScanner and _ResourceMonitor):
+        return False
     try:
-        _db      = _MetricsDB()
+        # Force absolute DB path so every worker shares the same file
+        try:
+            _db = _MetricsDB(db_path=_CFG["db_path"])
+        except TypeError:
+            # Older MetricsDB signature — patch afterwards
+            _db = _MetricsDB()
+            _db.db_path = _CFG["db_path"]
         _scanner = _ProjectScanner(_db)
         _monitor = _ResourceMonitor(_db)
         _monitor.start_monitoring()
-        sp = _CFG["scan_path"] or (
+        target = _CFG["scan_path"] or (
             "/var/app/current" if os.path.exists("/var/app/current")
             else str(BASE_DIR)
         )
-        _scanner.scan_project(sp)
-        print(f"[app] components ready, scan={sp}")
+        _scanner.scan_project(target)
+        print(f"[app] components ready pid={os.getpid()} "
+              f"db={_db.db_path} scan={target}")
+        return True
     except Exception as e:
         print(f"[app] component init failed: {e}")
+        return False
 
 
+_init_components()
+
+# ══════════════════════════════════════════════════════════════
+# PROMETHEUS METRICS
+# ══════════════════════════════════════════════════════════════
 def _safe(cls, name, desc, labels=None):
     try:
         return cls(name, desc, labels) if labels else cls(name, desc)
@@ -144,9 +173,16 @@ _update_process_metrics()
 threading.Thread(target=_metrics_loop, args=(15,), daemon=True).start()
 
 
+# ══════════════════════════════════════════════════════════════
+# REQUEST HOOKS
+# ══════════════════════════════════════════════════════════════
 @application.before_request
 def _t_start():
     request._start_time = time.time()
+    # Lazy init: if this worker has no components yet, init them
+    if _db is None or _scanner is None or _monitor is None:
+        if _MetricsDB and _ProjectScanner and _ResourceMonitor:
+            _init_components()
 
 
 @application.after_request
@@ -174,6 +210,9 @@ def _t_end(resp):
     return resp
 
 
+# ══════════════════════════════════════════════════════════════
+# HELPERS
+# ══════════════════════════════════════════════════════════════
 def _uptime():
     return max(0.0, time.time() - _START_TIME)
 
@@ -212,6 +251,9 @@ def _check_monitor_header(cfg_token):
     return request.headers.get("X-Monitor-Token", "") == cfg_token
 
 
+# ══════════════════════════════════════════════════════════════
+# CORE ROUTES
+# ══════════════════════════════════════════════════════════════
 @application.get("/")
 def home():
     try:
@@ -287,13 +329,15 @@ def agent_status_route():
 
 
 # ══════════════════════════════════════════════════════════════
-# DEBUG ROUTES  (safe to keep; remove later if you want)
+# DEBUG ROUTES
 # ══════════════════════════════════════════════════════════════
 @application.get("/debug")
 def debug_page():
     import traceback
     info = {
+        "pid":           os.getpid(),
         "_db":           str(_db),
+        "_db_path":      _db.db_path if _db else None,
         "_scanner":      str(_scanner),
         "_monitor":      str(_monitor),
         "_HTMLBuilder":  str(_HTMLBuilder),
@@ -305,10 +349,6 @@ def debug_page():
         "AI_PROVIDER":   _CFG["ai_provider"],
     }
     try:
-        info["files_in_base"] = os.listdir(str(BASE_DIR))[:30]
-    except Exception as e:
-        info["files_in_base_error"] = str(e)
-    try:
         if _db:
             rows = _db.execute(
                 "SELECT COUNT(*) as c FROM detected_files", fetch=True
@@ -317,12 +357,9 @@ def debug_page():
     except Exception as e:
         info["db_error"] = str(e)
     try:
-        if _scanner:
-            target = _CFG["scan_path"] or str(BASE_DIR)
-            files = _scanner.scan_project(target)
-            info["scan_result_count"] = len(files)
+        info["files_in_base"] = os.listdir(str(BASE_DIR))[:30]
     except Exception as e:
-        info["scan_error"] = traceback.format_exc()
+        info["files_in_base_error"] = str(e)
     return jsonify(info), 200
 
 
@@ -333,6 +370,7 @@ def debug2():
             "SELECT * FROM detected_files LIMIT 5", fetch=True
         )
         return jsonify({
+            "pid":    os.getpid(),
             "count":  len(rows) if rows else 0,
             "sample": [dict(r) for r in (rows or [])],
         })
@@ -340,13 +378,44 @@ def debug2():
         return jsonify({"error": str(e)}), 500
 
 
+@application.get("/debug3")
+def debug3():
+    """Return exactly what _get_data() gives to the dashboard."""
+    try:
+        files, metrics = _get_data()
+        return jsonify({
+            "pid":          os.getpid(),
+            "files_count":  len(files),
+            "files_sample": files[:3],
+            "system":       metrics.get("system", {}),
+            "tokens_keys":  list(metrics.get("tokens", {}).keys())[:5],
+            "req_keys":     list(metrics.get("requests", {}).keys())[:5],
+        })
+    except Exception as e:
+        import traceback
+        return jsonify(
+            {"error": str(e), "traceback": traceback.format_exc()}
+        ), 500
+
+
+@application.get("/debug4")
+def debug4():
+    return jsonify({
+        "pid":         os.getpid(),
+        "db_id":       id(_db) if _db else None,
+        "db_path":     _db.db_path if _db else None,
+        "scanner_id":  id(_scanner) if _scanner else None,
+        "monitor_id":  id(_monitor) if _monitor else None,
+    })
+
+
 @application.get("/rescan")
 def rescan():
-    """Force a fresh scan and return the count."""
     try:
         target = _CFG["scan_path"] or str(BASE_DIR)
         files = _scanner.scan_project(target)
         return jsonify({
+            "pid":     os.getpid(),
             "scanned": len(files),
             "path":    target,
             "ai":      sum(1 for f in files if f.get("is_ai_agent")),
@@ -374,28 +443,29 @@ def monitor_status():
 
 
 # ══════════════════════════════════════════════════════════════
-# DASHBOARD DATA HELPER — auto-scans if DB empty
+# DASHBOARD DATA — auto-scans if DB empty, works cross-worker
 # ══════════════════════════════════════════════════════════════
 def _get_data():
-    if _db and _monitor:
-        try:
+    if _db is None or _monitor is None:
+        return [], {"system": {}, "tokens": {}, "requests": {}, "resources": {}}
+    try:
+        rows = _db.execute(
+            "SELECT * FROM detected_files ORDER BY is_ai_agent DESC, "
+            "is_script DESC, is_main_file DESC, file_name", fetch=True
+        )
+        # If DB empty in this worker, trigger a scan and re-read
+        if not rows and _scanner:
+            print(f"[app] pid={os.getpid()} DB empty on read, scanning...")
+            target = _CFG["scan_path"] or str(BASE_DIR)
+            _scanner.scan_project(target)
             rows = _db.execute(
                 "SELECT * FROM detected_files ORDER BY is_ai_agent DESC, "
                 "is_script DESC, is_main_file DESC, file_name", fetch=True
             )
-            # Auto-scan if DB is empty (first request after restart)
-            if not rows and _scanner:
-                print("[app] DB empty on read, triggering scan...")
-                target = _CFG["scan_path"] or str(BASE_DIR)
-                _scanner.scan_project(target)
-                rows = _db.execute(
-                    "SELECT * FROM detected_files ORDER BY is_ai_agent DESC, "
-                    "is_script DESC, is_main_file DESC, file_name", fetch=True
-                )
-            return [dict(r) for r in (rows or [])], _monitor.get_all_metrics()
-        except Exception as e:
-            print(f"[app] _get_data error: {e}")
-    return [], {"system": {}, "tokens": {}, "requests": {}, "resources": {}}
+        return [dict(r) for r in (rows or [])], _monitor.get_all_metrics()
+    except Exception as e:
+        print(f"[app] _get_data error: {e}")
+        return [], {"system": {}, "tokens": {}, "requests": {}, "resources": {}}
 
 
 def _html(body):
@@ -408,6 +478,7 @@ def _err_page(page, extra=""):
         "background:#0f172a;color:#e2e8f0'>"
         f"<h1>{page} unavailable</h1>"
         f"<pre style='background:#1e293b;padding:16px;color:#f87171'>"
+        f"pid          = {os.getpid()}\n"
         f"_HTMLBuilder = {_HTMLBuilder}\n"
         f"_db          = {_db}\n"
         f"_scanner     = {_scanner}\n"
@@ -517,6 +588,9 @@ def reset_page():
         return _err_page("Reset", f"Runtime: {e}")
 
 
+# ══════════════════════════════════════════════════════════════
+# ERROR HANDLERS
+# ══════════════════════════════════════════════════════════════
 @application.errorhandler(404)
 def _404(e):
     return jsonify({"error": "Not found", "status": 404}), 404
@@ -533,21 +607,6 @@ def _exc(e):
     application.logger.exception(f"Unhandled: {e}")
     return jsonify({"error": "Internal server error", "status": 500}), 500
 
-@application.get("/debug3")
-def debug3():
-    """Return exactly what _get_data() gives to the dashboard."""
-    try:
-        files, metrics = _get_data()
-        return jsonify({
-            "files_count":  len(files),
-            "files_sample": files[:3],
-            "system":       metrics.get("system", {}),
-            "tokens_keys":  list(metrics.get("tokens", {}).keys())[:5],
-            "req_keys":     list(metrics.get("requests", {}).keys())[:5],
-        })
-    except Exception as e:
-        import traceback
-        return jsonify({"error": str(e), "traceback": traceback.format_exc()}), 500
 
 if __name__ == "__main__":
     application.run(
