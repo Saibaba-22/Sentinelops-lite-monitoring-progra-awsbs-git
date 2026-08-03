@@ -35,20 +35,8 @@ _CFG = {
     "monitor_token": os.environ.get("MONITOR_TOKEN", ""),
     "target_cloud":  os.environ.get("TARGET_CLOUD",  "aws"),
     "aws_region":    os.environ.get("AWS_REGION",    "us-east-1"),
-    SCAN_PATH = os.environ.get("SCAN_PATH", str(BASE_DIR))
-
-# Verify the path exists and is a directory
-if not os.path.isdir(SCAN_PATH):
-    print(f"[WARNING] SCAN_PATH {SCAN_PATH} does not exist, defaulting to BASE_DIR")
-    SCAN_PATH = str(BASE_DIR)
-
-print(f"[app] 📁 SCAN_PATH = {SCAN_PATH}")
+    "scan_path":     os.environ.get("SCAN_PATH",     ""),
 }
-
-# Force initial scan if database is empty
-if not _db.execute("SELECT COUNT(*) FROM detected_files", fetch=True)[0][0]:
-    print("[app] ⚠ Database empty - forcing initial scan")
-    _files = _scanner.scan_project(SCAN_PATH)
 
 application = Flask(__name__)
 
@@ -297,10 +285,53 @@ def agent_status_route():
         "uptime_seconds": _uptime(),
     }), 200
 
+
+# ══════════════════════════════════════════════════════════════
+# DEBUG ROUTES  (safe to keep; remove later if you want)
+# ══════════════════════════════════════════════════════════════
+@application.get("/debug")
+def debug_page():
+    import traceback
+    info = {
+        "_db":           str(_db),
+        "_scanner":      str(_scanner),
+        "_monitor":      str(_monitor),
+        "_HTMLBuilder":  str(_HTMLBuilder),
+        "_IMPORT_ERROR": _IMPORT_ERROR,
+        "BASE_DIR":      str(BASE_DIR),
+        "SCAN_PATH":     _CFG["scan_path"],
+        "cwd":           os.getcwd(),
+        "AI_MODEL":      _CFG["ai_model"],
+        "AI_PROVIDER":   _CFG["ai_provider"],
+    }
+    try:
+        info["files_in_base"] = os.listdir(str(BASE_DIR))[:30]
+    except Exception as e:
+        info["files_in_base_error"] = str(e)
+    try:
+        if _db:
+            rows = _db.execute(
+                "SELECT COUNT(*) as c FROM detected_files", fetch=True
+            )
+            info["db_file_count"] = dict(rows[0])["c"] if rows else 0
+    except Exception as e:
+        info["db_error"] = str(e)
+    try:
+        if _scanner:
+            target = _CFG["scan_path"] or str(BASE_DIR)
+            files = _scanner.scan_project(target)
+            info["scan_result_count"] = len(files)
+    except Exception as e:
+        info["scan_error"] = traceback.format_exc()
+    return jsonify(info), 200
+
+
 @application.get("/debug2")
 def debug2():
     try:
-        rows = _db.execute("SELECT * FROM detected_files LIMIT 5", fetch=True)
+        rows = _db.execute(
+            "SELECT * FROM detected_files LIMIT 5", fetch=True
+        )
         return jsonify({
             "count":  len(rows) if rows else 0,
             "sample": [dict(r) for r in (rows or [])],
@@ -313,15 +344,18 @@ def debug2():
 def rescan():
     """Force a fresh scan and return the count."""
     try:
-        files = _scanner.scan_project(str(BASE_DIR))
+        target = _CFG["scan_path"] or str(BASE_DIR)
+        files = _scanner.scan_project(target)
         return jsonify({
             "scanned": len(files),
-            "path":    str(BASE_DIR),
-            "ai":      sum(1 for f in files if f.get('is_ai_agent')),
-            "sc":      sum(1 for f in files if f.get('is_script')),
+            "path":    target,
+            "ai":      sum(1 for f in files if f.get("is_ai_agent")),
+            "sc":      sum(1 for f in files if f.get("is_script")),
+            "mn":      sum(1 for f in files if f.get("is_main_file")),
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
 
 @application.get("/metrics", endpoint="app_prometheus_metrics")
 def prom_metrics():
@@ -339,6 +373,9 @@ def monitor_status():
     return jsonify({"ok": True, "timestamp": time.time()}), 200
 
 
+# ══════════════════════════════════════════════════════════════
+# DASHBOARD DATA HELPER — auto-scans if DB empty
+# ══════════════════════════════════════════════════════════════
 def _get_data():
     if _db and _monitor:
         try:
@@ -348,8 +385,9 @@ def _get_data():
             )
             # Auto-scan if DB is empty (first request after restart)
             if not rows and _scanner:
-                print("[app] DB empty, triggering scan...")
-                _scanner.scan_project(str(BASE_DIR))
+                print("[app] DB empty on read, triggering scan...")
+                target = _CFG["scan_path"] or str(BASE_DIR)
+                _scanner.scan_project(target)
                 rows = _db.execute(
                     "SELECT * FROM detected_files ORDER BY is_ai_agent DESC, "
                     "is_script DESC, is_main_file DESC, file_name", fetch=True
@@ -358,6 +396,7 @@ def _get_data():
         except Exception as e:
             print(f"[app] _get_data error: {e}")
     return [], {"system": {}, "tokens": {}, "requests": {}, "resources": {}}
+
 
 def _html(body):
     return Response(body, status=200, content_type="text/html; charset=utf-8")
@@ -450,7 +489,9 @@ def scan_page():
     if _HTMLBuilder is None or _scanner is None:
         return _err_page("Scan")
     try:
-        sp = request.args.get("path", _CFG["scan_path"] or str(BASE_DIR))
+        sp = request.args.get(
+            "path", _CFG["scan_path"] or str(BASE_DIR)
+        )
         scanned = _scanner.scan_project(sp)
         r = {
             "total": len(scanned),
@@ -492,74 +533,6 @@ def _exc(e):
     application.logger.exception(f"Unhandled: {e}")
     return jsonify({"error": "Internal server error", "status": 500}), 500
 
-@application.get("/nuclear-reset")
-def nuclear_reset():
-    """Complete system reset with forced scan"""
-    # Delete database
-    if os.path.exists("agent_monitor.db"):
-        os.remove("agent_monitor.db")
-
-    # Reinitialize everything
-    global _db, _scanner, _monitor, _files
-    _db = MetricsDB()
-    _scanner = ProjectScanner(_db)
-    _monitor = ResourceMonitor(_db)
-    _monitor.start_monitoring()
-
-    # Force scan with error handling
-    try:
-        _files = _scanner.scan_project(SCAN_PATH)
-        return jsonify({
-            "status": "success",
-            "files_found": len(_files),
-            "ai_agents": sum(1 for f in _files if f['is_ai_agent'])
-        })
-    except Exception as e:
-        return jsonify({
-            "status": "error",
-            "message": str(e),
-            "scan_path": SCAN_PATH
-        }), 500
-
-@application.get("/scan-results")
-def scan_results():
-    """Show scan results"""
-    files = _db.execute("SELECT * FROM detected_files LIMIT 10", fetch=True)
-    return jsonify({
-        "total_files": len(files),
-        "sample_files": [dict(f) for f in files],
-        "scan_path": SCAN_PATH
-    })
-
-@application.get("/debug")
-def debug_page():
-    import traceback
-    info = {
-        "_db":          str(_db),
-        "_scanner":     str(_scanner),
-        "_monitor":     str(_monitor),
-        "_HTMLBuilder": str(_HTMLBuilder),
-        "_IMPORT_ERROR": _IMPORT_ERROR,
-        "BASE_DIR":     str(BASE_DIR),
-        "SCAN_PATH":    _CFG["scan_path"],
-        "cwd":          os.getcwd(),
-        "AI_MODEL":     _CFG["ai_model"],
-        "AI_PROVIDER":  _CFG["ai_provider"],
-        "files_in_base": os.listdir(BASE_DIR)[:30],
-    }
-    try:
-        if _db:
-            rows = _db.execute("SELECT COUNT(*) as c FROM detected_files", fetch=True)
-            info["db_file_count"] = dict(rows[0])["c"] if rows else 0
-    except Exception as e:
-        info["db_error"] = str(e)
-    try:
-        if _scanner:
-            files = _scanner.scan_project(BASE_DIR if not _CFG["scan_path"] else _CFG["scan_path"])
-            info["scan_result_count"] = len(files)
-    except Exception as e:
-        info["scan_error"] = traceback.format_exc()
-    return jsonify(info), 200
 
 if __name__ == "__main__":
     application.run(
