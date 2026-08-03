@@ -114,8 +114,64 @@ if str(BASE_DIR) not in sys.path:
 #         its exports.
 # ══════════════════════════════════════════════════════════════
 
-from agent_monitor import application, scanner
+#from agent_monitor import application, scanner
 
+# ══════════════════════════════════════════════════════════════
+# REPLACE BLOCK 3 in app.py
+# ══════════════════════════════════════════════════════════════
+
+# OLD (broken):
+# from agent_monitor import application, scanner
+
+# NEW — create Flask app directly in app.py
+from flask import Flask
+application = Flask(__name__)
+
+# ── Import scanner components from agent_monitor ──────────────
+from agent_monitor import (
+    MetricsDB,
+    ProjectScanner,
+    ResourceMonitor,
+)
+
+# ── Create scanner instance ───────────────────────────────────
+_db      = MetricsDB()
+_monitor = ResourceMonitor(_db)
+_monitor.start_monitoring()
+
+class scanner:
+    """
+    Namespace that mimics the scanner API
+    app.py routes expect.
+    """
+    db               = _db
+    agents           = []
+    request_history  = []
+    quota_trackers   = {}
+    project_files    = []
+
+    @staticmethod
+    def get_dashboard_data():
+        metrics = _monitor.get_all_metrics()
+        files   = _db.execute(
+            "SELECT * FROM detected_files ORDER BY is_ai_agent DESC",
+            fetch=True
+        )
+        return {
+            "agents":         [dict(f) for f in files if f["is_ai_agent"]],
+            "system_metrics": metrics.get("system", {}),
+            "session_stats":  {
+                "total_tokens": 0,
+                "rpm": 0, "rph": 0, "rpd": 0,
+                "tpm": 0, "tph": 0, "tpd": 0,
+            },
+            "providers":      [],
+            "request_history": [],
+        }
+
+    @staticmethod
+    def _agent_dict(agent):
+        return dict(agent)
 
 # ══════════════════════════════════════════════════════════════
 # BLOCK 4 — IMPORT PROMETHEUS COUNTERS FROM monitoring/metrics.py
