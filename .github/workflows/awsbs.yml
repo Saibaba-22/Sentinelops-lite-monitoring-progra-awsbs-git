@@ -28,6 +28,9 @@ env:
   AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
   AWS_BASE_URL: ${{ vars.AWS_BASE_URL }}
   APP_HEALTH_PATH: ${{ vars.APP_HEALTH_PATH || '/health' }}
+  AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  AWS_REGION:            ${{ vars.AWS_REGION }}
 
 jobs:
   precheck:
@@ -220,6 +223,9 @@ jobs:
     env:
       GRAFANA_ADMIN_PASSWORD: ${{ secrets.GRAFANA_ADMIN_PASSWORD }}
       MONITOR_TOKEN_AWS: ${{ secrets.MONITOR_TOKEN_AWS }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      AI_PROVIDER: ${{ vars.AI_PROVIDER || 'gemini' }}
+      AI_MODEL: ${{ vars.AI_MODEL || 'gemini-2.5-flash' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -237,6 +243,9 @@ jobs:
           test -n "$GRAFANA_ADMIN_PASSWORD"      || { echo "Add repository secret GRAFANA_ADMIN_PASSWORD"; exit 1; }
           test -n "$AWS_ACCESS_KEY_ID_VALUE"     || { echo "Missing secret AWS_ACCESS_KEY_ID"; exit 1; }
           test -n "$AWS_SECRET_ACCESS_KEY_VALUE" || { echo "Missing secret AWS_SECRET_ACCESS_KEY"; exit 1; }
+          test -n "$GEMINI_API_KEY"              || { echo "Missing secret GEMINI_API_KEY"; exit 1; }
+          test -n "$AI_PROVIDER"                 || { echo "Missing variable AI_PROVIDER"; exit 1; }
+          test -n "$AI_MODEL"                    || { echo "Missing variable AI_MODEL"; exit 1; }
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -293,6 +302,11 @@ jobs:
               "GF_SERVER_DOMAIN":           os.environ["CNAME"],
               "GF_SERVER_ROOT_URL":         os.environ["BASE_URL"].rstrip("/") + "/grafana/",
               "PROMETHEUS_URL":             "http://prometheus:9090/prometheus",
+
+              # AI variables: GitHub Secrets/Variables → AWS Beanstalk
+              "GEMINI_API_KEY":             os.environ["GEMINI_API_KEY"],
+              "AI_PROVIDER":                os.environ["AI_PROVIDER"],
+              "AI_MODEL":                   os.environ["AI_MODEL"],
           }
           options = [{
               "Namespace":  "aws:elasticbeanstalk:application:environment",
