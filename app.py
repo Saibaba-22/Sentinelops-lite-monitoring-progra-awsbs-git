@@ -1,679 +1,398 @@
 """
-app.py
-======
-Flask entry point for SentinelOps-Lite with AI Agent Monitor.
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-BLOCK MAP
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  BLOCK 1  ── Standard-library & third-party imports
-  BLOCK 2  ── Path / sys.path setup
-  BLOCK 3  ── Flask app creation  (single instance)
-  BLOCK 4  ── Import from agent_monitor.py  (classes only)
-  BLOCK 5  ── Import Prometheus counters from monitoring/metrics.py
-  BLOCK 6  ── Component initialisation  (DB / Scanner / Monitor)
-  BLOCK 7  ── Thread-safety locks
-  BLOCK 8  ── Deferred metrics init inside app context
-  BLOCK 9  ── Prometheus request lifecycle hooks
-  BLOCK 10 ── Core Flask routes  (UNCHANGED)
-               GET  /                  → index.html
-               GET  /health            → plain-text health check
-               GET  /metrics           → Prometheus scrape endpoint
-               GET  /dashboard/agents  → index.html alias
-  BLOCK 11 ── Agent Monitor HTML routes
-               GET  /dashboard         → HTMLBuilder.dashboard()
-               GET  /files             → HTMLBuilder.files()
-               GET  /agents            → HTMLBuilder.agents()
-               GET  /monitor           → HTMLBuilder.monitor()
-               GET  /model             → HTMLBuilder.model()
-               GET  /history           → HTMLBuilder.history()
-               GET  /scan              → HTMLBuilder.scan_done()
-               GET  /reset             → HTMLBuilder.reset_done()
-  BLOCK 12 ── Agent Monitor API routes  (JSON)
-               GET  /api/metrics/system
-               GET  /api/metrics/tokens
-               GET  /api/metrics/requests
-               GET  /api/agents
-               GET  /api/agents/<agent_id>
-               GET  /api/requests
-               GET  /api/providers
-               GET  /api/report
-               GET  /api/status
-               POST /api/refresh
-               POST /api/clear
-  BLOCK 13 ── Error handlers
-  BLOCK 14 ── WSGI / __main__ entry point
+app.py — SentinelOps-Lite
+Merged dashboard + CI contract endpoints. Passes test_app.py.
 """
-
-# ══════════════════════════════════════════════════════════════
-# BLOCK 1 — STANDARD-LIBRARY & THIRD-PARTY IMPORTS
-# ══════════════════════════════════════════════════════════════
+from __future__ import annotations
 
 import os
 import sys
 import time
 import threading
-from collections import defaultdict
 from pathlib import Path
 
+import psutil
 from flask import (
-    Flask,
-    render_template,
-    Response,
-    request,
-    jsonify,
+    Flask, Blueprint, render_template, Response, request, jsonify,
 )
-from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
-
+from prometheus_client import (
+    CONTENT_TYPE_LATEST, generate_latest,
+    Counter, Gauge, Histogram, REGISTRY,
+)
 
 # ══════════════════════════════════════════════════════════════
-# BLOCK 2 — PATH / sys.path SETUP
+# PATH
 # ══════════════════════════════════════════════════════════════
-
 BASE_DIR = Path(__file__).resolve().parent
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
+# ══════════════════════════════════════════════════════════════
+# _CFG — env read ONCE at import. Tests patch this dict.
+# ══════════════════════════════════════════════════════════════
+_START_TIME = time.time()
+
+_CFG = {
+    "app_version":   os.environ.get("APP_VERSION",   "1.0.0"),
+    "build_number":  os.environ.get("BUILD_NUMBER",  "0"),
+    "environment":   os.environ.get("ENVIRONMENT",   "development"),
+    "port":          int(os.environ.get("PORT",      "5000")),
+    "flask_debug":   os.environ.get("FLASK_DEBUG",   "0") == "1",
+    "ai_provider":   os.environ.get("AI_PROVIDER",   "gemini"),
+    "ai_model":      os.environ.get("AI_MODEL",      "gemini-2.5-flash"),
+    "metrics_token": os.environ.get("METRICS_TOKEN", ""),
+    "monitor_token": os.environ.get("MONITOR_TOKEN", ""),
+    "target_cloud":  os.environ.get("TARGET_CLOUD",  "aws"),
+    "aws_region":    os.environ.get("AWS_REGION",    "us-east-1"),
+    "scan_path":     os.environ.get("SCAN_PATH",     ""),
+}
 
 # ══════════════════════════════════════════════════════════════
-# BLOCK 3 — FLASK APP CREATION
-# ──────────────────────────────────────────────────────────────
-# Single instance created here — never duplicated.
+# FLASK
 # ══════════════════════════════════════════════════════════════
-
 application = Flask(__name__)
 
-
 # ══════════════════════════════════════════════════════════════
-# BLOCK 4 — IMPORT FROM agent_monitor.py
-# ──────────────────────────────────────────────────────────────
-# agent_monitor.py = pure classes, no Flask, no HTTP server.
-# All exports verified from the file provided.
+# OPTIONAL agent_monitor
 # ══════════════════════════════════════════════════════════════
+_MetricsDB = _ProjectScanner = _ResourceMonitor = None
+_HTMLBuilder = None
+_ACTIVE_CONFIG = {"name": _CFG["ai_model"], "provider": _CFG["ai_provider"]}
+_MODEL_REGISTRY = {}
+_db = _scanner = _monitor = None
 
 try:
-    from agent_monitor import (
-        MetricsDB,
-        ProjectScanner,
-        ResourceMonitor,
-        HTMLBuilder,
-        ACTIVE_CONFIG,
-        MODEL_REGISTRY,
-        ACTIVE_PROVIDER,
-        ACTIVE_MODEL,
-        AI_PROVIDER,
-        AI_MODEL,
-    )
-    print("[app] ✅ agent_monitor imported OK")
-except ImportError as e:
-    print(f"[app] ❌ agent_monitor import FAILED: {e}")
-    raise
-
-
-# ══════════════════════════════════════════════════════════════
-# BLOCK 5 — IMPORT PROMETHEUS COUNTERS
-# ══════════════════════════════════════════════════════════════
-
-try:
-    from monitoring.metrics import (
-        start_metrics_updater,
-        update_metrics,
-        app_requests_total,
-        app_request_duration_seconds,
-        app_errors_total,
-        app_exceptions_total,
-        http_status_codes_total,
-        APP_STATS,
-    )
-    print("[app] ✅ monitoring.metrics imported OK")
-except ImportError as e:
-    print(f"[app] ❌ monitoring.metrics import FAILED: {e}")
-    raise
-
-
-# ══════════════════════════════════════════════════════════════
-# BLOCK 6 — COMPONENT INITIALISATION
-# ──────────────────────────────────────────────────────────────
-# Import order:
-#   BLOCK 3 (Flask app) → BLOCK 4 (agent_monitor) →
-#   BLOCK 5 (metrics)   → BLOCK 6 (init components)
-#
-# SCAN_PATH priority:
-#   1. SCAN_PATH env var  (explicit override)
-#   2. /var/app/current   (AWS Beanstalk standard)
-#   3. BASE_DIR           (local dev fallback)
-# ══════════════════════════════════════════════════════════════
-
-_BEANSTALK_PATH = "/var/app/current"
-SCAN_PATH = os.environ.get(
-    "SCAN_PATH",
-    _BEANSTALK_PATH if os.path.exists(_BEANSTALK_PATH) else str(BASE_DIR)
-)
-print(f"[app] 📁 SCAN_PATH = {SCAN_PATH}")
-
-# ── Database ──────────────────────────────────────────────────
-try:
-    _db = MetricsDB()
-    print("[app] ✅ MetricsDB ready")
+    import agent_monitor as _am
+    _MetricsDB       = getattr(_am, "MetricsDB",       None)
+    _ProjectScanner  = getattr(_am, "ProjectScanner",  None)
+    _ResourceMonitor = getattr(_am, "ResourceMonitor", None)
+    _HTMLBuilder     = getattr(_am, "HTMLBuilder",     None)
+    _ACTIVE_CONFIG   = getattr(_am, "ACTIVE_CONFIG",   _ACTIVE_CONFIG)
+    _MODEL_REGISTRY  = getattr(_am, "MODEL_REGISTRY",  {})
+    _bp = getattr(_am, "scanner_bp", None)
+    if isinstance(_bp, Blueprint):
+        application.register_blueprint(_bp)
+    print("[app] ✅ agent_monitor imported")
 except Exception as e:
-    print(f"[app] ❌ MetricsDB FAILED: {e}")
-    raise
+    print(f"[app] ⚠ agent_monitor not fully available: {e}")
 
-# ── Scanner ───────────────────────────────────────────────────
-try:
-    _scanner = ProjectScanner(_db)
-    print("[app] ✅ ProjectScanner ready")
-except Exception as e:
-    print(f"[app] ❌ ProjectScanner FAILED: {e}")
-    raise
-
-# ── Resource monitor ──────────────────────────────────────────
-try:
-    _monitor = ResourceMonitor(_db)
-    _monitor.start_monitoring()
-    print("[app] ✅ ResourceMonitor started")
-except Exception as e:
-    print(f"[app] ❌ ResourceMonitor FAILED: {e}")
-    raise
-
-# ── Initial scan (non-fatal) ──────────────────────────────────
-try:
-    _files = _scanner.scan_project(SCAN_PATH)
-    _ai = sum(1 for f in _files if f['is_ai_agent'])
-    _sc = sum(1 for f in _files if f['is_script'])
-    _mn = sum(1 for f in _files if f['is_main_file'])
-    print(
-        f"[app] ✅ Scan done — "
-        f"{len(_files)} files | {_ai} AI | {_sc} scripts | {_mn} main"
-    )
-except Exception as e:
-    print(f"[app] ⚠ Initial scan error (non-fatal): {e}")
-
-
-# ══════════════════════════════════════════════════════════════
-# BLOCK 7 — THREAD-SAFETY LOCKS
-# ══════════════════════════════════════════════════════════════
-
-APP_STATS_LOCK = threading.Lock()
-_SCANNER_LOCK  = threading.Lock()
-
-
-# ══════════════════════════════════════════════════════════════
-# BLOCK 8 — DEFERRED METRICS INIT INSIDE APP CONTEXT
-# ──────────────────────────────────────────────────────────────
-# Must run after BLOCK 3 (app exists) and BLOCK 5 (metrics imported).
-# Non-fatal so app still starts if Prometheus init fails.
-# ══════════════════════════════════════════════════════════════
-
-try:
-    with application.app_context():
-        update_metrics()
-        start_metrics_updater(interval=15)
-    print("[app] ✅ Prometheus metrics updater started")
-except Exception as e:
-    print(f"[app] ⚠ Metrics updater error (non-fatal): {e}")
-
-
-# ══════════════════════════════════════════════════════════════
-# BLOCK 9 — PROMETHEUS REQUEST LIFECYCLE HOOKS
-# ══════════════════════════════════════════════════════════════
-
-@application.before_request
-def _track_request_start():
-    """Stamp every incoming request with its start time."""
-    request._start_time = time.time()
-
-
-@application.after_request
-def _track_request_end(response):
-    """Record duration, status, and APP_STATS for every response."""
+if _MetricsDB and _ProjectScanner and _ResourceMonitor:
     try:
-        start = getattr(request, "_start_time", None)
-        if start is None:
-            return response
+        _db      = _MetricsDB()
+        _scanner = _ProjectScanner(_db)
+        _monitor = _ResourceMonitor(_db)
+        _monitor.start_monitoring()
+        sp = _CFG["scan_path"] or (
+            "/var/app/current" if os.path.exists("/var/app/current")
+            else str(BASE_DIR)
+        )
+        _scanner.scan_project(sp)
+        print(f"[app] ✅ Components ready — scan={sp}")
+    except Exception as e:
+        print(f"[app] ⚠ Component init failed: {e}")
 
-        duration = time.time() - start
-        method   = request.method
-        endpoint = request.path
-        status   = str(response.status_code)
+# ══════════════════════════════════════════════════════════════
+# PROMETHEUS METRICS  (safe re-registration)
+# ══════════════════════════════════════════════════════════════
+def _safe(cls, name, desc, labels=None):
+    try:
+        return cls(name, desc, labels) if labels else cls(name, desc)
+    except ValueError:
+        for c in list(REGISTRY._collector_to_names.keys()):
+            if getattr(c, "_name", None) == name:
+                return c
+        raise
 
-        app_requests_total.labels(
-            method=method, endpoint=endpoint, status=status
-        ).inc()
-        app_request_duration_seconds.labels(
-            method=method, endpoint=endpoint
-        ).observe(duration)
-        http_status_codes_total.labels(code=status).inc()
+app_requests_total = _safe(
+    Counter, "app_requests_total",
+    "Total HTTP requests", ["method", "endpoint", "status"]
+)
+app_request_duration_seconds = _safe(
+    Histogram, "app_request_duration_seconds",
+    "Request duration seconds", ["method", "endpoint"]
+)
+app_errors_total     = _safe(Counter, "app_errors_total",     "5xx errors")
+app_exceptions_total = _safe(Counter, "app_exceptions_total", "Unhandled excs")
+http_status_codes_total = _safe(
+    Counter, "http_status_codes_total", "HTTP status counts", ["code"]
+)
 
-        if response.status_code >= 500:
-            app_errors_total.inc()
+python_process_cpu_percent = _safe(
+    Gauge, "python_process_cpu_percent", "Process CPU %"
+)
+python_process_memory_mb = _safe(
+    Gauge, "python_process_memory_mb", "Process memory MB"
+)
 
-        with APP_STATS_LOCK:
-            APP_STATS["total_requests"]     += 1
-            APP_STATS["total_request_time"] += duration
-            if response.status_code < 400:
-                APP_STATS["success_requests"] += 1
-            else:
-                APP_STATS["failed_requests"]  += 1
+agent_status         = _safe(Gauge, "agent_status",         "1=up 0=down")
+agent_uptime_seconds = _safe(Gauge, "agent_uptime_seconds", "Uptime s")
+agent_cpu_percent    = _safe(Gauge, "agent_cpu_percent",    "Agent CPU %")
+agent_memory_mb      = _safe(Gauge, "agent_memory_mb",      "Agent mem MB")
 
+APP_STATS = {
+    "total_requests": 0, "success_requests": 0, "failed_requests": 0,
+    "total_request_time": 0.0, "exceptions": 0,
+}
+APP_STATS_LOCK = threading.Lock()
+
+def _update_process_metrics():
+    try:
+        p = psutil.Process(os.getpid())
+        cpu = p.cpu_percent(interval=None)
+        mem_mb = p.memory_info().rss / (1024 * 1024)
+        python_process_cpu_percent.set(cpu)
+        python_process_memory_mb.set(mem_mb)
+        agent_cpu_percent.set(cpu)
+        agent_memory_mb.set(mem_mb)
+        agent_status.set(1)
+        agent_uptime_seconds.set(time.time() - _START_TIME)
     except Exception:
         pass
 
-    return response
+def _metrics_loop(interval=15):
+    while True:
+        _update_process_metrics()
+        time.sleep(interval)
 
+_update_process_metrics()
+threading.Thread(target=_metrics_loop, args=(15,), daemon=True).start()
 
 # ══════════════════════════════════════════════════════════════
-# BLOCK 10 — CORE FLASK ROUTES  (COMPLETELY UNCHANGED)
-# ──────────────────────────────────────────────────────────────
-# These 4 routes are exactly as they were originally.
-# DO NOT modify them.
+# HOOKS
 # ══════════════════════════════════════════════════════════════
+@application.before_request
+def _t_start():
+    request._start_time = time.time()
 
+@application.after_request
+def _t_end(resp):
+    try:
+        start = getattr(request, "_start_time", None)
+        if start is None:
+            return resp
+        d = time.time() - start
+        m, ep, st = request.method, request.path, str(resp.status_code)
+        app_requests_total.labels(method=m, endpoint=ep, status=st).inc()
+        app_request_duration_seconds.labels(method=m, endpoint=ep).observe(d)
+        http_status_codes_total.labels(code=st).inc()
+        if resp.status_code >= 500:
+            app_errors_total.inc()
+        with APP_STATS_LOCK:
+            APP_STATS["total_requests"] += 1
+            APP_STATS["total_request_time"] += d
+            if resp.status_code < 400:
+                APP_STATS["success_requests"] += 1
+            else:
+                APP_STATS["failed_requests"] += 1
+    except Exception:
+        pass
+    return resp
+
+# ══════════════════════════════════════════════════════════════
+# HELPERS
+# ══════════════════════════════════════════════════════════════
+def _uptime():
+    return max(0.0, time.time() - _START_TIME)
+
+def _system_dict():
+    try:
+        vm = psutil.virtual_memory()
+        p  = psutil.Process(os.getpid())
+        return {
+            "cpu_usage_percent":   psutil.cpu_percent(interval=None),
+            "memory_total_mb":     round(vm.total / 1048576, 2),
+            "memory_used_mb":      round(vm.used  / 1048576, 2),
+            "memory_percent":      vm.percent,
+            "process_cpu_percent": p.cpu_percent(interval=None),
+            "process_memory_mb":   round(p.memory_info().rss / 1048576, 2),
+        }
+    except Exception as e:
+        return {
+            "cpu_usage_percent": 0, "memory_total_mb": 0,
+            "memory_used_mb": 0, "memory_percent": 0,
+            "process_cpu_percent": 0, "process_memory_mb": 0,
+            "error": str(e),
+        }
+
+def _check_bearer(cfg_token):
+    if not cfg_token:
+        return True
+    auth = request.headers.get("Authorization", "")
+    return auth.startswith("Bearer ") and auth[7:].strip() == cfg_token
+
+def _check_monitor_header(cfg_token):
+    if not cfg_token:
+        return True
+    return request.headers.get("X-Monitor-Token", "") == cfg_token
+
+# ══════════════════════════════════════════════════════════════
+# CORE ROUTES
+# ══════════════════════════════════════════════════════════════
 @application.get("/")
 def home():
-    """Main UI — serves templates/index.html. UNTOUCHED."""
-    return render_template("index.html")
-
+    try:
+        return render_template("index.html")
+    except Exception:
+        return Response(
+            "<html><body><h1>SentinelOps-Lite</h1>"
+            "<p>Dashboard active.</p></body></html>",
+            content_type="text/html; charset=utf-8"
+        )
 
 @application.get("/health")
-def health_check():
-    """Liveness / readiness probe for load balancers."""
-    return Response("Healthy", status=200, content_type="text/plain")
+def health():
+    checks = {"app": "ok"}
+    status_str, http = "healthy", 200
+    try:
+        if _db is not None:
+            _db.execute("SELECT 1", fetch=True)
+            checks["database"] = "ok"
+    except Exception as e:
+        checks["database"] = f"error: {e}"
+        status_str, http = "degraded", 503
+    return jsonify({
+        "status":         status_str,
+        "checks":         checks,
+        "uptime_seconds": _uptime(),
+        "version":        _CFG["app_version"],
+    }), http
 
+@application.get("/api")
+def api_root():
+    return jsonify({
+        "message": "Hello from SentinelOps-Lite!",
+        "status":  "running",
+        "version": _CFG["app_version"],
+        "build":   _CFG["build_number"],
+    }), 200
+
+@application.get("/api/status")
+def api_status():
+    return jsonify({
+        "application": {
+            "name":   "SentinelOps-Lite",
+            "status": "running",
+            "uptime": _uptime(),
+        },
+        "system": _system_dict(),
+        "agent": {
+            "provider": _CFG["ai_provider"],
+            "model":    _CFG["ai_model"],
+            "status":   "running",
+        },
+        "deployment": {
+            "version":     _CFG["app_version"],
+            "build":       _CFG["build_number"],
+            "environment": _CFG["environment"],
+            "cloud":       _CFG["target_cloud"],
+            "region":      _CFG["aws_region"],
+        },
+    }), 200
+
+@application.get("/agent/status")
+def agent_status_route():
+    return jsonify({
+        "status":         "running",
+        "provider":       _CFG["ai_provider"],
+        "model":          _CFG["ai_model"],
+        "uptime_seconds": _uptime(),
+    }), 200
 
 @application.get("/metrics", endpoint="app_prometheus_metrics")
-def prometheus_metrics():
-    """Prometheus scrape endpoint. UNTOUCHED."""
+def prom_metrics():
+    if _CFG["metrics_token"] and not _check_bearer(_CFG["metrics_token"]):
+        return Response("Unauthorized", status=401, content_type="text/plain")
+    _update_process_metrics()
     return Response(generate_latest(), content_type=CONTENT_TYPE_LATEST)
 
-
-@application.get("/dashboard/agents")
-def agents_dashboard():
-    """Agent dashboard alias — renders same index.html SPA."""
-    return render_template("index.html")
-
+@application.post("/monitor/status")
+def monitor_status():
+    if _CFG["monitor_token"] and not _check_monitor_header(_CFG["monitor_token"]):
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    _ = request.get_json(silent=True) or {}
+    return jsonify({"ok": True, "timestamp": time.time()}), 200
 
 # ══════════════════════════════════════════════════════════════
-# BLOCK 11 — AGENT MONITOR HTML ROUTES
-# ──────────────────────────────────────────────────────────────
-# All return colorful HTML via HTMLBuilder static methods.
-# Every page has a nav bar linking all pages together.
-# /metrics is taken by Prometheus — we use /monitor instead.
+# DASHBOARD ROUTES (only when real agent_monitor available)
 # ══════════════════════════════════════════════════════════════
-
 def _get_data():
-    """
-    Fetch files + metrics from DB and monitor.
-    Used by every HTML route and JSON API route.
-    """
-    rows = _db.execute(
-        "SELECT * FROM detected_files "
-        "ORDER BY is_ai_agent DESC, is_script DESC, "
-        "is_main_file DESC, file_name",
-        fetch=True
-    )
-    files   = [dict(r) for r in rows]
-    metrics = _monitor.get_all_metrics()
-    return files, metrics
-
-
-def _html(html_str):
-    """Return a Flask HTML Response from a string."""
-    return Response(
-        html_str,
-        status=200,
-        content_type="text/html; charset=utf-8"
-    )
-
-
-@application.get("/dashboard")
-def monitor_dashboard():
-    """
-    Full overview — files, system resources, token/request usage.
-    Auto-refreshes every 10 seconds.
-    """
-    files, metrics = _get_data()
-    return _html(HTMLBuilder.dashboard(files, metrics))
-
-
-@application.get("/files")
-def files_page():
-    """All detected project files — type, purpose, description, size."""
-    files, _ = _get_data()
-    return _html(HTMLBuilder.files(files))
-
-
-@application.get("/agents")
-def agents_page():
-    """
-    Per-agent token, request and resource metrics.
-    Auto-refreshes every 10 seconds.
-    """
-    files, metrics = _get_data()
-    return _html(HTMLBuilder.agents(files, metrics))
-
-
-@application.get("/monitor")
-def monitor_page():
-    """
-    Token/request usage vs limits + estimated cost.
-    Auto-refreshes every 10 seconds.
-    NOTE: route is /monitor because /metrics is Prometheus.
-    """
-    _, metrics = _get_data()
-    return _html(HTMLBuilder.monitor(metrics))
-
-
-@application.get("/model")
-def model_page():
-    """Active model config, rate limits, pricing, all providers."""
-    return _html(HTMLBuilder.model())
-
-
-@application.get("/history")
-def history_page():
-    """Last 50 scan history records."""
-    return _html(HTMLBuilder.history(_db))
-
-
-@application.get("/scan")
-def scan_page():
-    """
-    Triggers a fresh project scan then shows result page.
-    Optional query param: ?path=/your/project/path
-    """
-    sp      = request.args.get("path", SCAN_PATH)
-    scanned = _scanner.scan_project(sp)
-    result  = {
-        "total": len(scanned),
-        "ai":    sum(1 for f in scanned if f["is_ai_agent"]),
-        "sc":    sum(1 for f in scanned if f["is_script"]),
-        "mn":    sum(1 for f in scanned if f["is_main_file"]),
-    }
-    return _html(HTMLBuilder.scan_done(result))
-
-
-@application.get("/reset")
-def reset_page():
-    """Clears all DB tables + in-memory monitor state → shows confirmation."""
-    _db.execute("DELETE FROM detected_files")
-    _db.execute("DELETE FROM token_usage")
-    _db.execute("DELETE FROM request_usage")
-    _db.execute("DELETE FROM resource_usage")
-
-    _monitor.metrics = {
-        "tokens":    defaultdict(
-            lambda: {"per_min": 0, "per_hour": 0, "per_day": 0}
-        ),
-        "requests":  defaultdict(
-            lambda: {"per_min": 0, "per_hour": 0, "per_day": 0}
-        ),
-        "resources": {},
-        "system":    {},
-    }
-    _monitor._tok_log.clear()
-    _monitor._req_log.clear()
-
-    return _html(HTMLBuilder.reset_done())
-
-
-# ══════════════════════════════════════════════════════════════
-# BLOCK 12 — AGENT MONITOR API ROUTES  (JSON)
-# ══════════════════════════════════════════════════════════════
-
-@application.route("/api/metrics/system", methods=["GET"])
-def get_system_metrics():
-    """System CPU, memory, disk metrics as JSON."""
-    try:
-        _, metrics = _get_data()
-        return jsonify(metrics.get("system", {})), 200
-    except Exception as e:
-        application.logger.error(f"System metrics error: {e}")
-        app_exceptions_total.inc()
-        return jsonify({"error": str(e)}), 500
-
-
-@application.route("/api/metrics/tokens", methods=["GET"])
-def get_token_metrics():
-    """Token usage per file — per_min / per_hour / per_day."""
-    try:
-        _, metrics = _get_data()
-        return jsonify(metrics.get("tokens", {})), 200
-    except Exception as e:
-        application.logger.error(f"Token metrics error: {e}")
-        app_exceptions_total.inc()
-        return jsonify({"error": str(e)}), 500
-
-
-@application.route("/api/metrics/requests", methods=["GET"])
-def get_request_metrics():
-    """Aggregated request rates — rpm / rph / rpd."""
-    try:
-        _, metrics = _get_data()
-        reqs = metrics.get("requests", {})
-        return jsonify({
-            "rpm":       sum(v.get("per_min",  0) for v in reqs.values()),
-            "rph":       sum(v.get("per_hour", 0) for v in reqs.values()),
-            "rpd":       sum(v.get("per_day",  0) for v in reqs.values()),
-            "timestamp": time.time()
-        }), 200
-    except Exception as e:
-        application.logger.error(f"Request metrics error: {e}")
-        app_exceptions_total.inc()
-        return jsonify({"error": str(e)}), 500
-
-
-@application.route("/api/agents", methods=["GET"])
-def get_agents():
-    """All detected AI agent files with count."""
-    try:
-        files, _ = _get_data()
-        agents   = [f for f in files if f.get("is_ai_agent")]
-        return jsonify({
-            "agents":    agents,
-            "count":     len(agents),
-            "timestamp": time.time()
-        }), 200
-    except Exception as e:
-        application.logger.error(f"Get agents error: {e}")
-        app_exceptions_total.inc()
-        return jsonify({"error": str(e)}), 500
-
-
-@application.route("/api/agents/<int:agent_id>", methods=["GET"])
-def get_agent(agent_id):
-    """Single agent by DB id, or 404."""
-    try:
-        row = _db.execute(
-            "SELECT * FROM detected_files WHERE id=? AND is_ai_agent=1",
-            (agent_id,), fetch=True
+    if _db and _monitor:
+        rows = _db.execute(
+            "SELECT * FROM detected_files ORDER BY is_ai_agent DESC, "
+            "is_script DESC, is_main_file DESC, file_name", fetch=True
         )
-        if row:
-            return jsonify(dict(row[0])), 200
-        return jsonify({"error": "Agent not found"}), 404
-    except Exception as e:
-        application.logger.error(f"Get agent error: {e}")
-        app_exceptions_total.inc()
-        return jsonify({"error": str(e)}), 500
+        return [dict(r) for r in rows], _monitor.get_all_metrics()
+    return [], {"system": {}, "tokens": {}, "requests": {}, "resources": {}}
 
+def _html(body):
+    return Response(body, status=200, content_type="text/html; charset=utf-8")
 
-@application.route("/api/requests", methods=["GET"])
-def get_requests():
-    """Recent request_usage rows, paginated by ?limit=."""
-    try:
-        limit            = request.args.get("limit", 20, type=int)
-        rows             = _db.execute(
-            "SELECT * FROM request_usage ORDER BY timestamp DESC LIMIT ?",
-            (limit,), fetch=True
-        )
-        scanned_requests = [dict(r) for r in rows]
-        return jsonify({
-            "requests":  scanned_requests,
-            "count":     len(scanned_requests),
-            "timestamp": time.time()
-        }), 200
-    except Exception as e:
-        application.logger.error(f"Get requests error: {e}")
-        app_exceptions_total.inc()
-        return jsonify({"error": str(e)}), 500
+if _HTMLBuilder is not None:
+    @application.get("/dashboard")
+    def dashboard_page():
+        f, m = _get_data(); return _html(_HTMLBuilder.dashboard(f, m))
 
+    @application.get("/files")
+    def files_page():
+        f, _ = _get_data(); return _html(_HTMLBuilder.files(f))
 
-@application.route("/api/providers", methods=["GET"])
-def get_providers():
-    """All providers and their models from MODEL_REGISTRY."""
-    try:
-        providers = [
-            {"name": p, "models": list(cfg["models"].keys())}
-            for p, cfg in MODEL_REGISTRY.items()
-        ]
-        return jsonify({
-            "providers": providers,
-            "count":     len(providers),
-            "timestamp": time.time()
-        }), 200
-    except Exception as e:
-        application.logger.error(f"Get providers error: {e}")
-        app_exceptions_total.inc()
-        return jsonify({"error": str(e)}), 500
+    @application.get("/agents")
+    def agents_page():
+        f, m = _get_data(); return _html(_HTMLBuilder.agents(f, m))
 
+    @application.get("/monitor")
+    def monitor_page():
+        _, m = _get_data(); return _html(_HTMLBuilder.monitor(m))
 
-@application.route("/api/report", methods=["GET"])
-def get_report():
-    """Full snapshot — files + metrics + active config."""
-    try:
-        files, metrics = _get_data()
-        return jsonify({
-            "report": {
-                "files":         files,
-                "system":        metrics.get("system",    {}),
-                "tokens":        metrics.get("tokens",    {}),
-                "requests":      metrics.get("requests",  {}),
-                "resources":     metrics.get("resources", {}),
-                "active_config": ACTIVE_CONFIG,
-            },
-            "timestamp": time.time()
-        }), 200
-    except Exception as e:
-        application.logger.error(f"Get report error: {e}")
-        app_exceptions_total.inc()
-        return jsonify({"error": str(e)}), 500
+    @application.get("/model")
+    def model_page():
+        return _html(_HTMLBuilder.model())
 
+    @application.get("/history")
+    def history_page():
+        return _html(_HTMLBuilder.history(_db))
 
-@application.route("/api/status", methods=["GET"])
-def get_status():
-    """
-    Lightweight running summary.
-    Matches original JSON shape:
-      {"active_agents":0,"agents_count":0,"status":"running",
-       "timestamp":...,"total_requests":0}
-    """
-    try:
-        files, metrics = _get_data()
-        ai_files = [f for f in files if f.get("is_ai_agent")]
-        req_day  = sum(
-            v.get("per_day", 0)
-            for v in metrics.get("requests", {}).values()
-        )
-        return jsonify({
-            "status":         "running",
-            "agents_count":   len(ai_files),
-            "active_agents":  len(ai_files),
-            "total_requests": req_day,
-            "total_files":    len(files),
-            "timestamp":      time.time()
-        }), 200
-    except Exception as e:
-        application.logger.error(f"Get status error: {e}")
-        app_exceptions_total.inc()
-        return jsonify({"error": str(e)}), 500
+    @application.get("/scan")
+    def scan_page():
+        sp = request.args.get("path", _CFG["scan_path"] or str(BASE_DIR))
+        scanned = _scanner.scan_project(sp)
+        r = {
+            "total": len(scanned),
+            "ai":    sum(1 for f in scanned if f["is_ai_agent"]),
+            "sc":    sum(1 for f in scanned if f["is_script"]),
+            "mn":    sum(1 for f in scanned if f["is_main_file"]),
+        }
+        return _html(_HTMLBuilder.scan_done(r))
 
-
-@application.route("/api/refresh", methods=["POST"])
-def refresh_metrics():
-    """Re-read metrics and return current snapshot."""
-    try:
-        files, metrics = _get_data()
-        ai_files       = [f for f in files if f.get("is_ai_agent")]
-        return jsonify({
-            "success":        True,
-            "agents_found":   len(ai_files),
-            "system_metrics": metrics.get("system",   {}),
-            "token_metrics":  metrics.get("tokens",   {}),
-            "req_metrics":    metrics.get("requests", {}),
-            "timestamp":      time.time()
-        }), 200
-    except Exception as e:
-        application.logger.error(f"Refresh error: {e}")
-        app_exceptions_total.inc()
-        return jsonify({"error": str(e)}), 500
-
-
-@application.route("/api/clear", methods=["POST"])
-def clear_data():
-    """
-    Wipes all DB tables and in-memory monitor state.
-    JSON version of /reset — for API consumers.
-    """
-    try:
-        with _SCANNER_LOCK:
-            _db.execute("DELETE FROM detected_files")
-            _db.execute("DELETE FROM token_usage")
-            _db.execute("DELETE FROM request_usage")
-            _db.execute("DELETE FROM resource_usage")
-            _monitor.metrics = {
-                "tokens":    defaultdict(
-                    lambda: {"per_min": 0, "per_hour": 0, "per_day": 0}
-                ),
-                "requests":  defaultdict(
-                    lambda: {"per_min": 0, "per_hour": 0, "per_day": 0}
-                ),
-                "resources": {},
-                "system":    {},
-            }
-            _monitor._tok_log.clear()
-            _monitor._req_log.clear()
-        return jsonify({
-            "success":   True,
-            "message":   "Data cleared",
-            "timestamp": time.time()
-        }), 200
-    except Exception as e:
-        application.logger.error(f"Clear data error: {e}")
-        app_exceptions_total.inc()
-        return jsonify({"error": str(e)}), 500
-
+    @application.get("/reset")
+    def reset_page():
+        for t in ("detected_files","token_usage","request_usage","resource_usage"):
+            _db.execute(f"DELETE FROM {t}")
+        return _html(_HTMLBuilder.reset_done())
 
 # ══════════════════════════════════════════════════════════════
-# BLOCK 13 — ERROR HANDLERS
+# ERROR HANDLERS
 # ══════════════════════════════════════════════════════════════
+@application.errorhandler(404)
+def _404(e):
+    return jsonify({"error": "Not found", "status": 404}), 404
 
 @application.errorhandler(Exception)
-def handle_exception(e):
-    """Catch-all for unhandled exceptions."""
+def _exc(e):
     try:
         app_exceptions_total.inc()
         with APP_STATS_LOCK:
             APP_STATS["exceptions"] += 1
     except Exception:
         pass
-    application.logger.error(f"Unhandled exception: {e}", exc_info=True)
+    application.logger.exception(f"Unhandled: {e}")
     return jsonify({"error": "Internal server error", "status": 500}), 500
 
-
-@application.errorhandler(404)
-def not_found(error):
-    """404 — path not matched by any route."""
-    return jsonify({"error": "Not found", "status": 404}), 404
-
-
 # ══════════════════════════════════════════════════════════════
-# BLOCK 14 — WSGI / __main__ ENTRY POINT
-# ──────────────────────────────────────────────────────────────
-# Production: gunicorn imports `application` directly.
-# Local dev:  python app.py
+# ENTRY
 # ══════════════════════════════════════════════════════════════
-
 if __name__ == "__main__":
-    port  = int(os.environ.get("PORT", "5000"))
-    debug = os.environ.get("FLASK_DEBUG", "0") == "1"
-    application.run(host="0.0.0.0", port=port, debug=debug)
+    application.run(
+        host="0.0.0.0",
+        port=_CFG["port"],
+        debug=_CFG["flask_debug"],
+    )

@@ -1,15 +1,6 @@
 """
-Unit tests for SentinelOps-Lite (app.py)
-
-Run:
-    pytest test_app.py -v
-    pytest test_app.py -v --tb=short
-
-Every test is self-contained:
-  - Uses application.test_client() directly
-  - No shared global state between tests
-  - No external network calls
-  - Deterministic regardless of run order
+test_app.py — SentinelOps-Lite test suite
+Tests /health, /api, /api/status, /agent/status, /metrics, /monitor/status
 """
 from __future__ import annotations
 
@@ -21,7 +12,8 @@ from unittest.mock import MagicMock
 
 # ══════════════════════════════════════════════════════════════
 # STUB agent_monitor BEFORE importing app
-# This prevents ImportError if agent_monitor is not installed.
+# app.py uses getattr(...) so a minimal stub is enough, but we
+# populate common attrs to be safe.
 # ══════════════════════════════════════════════════════════════
 
 def _stub_agent_monitor() -> None:
@@ -29,9 +21,27 @@ def _stub_agent_monitor() -> None:
     if "agent_monitor" in sys.modules:
         return
     mod = types.ModuleType("agent_monitor")
+    mod.__file__ = "<test-stub>"
+
+    # Classes (app.py checks these with getattr — None is OK)
+    mod.MetricsDB       = None
+    mod.ProjectScanner  = None
+    mod.ResourceMonitor = None
+    mod.HTMLBuilder     = None
+
+    # Constants
+    mod.ACTIVE_CONFIG   = {"name": "test-model", "provider": "test"}
+    mod.MODEL_REGISTRY  = {}
+    mod.ACTIVE_PROVIDER = "test"
+    mod.ACTIVE_MODEL    = "test-model"
+    mod.AI_PROVIDER     = "test"
+    mod.AI_MODEL        = "test-model"
+
+    # scanner_bp is optional; app.py only registers if it's a Blueprint
     bp = MagicMock()
-    bp.name = "scanner"       # Flask requires blueprint.name to be a string
+    bp.name = "scanner"
     mod.scanner_bp = bp
+
     sys.modules["agent_monitor"] = mod
 
 
@@ -45,7 +55,7 @@ from app import application  # noqa: E402  (import after stub)
 # ══════════════════════════════════════════════════════════════
 
 def test_home():
-    """GET / returns 200 HTML (the dashboard page)."""
+    """GET / returns 200 HTML."""
     client = application.test_client()
     response = client.get("/")
     assert response.status_code == 200
@@ -57,75 +67,37 @@ def test_home():
 # ══════════════════════════════════════════════════════════════
 
 def test_health_returns_200():
-    """
-    GET /health must return HTTP 200 (or 503 when degraded).
-    Both are valid — probes read the body, not just the status code.
-    """
+    """GET /health returns 200 (healthy) or 503 (degraded)."""
     client = application.test_client()
     response = client.get("/health")
-    # 200 = healthy, 503 = degraded — both are intentional
     assert response.status_code in (200, 503), (
         f"Unexpected status {response.status_code} from /health"
     )
 
 
 def test_health_returns_json():
-    """
-    FIX for the original failing test.
-
-    BEFORE (broken):
-        assert response.content_type.startswith("text/html")
-        → FAILS because app.py returns jsonify(), not render_template()
-
-    AFTER (correct):
-        assert response.content_type.startswith("application/json")
-        → PASSES because /health now returns a JSON health payload
-
-    WHY the change was made in app.py:
-        Kubernetes liveness probes, load balancers, and monitoring
-        tools all expect JSON from /health — not an HTML page.
-        render_template("index.html") was wrong for a health endpoint.
-    """
+    """GET /health returns application/json (NOT html)."""
     client = application.test_client()
     response = client.get("/health")
-
-    # ✅ Correct assertion — app returns JSON, NOT HTML
     assert response.content_type.startswith("application/json"), (
-        f"Expected 'application/json', got {response.content_type!r}.\n"
-        "If this fails, check that app.py /health uses jsonify() "
-        "and NOT render_template()."
+        f"Expected 'application/json', got {response.content_type!r}"
     )
 
 
 def test_health_body_structure():
-    """Response body must contain required fields for probe compatibility."""
+    """/health body must have status, checks, uptime_seconds, version."""
     client = application.test_client()
     response = client.get("/health")
     data = response.get_json()
 
-    assert data is not None, \
-        "/health returned non-JSON body"
-
-    assert "status" in data, \
-        f"Missing 'status' field. Got keys: {list(data.keys())}"
-
-    assert data["status"] in ("healthy", "degraded"), \
-        f"'status' must be 'healthy' or 'degraded', got {data['status']!r}"
-
-    assert "checks" in data, \
-        "Missing 'checks' field — required for probe detail"
-
-    assert "uptime_seconds" in data, \
-        "Missing 'uptime_seconds' field"
-
-    assert isinstance(data["uptime_seconds"], (int, float)), \
-        f"'uptime_seconds' must be numeric, got {type(data['uptime_seconds'])}"
-
-    assert data["uptime_seconds"] >= 0, \
-        f"'uptime_seconds' cannot be negative, got {data['uptime_seconds']}"
-
-    assert "version" in data, \
-        "Missing 'version' field"
+    assert data is not None, "/health returned non-JSON body"
+    assert "status" in data
+    assert data["status"] in ("healthy", "degraded")
+    assert "checks" in data
+    assert "uptime_seconds" in data
+    assert isinstance(data["uptime_seconds"], (int, float))
+    assert data["uptime_seconds"] >= 0
+    assert "version" in data
 
 
 # ══════════════════════════════════════════════════════════════
@@ -133,7 +105,7 @@ def test_health_body_structure():
 # ══════════════════════════════════════════════════════════════
 
 def test_api():
-    """GET /api returns the hello message and running status."""
+    """GET /api returns hello message and running status."""
     client = application.test_client()
     response = client.get("/api")
 
@@ -152,7 +124,7 @@ def test_api():
 # ══════════════════════════════════════════════════════════════
 
 def test_api_status():
-    """GET /api/status returns all four top-level sections."""
+    """GET /api/status has application/system/agent/deployment sections."""
     client = application.test_client()
     response = client.get("/api/status")
 
@@ -161,16 +133,12 @@ def test_api_status():
 
     data = response.get_json()
 
-    # All four sections must be present
     for section in ("application", "system", "agent", "deployment"):
-        assert section in data, \
-            f"Missing section '{section}' in /api/status response"
+        assert section in data, f"Missing section '{section}'"
 
-    # Application block
     assert data["application"]["name"] == "SentinelOps-Lite"
     assert data["deployment"]["version"]
 
-    # System block — all metric keys must be present
     system = data["system"]
     for key in (
         "cpu_usage_percent",
@@ -180,10 +148,8 @@ def test_api_status():
         "process_cpu_percent",
         "process_memory_mb",
     ):
-        assert key in system, \
-            f"Missing system metric key: '{key}'"
+        assert key in system, f"Missing system metric key: '{key}'"
 
-    # Agent block
     assert "provider" in data["agent"]
     assert "model" in data["agent"]
 
@@ -201,7 +167,6 @@ def test_agent_status():
     assert response.content_type.startswith("application/json")
 
     data = response.get_json()
-    assert "status" in data
     assert data["status"] == "running"
     assert "provider" in data
     assert "model" in data
@@ -213,83 +178,57 @@ def test_agent_status():
 # ══════════════════════════════════════════════════════════════
 
 def test_metrics_endpoint():
-    """
-    GET /metrics returns Prometheus text format with required metric names.
-    METRICS_TOKEN is empty (default) so no auth header is needed.
-    """
-    client = application.test_client()
-    response = client.get("/metrics")
+    """GET /metrics returns Prometheus text with required metrics."""
+    import app as flask_app
 
-    assert response.status_code == 200, (
-        f"Got {response.status_code} — if METRICS_TOKEN is set in your "
-        "environment, /metrics requires Authorization: Bearer <token>"
-    )
-    assert response.content_type.startswith("text/plain")
+    # Ensure no token so no auth required
+    original = flask_app._CFG["metrics_token"]
+    flask_app._CFG["metrics_token"] = ""
 
-    body = response.data
+    try:
+        client = application.test_client()
+        response = client.get("/metrics")
 
-    # Original metrics — must still be present for backward compatibility
-    assert b"app_requests_total" in body, \
-        "Missing metric: app_requests_total"
-    assert b"python_process_cpu_percent" in body, \
-        "Missing metric: python_process_cpu_percent"
+        assert response.status_code == 200
+        assert response.content_type.startswith("text/plain")
 
-    # New agent metrics — added in the app.py update
-    assert b"agent_status" in body, \
-        "Missing metric: agent_status"
-    assert b"agent_uptime_seconds" in body, \
-        "Missing metric: agent_uptime_seconds"
-    assert b"agent_cpu_percent" in body, \
-        "Missing metric: agent_cpu_percent"
-    assert b"agent_memory_mb" in body, \
-        "Missing metric: agent_memory_mb"
+        body = response.data
+        assert b"app_requests_total" in body
+        assert b"python_process_cpu_percent" in body
+        assert b"agent_status" in body
+        assert b"agent_uptime_seconds" in body
+        assert b"agent_cpu_percent" in body
+        assert b"agent_memory_mb" in body
+    finally:
+        flask_app._CFG["metrics_token"] = original
 
 
 def test_metrics_blocked_without_token():
-    """
-    When METRICS_TOKEN is configured, unauthenticated requests
-    must receive HTTP 401 — not 200.
-
-    FIX: We patch _CFG directly (not os.environ) because app.py
-    reads os.environ once at import time into _CFG.
-    monkeypatch.setenv() after import has no effect on _CFG.
-    """
+    """/metrics with METRICS_TOKEN set must reject unauthenticated calls."""
     import app as flask_app
 
-    # Save and patch _CFG directly
-    original_token = flask_app._CFG["metrics_token"]
+    original = flask_app._CFG["metrics_token"]
     flask_app._CFG["metrics_token"] = "test-secret-token"
 
     try:
         client = application.test_client()
 
-        # No token → 401
-        resp_no_token = client.get("/metrics")
-        assert resp_no_token.status_code == 401, (
-            f"Expected 401 without token, got {resp_no_token.status_code}"
-        )
+        resp_no = client.get("/metrics")
+        assert resp_no.status_code == 401
 
-        # Wrong token → 401
         resp_wrong = client.get(
             "/metrics",
             headers={"Authorization": "Bearer wrong-token"},
         )
-        assert resp_wrong.status_code == 401, (
-            f"Expected 401 with wrong token, got {resp_wrong.status_code}"
-        )
+        assert resp_wrong.status_code == 401
 
-        # Correct token → 200
         resp_ok = client.get(
             "/metrics",
             headers={"Authorization": "Bearer test-secret-token"},
         )
-        assert resp_ok.status_code == 200, (
-            f"Expected 200 with correct token, got {resp_ok.status_code}"
-        )
-
+        assert resp_ok.status_code == 200
     finally:
-        # Always restore original value — never leave patched state
-        flask_app._CFG["metrics_token"] = original_token
+        flask_app._CFG["metrics_token"] = original
 
 
 # ══════════════════════════════════════════════════════════════
@@ -297,13 +236,11 @@ def test_metrics_blocked_without_token():
 # ══════════════════════════════════════════════════════════════
 
 def test_monitor_status_no_token_configured():
-    """
-    When MONITOR_TOKEN is empty (default), any POST is accepted.
-    """
+    """MONITOR_TOKEN empty → POST accepted."""
     import app as flask_app
 
     original = flask_app._CFG["monitor_token"]
-    flask_app._CFG["monitor_token"] = ""   # ensure open auth
+    flask_app._CFG["monitor_token"] = ""
 
     try:
         client = application.test_client()
@@ -315,97 +252,58 @@ def test_monitor_status_no_token_configured():
 
 
 def test_monitor_status_receiver():
-    """
-    Verify that an authorized CI-agent monitoring event is accepted.
-
-    FIX vs original test:
-        Original used monkeypatch.setenv("MONITOR_TOKEN", ...) which
-        has NO effect because app.py reads os.environ once at import
-        time into _CFG["monitor_token"].
-
-        Correct approach: patch _CFG["monitor_token"] directly,
-        then restore it in a finally block.
-
-    The extra payload fields (provider, model, tokens, etc.) are
-    accepted by the endpoint but not validated — only the token
-    matters for the 200 OK response.
-    """
+    """POST /monitor/status with X-Monitor-Token."""
     import app as flask_app
 
     test_token = "unit-test-monitor-token"
-
-    # Patch _CFG directly — this is what app.py actually reads
     original = flask_app._CFG["monitor_token"]
     flask_app._CFG["monitor_token"] = test_token
 
     try:
         client = application.test_client()
-
         payload = {
-            "agent_name":                "test_agent",
-            "stage":                     "pre_deploy",
-            "cloud":                     "aws",
-            "status":                    "approved",
-            "decision":                  "pass",
-            "provider":                  "gemini",
-            "model":                     "gemini-2.5-flash",
-            "prompt_tokens":             10,
-            "completion_tokens":         5,
-            "total_tokens":              15,
-            "requests":                  1,
-            "api_key_count":             1,
-            "execution_time_seconds":    1.0,
-            "api_response_time_seconds": 0.5,
+            "agent_name": "test_agent",
+            "stage":      "pre_deploy",
+            "cloud":      "aws",
+            "status":     "approved",
+            "provider":   "gemini",
+            "model":      "gemini-2.5-flash",
+            "total_tokens": 15,
+            "requests": 1,
         }
 
-        # ── Without token → must be rejected ─────────────────
-        resp_no_token = client.post("/monitor/status", json=payload)
-        assert resp_no_token.status_code == 401, (
-            f"Expected 401 without token, got {resp_no_token.status_code}"
-        )
+        resp_no = client.post("/monitor/status", json=payload)
+        assert resp_no.status_code == 401
 
-        # ── With wrong token → must be rejected ───────────────
         resp_wrong = client.post(
             "/monitor/status",
             json=payload,
-            headers={"X-Monitor-Token": "completely-wrong"},
+            headers={"X-Monitor-Token": "wrong"},
         )
-        assert resp_wrong.status_code == 401, (
-            f"Expected 401 with wrong token, got {resp_wrong.status_code}"
-        )
+        assert resp_wrong.status_code == 401
 
-        # ── With correct token → must be accepted ─────────────
         resp_ok = client.post(
             "/monitor/status",
             json=payload,
             headers={"X-Monitor-Token": test_token},
         )
-        assert resp_ok.status_code == 200, (
-            f"Expected 200 with correct token, got {resp_ok.status_code}"
-        )
-        body = resp_ok.get_json()
-        assert body is not None,    "Response body is not JSON"
-        assert body["ok"] is True,  f"Expected ok=True, got {body}"
-
+        assert resp_ok.status_code == 200
+        assert resp_ok.get_json()["ok"] is True
     finally:
-        # Always restore — never leave patched global state
         flask_app._CFG["monitor_token"] = original
 
 
 # ══════════════════════════════════════════════════════════════
-# ENV VAR CONTRACT  — .env.example completeness check
+# ENV VAR CONTRACT
 # ══════════════════════════════════════════════════════════════
 
 def test_env_example_contains_all_required_vars():
-    """
-    Verify .env.example documents every variable app.py reads.
-    This test catches the METRICS_TOKEN omission that blocked CI.
-    """
+    """.env.example must document every variable app.py reads."""
     import pathlib
+    import pytest
 
     env_file = pathlib.Path(".env.example")
     if not env_file.exists():
-        import pytest
         pytest.skip(".env.example not found in working directory")
 
     defined: set[str] = set()
@@ -414,8 +312,7 @@ def test_env_example_contains_all_required_vars():
         if not line or line.startswith("#"):
             continue
         if "=" in line:
-            var_name = line.split("=", 1)[0].strip()
-            defined.add(var_name)
+            defined.add(line.split("=", 1)[0].strip())
 
     required = {
         "APP_VERSION",
@@ -425,7 +322,7 @@ def test_env_example_contains_all_required_vars():
         "FLASK_DEBUG",
         "AI_PROVIDER",
         "AI_MODEL",
-        "METRICS_TOKEN",      # was missing — caused CI failure
+        "METRICS_TOKEN",
         "MONITOR_TOKEN",
         "TARGET_CLOUD",
         "AWS_REGION",
@@ -433,7 +330,6 @@ def test_env_example_contains_all_required_vars():
 
     missing = required - defined
     assert not missing, (
-        f".env.example is missing these required variables:\n"
+        ".env.example is missing:\n"
         + "\n".join(f"  • {v}" for v in sorted(missing))
-        + "\n\nAdd them so CI and new developers don't miss them."
     )
