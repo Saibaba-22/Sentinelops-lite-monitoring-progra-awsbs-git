@@ -408,6 +408,69 @@ def debug4():
         "monitor_id":  id(_monitor) if _monitor else None,
     })
 
+@application.get("/debug5")
+def debug5():
+    """Test the exact SQL from _get_data() step by step."""
+    try:
+        # Test 1: basic select (should work — same as debug2)
+        r1 = _db.execute("SELECT * FROM detected_files", fetch=True)
+
+        # Test 2: with ORDER BY
+        r2 = _db.execute(
+            "SELECT * FROM detected_files ORDER BY file_name", fetch=True
+        )
+
+        # Test 3: the exact query from _get_data
+        r3 = _db.execute(
+            "SELECT * FROM detected_files ORDER BY is_ai_agent DESC, "
+            "is_script DESC, is_main_file DESC, file_name", fetch=True
+        )
+
+        return jsonify({
+            "test1_basic":      len(r1) if r1 else 0,
+            "test2_order":      len(r2) if r2 else 0,
+            "test3_full_order": len(r3) if r3 else 0,
+            "r1_type":          str(type(r1)),
+            "r3_type":          str(type(r3)),
+            "r3_is_none":       r3 is None,
+        })
+    except Exception as e:
+        import traceback
+        return jsonify(
+            {"error": str(e), "traceback": traceback.format_exc()}
+        ), 500
+
+
+@application.get("/debug6")
+def debug6():
+    """Call _get_data() and dump every intermediate value."""
+    import traceback
+    info = {
+        "_db_is_None":      _db is None,
+        "_monitor_is_None": _monitor is None,
+        "_scanner_is_None": _scanner is None,
+    }
+    try:
+        rows = _db.execute(
+            "SELECT * FROM detected_files ORDER BY is_ai_agent DESC, "
+            "is_script DESC, is_main_file DESC, file_name", fetch=True
+        )
+        info["raw_rows_type"] = str(type(rows))
+        info["raw_rows_len"]  = len(rows) if rows is not None else "None"
+        info["raw_rows_bool"] = bool(rows)
+
+        # This is the exact line _get_data uses
+        result = [dict(r) for r in (rows or [])]
+        info["result_len"] = len(result)
+        info["first_row"]  = result[0] if result else None
+
+        m = _monitor.get_all_metrics()
+        info["metrics_keys"]      = list(m.keys())
+        info["metrics_system"]    = m.get("system", {})
+    except Exception as e:
+        info["error"]     = str(e)
+        info["traceback"] = traceback.format_exc()
+    return jsonify(info), 200
 
 @application.get("/rescan")
 def rescan():
