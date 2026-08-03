@@ -325,6 +325,18 @@ def history_page():
     """
     return _html(HTMLBuilder.history(_db))
 
+@application.get("/debug/env")
+def debug_env():
+    """TEMPORARY — remove after debugging."""
+    key = os.environ.get("GEMINI_API_KEY", "")
+    masked = key[:4] + "****" + key[-4:] if len(key) > 8 else "EMPTY"
+    return jsonify({
+        "GEMINI_API_KEY": masked,
+        "AI_PROVIDER":    os.environ.get("AI_PROVIDER", "not set"),
+        "AI_MODEL":       os.environ.get("AI_MODEL", "not set"),
+        "provider":       ACTIVE_CONFIG.get("provider"),
+        "api_key_in_cfg": bool(ACTIVE_CONFIG.get("api_key")),
+    })
 
 # ── /scan ─────────────────────────────────────────────────────
 @application.get("/scan")

@@ -167,9 +167,14 @@ MODEL_REGISTRY = {
 
 
 def _resolve_config() -> dict:
-    """Resolve active provider + model into a flat config dict."""
+    """
+    Resolve active provider + model into a flat config dict.
+    FIX: Re-reads API key from environment at call time,
+    not at module import time — fixes AWS Beanstalk timing issue.
+    """
     pcfg = MODEL_REGISTRY.get(ACTIVE_PROVIDER, {})
     mcfg = pcfg.get("models", {}).get(ACTIVE_MODEL, {})
+
     if not mcfg:
         print(f"[monitor] ⚠ Model '{ACTIVE_MODEL}' not found, using zeros")
         mcfg = {
@@ -178,21 +183,49 @@ def _resolve_config() -> dict:
             "cost_input_per_1k": 0.0, "cost_output_per_1k": 0.0,
             "context_window": 0,
         }
-    key_ok = "✅ SET" if pcfg.get("api_key") else "❌ MISSING"
-    print(f"[monitor] Provider={ACTIVE_PROVIDER} Model={ACTIVE_MODEL} Key={key_ok}")
+
+    # ══════════════════════════════════════════════════════════
+    # FIX: Re-read API key LIVE from environment
+    # ──────────────────────────────────────────────────────────
+    # On AWS Beanstalk / GitHub Actions, environment variables
+    # may not be available when Python first imports the module.
+    # Reading them again here catches late-loaded secrets.
+    # ══════════════════════════════════════════════════════════
+    _live_keys = {
+        "google":    os.environ.get("GEMINI_API_KEY",
+                     os.environ.get("GOOGLE_API_KEY", "")),
+        "openai":    os.environ.get("OPENAI_API_KEY", ""),
+        "anthropic": os.environ.get("ANTHROPIC_API_KEY", ""),
+        "groq":      os.environ.get("GROQ_API_KEY", ""),
+        "mistral":   os.environ.get("MISTRAL_API_KEY", ""),
+        "ollama":    "",  # local — no key needed
+    }
+
+    # Use live key; fall back to registry key; fall back to ""
+    api_key = (
+        _live_keys.get(ACTIVE_PROVIDER, "")
+        or pcfg.get("api_key", "")
+    )
+
+    key_ok = "✅ SET" if api_key else "❌ MISSING"
+    print(f"[monitor] Provider={ACTIVE_PROVIDER} "
+          f"Model={ACTIVE_MODEL} Key={key_ok}")
+
     return {
         "name":     ACTIVE_MODEL,
         "provider": ACTIVE_PROVIDER,
-        "api_key":  pcfg.get("api_key",  ""),
+        "api_key":  api_key,            # ← LIVE key, not stale one
         "base_url": pcfg.get("base_url", ""),
-        "tpm": mcfg["tpm_limit"],  "tph": mcfg["tph_limit"],
-        "tpd": mcfg["tpd_limit"],  "rpm": mcfg["rpm_limit"],
-        "rph": mcfg["rph_limit"],  "rpd": mcfg["rpd_limit"],
+        "tpm":      mcfg["tpm_limit"],
+        "tph":      mcfg["tph_limit"],
+        "tpd":      mcfg["tpd_limit"],
+        "rpm":      mcfg["rpm_limit"],
+        "rph":      mcfg["rph_limit"],
+        "rpd":      mcfg["rpd_limit"],
         "cost_in":  mcfg["cost_input_per_1k"],
         "cost_out": mcfg["cost_output_per_1k"],
         "ctx":      mcfg["context_window"],
     }
-
 
 ACTIVE_CONFIG: dict = _resolve_config()
 
@@ -1274,7 +1307,25 @@ tr:hover td{background:#0d1628}
     @staticmethod
     def model():
         cfg = ACTIVE_CONFIG
-        key_ok = bool(cfg['api_key'])
+
+        # ── Re-read API key live from environment ──────────────
+        # cfg['api_key'] was set at import time (may be empty
+        # on AWS Beanstalk because secrets load after import).
+        # We re-read directly from os.environ here instead.
+        _live_keys = {
+            "google":    os.environ.get("GEMINI_API_KEY",
+                         os.environ.get("GOOGLE_API_KEY", "")),
+            "openai":    os.environ.get("OPENAI_API_KEY",    ""),
+            "anthropic": os.environ.get("ANTHROPIC_API_KEY", ""),
+            "groq":      os.environ.get("GROQ_API_KEY",      ""),
+            "mistral":   os.environ.get("MISTRAL_API_KEY",   ""),
+            "ollama":    "local",
+        }
+        live_key = (
+            _live_keys.get(cfg['provider'], "")
+            or cfg['api_key']
+        )
+        key_ok = bool(live_key)
         ks = "✅ API Key Set" if key_ok else "❌ API Key Missing"
         kc = "a-ok" if key_ok else "a-bad"
 
