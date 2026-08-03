@@ -511,24 +511,18 @@ def monitor_status():
 def _get_data():
     if _db is None or _monitor is None:
         return [], {"system": {}, "tokens": {}, "requests": {}, "resources": {}}
-    try:
+    rows = _db.execute(
+        "SELECT * FROM detected_files ORDER BY is_ai_agent DESC, "
+        "is_script DESC, is_main_file DESC, file_name", fetch=True
+    )
+    if not rows and _scanner:
+        target = _CFG["scan_path"] or str(BASE_DIR)
+        _scanner.scan_project(target)
         rows = _db.execute(
             "SELECT * FROM detected_files ORDER BY is_ai_agent DESC, "
             "is_script DESC, is_main_file DESC, file_name", fetch=True
         )
-        # If DB empty in this worker, trigger a scan and re-read
-        if not rows and _scanner:
-            print(f"[app] pid={os.getpid()} DB empty on read, scanning...")
-            target = _CFG["scan_path"] or str(BASE_DIR)
-            _scanner.scan_project(target)
-            rows = _db.execute(
-                "SELECT * FROM detected_files ORDER BY is_ai_agent DESC, "
-                "is_script DESC, is_main_file DESC, file_name", fetch=True
-            )
-        return [dict(r) for r in (rows or [])], _monitor.get_all_metrics()
-    except Exception as e:
-        print(f"[app] _get_data error: {e}")
-        return [], {"system": {}, "tokens": {}, "requests": {}, "resources": {}}
+    return [dict(r) for r in (rows or [])], _monitor.get_all_metrics()
 
 
 def _html(body):

@@ -284,7 +284,7 @@ class MetricsDB:
         c = sqlite3.connect(self.db_path, check_same_thread=False)
         c.row_factory = sqlite3.Row
         return c
-        
+
     def _init_db(self):
         c = self._conn()
         c.executescript("""
@@ -738,7 +738,7 @@ class ResourceMonitor:
                 f"req/day={total_req:,}"
             )
 
-def _sim(self):
+    def _sim(self):
     """
     Simulate token/request usage for detected AI agents.
     Runs every cycle — guaranteed data on dashboard.
