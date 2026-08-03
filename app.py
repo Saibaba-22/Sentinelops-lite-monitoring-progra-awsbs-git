@@ -8,26 +8,28 @@ BLOCK MAP
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   BLOCK 1  ── Standard-library & third-party imports
   BLOCK 2  ── Path / sys.path setup
-  BLOCK 3  ── Import classes from agent_monitor.py
-  BLOCK 4  ── Import Prometheus counters from monitoring/metrics.py
-  BLOCK 5  ── Thread-safety locks
-  BLOCK 6  ── Deferred metrics init inside app context
-  BLOCK 7  ── Prometheus request lifecycle hooks
-  BLOCK 8  ── Core Flask routes (UNCHANGED)
-               GET  /                  → index.html  (UNTOUCHED)
+  BLOCK 3  ── Flask app creation  (single instance)
+  BLOCK 4  ── Import from agent_monitor.py  (classes only)
+  BLOCK 5  ── Import Prometheus counters from monitoring/metrics.py
+  BLOCK 6  ── Component initialisation  (DB / Scanner / Monitor)
+  BLOCK 7  ── Thread-safety locks
+  BLOCK 8  ── Deferred metrics init inside app context
+  BLOCK 9  ── Prometheus request lifecycle hooks
+  BLOCK 10 ── Core Flask routes  (UNCHANGED)
+               GET  /                  → index.html
                GET  /health            → plain-text health check
                GET  /metrics           → Prometheus scrape endpoint
                GET  /dashboard/agents  → index.html alias
-  BLOCK 9  ── Agent Monitor HTML routes (NEW - all return HTML)
-               GET  /dashboard         → HTML dashboard
-               GET  /files             → HTML files page
-               GET  /agents            → HTML agents page
-               GET  /monitor           → HTML metrics page
-               GET  /model             → HTML model page
-               GET  /history           → HTML history page
-               GET  /scan              → trigger scan → HTML result
-               GET  /reset             → reset data  → HTML result
-  BLOCK 10 ── Agent Monitor API routes (JSON - scanner-backed)
+  BLOCK 11 ── Agent Monitor HTML routes
+               GET  /dashboard         → HTMLBuilder.dashboard()
+               GET  /files             → HTMLBuilder.files()
+               GET  /agents            → HTMLBuilder.agents()
+               GET  /monitor           → HTMLBuilder.monitor()
+               GET  /model             → HTMLBuilder.model()
+               GET  /history           → HTMLBuilder.history()
+               GET  /scan              → HTMLBuilder.scan_done()
+               GET  /reset             → HTMLBuilder.reset_done()
+  BLOCK 12 ── Agent Monitor API routes  (JSON)
                GET  /api/metrics/system
                GET  /api/metrics/tokens
                GET  /api/metrics/requests
@@ -39,8 +41,8 @@ BLOCK MAP
                GET  /api/status
                POST /api/refresh
                POST /api/clear
-  BLOCK 11 ── Error handlers
-  BLOCK 12 ── WSGI / __main__ entry point
+  BLOCK 13 ── Error handlers
+  BLOCK 14 ── WSGI / __main__ entry point
 """
 
 # ══════════════════════════════════════════════════════════════
@@ -51,6 +53,7 @@ import os
 import sys
 import time
 import threading
+from collections import defaultdict
 from pathlib import Path
 
 from flask import (
@@ -73,80 +76,146 @@ if str(BASE_DIR) not in sys.path:
 
 
 # ══════════════════════════════════════════════════════════════
-# BLOCK 3 — IMPORT CLASSES FROM agent_monitor.py
+# BLOCK 3 — FLASK APP CREATION
 # ──────────────────────────────────────────────────────────────
-# agent_monitor.py now contains ONLY classes — no HTTP server,
-# no Flask app, no routes.
-# We create the Flask app here and own ALL routes.
+# Single instance created here — never duplicated.
 # ══════════════════════════════════════════════════════════════
 
-from flask import Flask
 application = Flask(__name__)
 
-from agent_monitor import (
-    MetricsDB,
-    ProjectScanner,
-    ResourceMonitor,
-    HTMLBuilder,
-    ACTIVE_CONFIG,
-    MODEL_REGISTRY,
-)
 
-# ── Initialise components ─────────────────────────────────────
-SCAN_PATH = os.environ.get("SCAN_PATH", str(BASE_DIR))
+# ══════════════════════════════════════════════════════════════
+# BLOCK 4 — IMPORT FROM agent_monitor.py
+# ──────────────────────────────────────────────────────────────
+# agent_monitor.py = pure classes, no Flask, no HTTP server.
+# All exports verified from the file provided.
+# ══════════════════════════════════════════════════════════════
 
-_db      = MetricsDB()
-_scanner = ProjectScanner(_db)
-_monitor = ResourceMonitor(_db)
-_monitor.start_monitoring()
-
-# ── Initial scan on startup ───────────────────────────────────
 try:
-    _scanner.scan_project(SCAN_PATH)
-    print(f"[app] ✅ Initial scan complete: {SCAN_PATH}")
-except Exception as _e:
-    print(f"[app] ⚠ Initial scan error: {_e}")
+    from agent_monitor import (
+        MetricsDB,
+        ProjectScanner,
+        ResourceMonitor,
+        HTMLBuilder,
+        ACTIVE_CONFIG,
+        MODEL_REGISTRY,
+        ACTIVE_PROVIDER,
+        ACTIVE_MODEL,
+        AI_PROVIDER,
+        AI_MODEL,
+    )
+    print("[app] ✅ agent_monitor imported OK")
+except ImportError as e:
+    print(f"[app] ❌ agent_monitor import FAILED: {e}")
+    raise
 
 
 # ══════════════════════════════════════════════════════════════
-# BLOCK 4 — IMPORT PROMETHEUS COUNTERS
+# BLOCK 5 — IMPORT PROMETHEUS COUNTERS
+# ══════════════════════════════════════════════════════════════
+
+try:
+    from monitoring.metrics import (
+        start_metrics_updater,
+        update_metrics,
+        app_requests_total,
+        app_request_duration_seconds,
+        app_errors_total,
+        app_exceptions_total,
+        http_status_codes_total,
+        APP_STATS,
+    )
+    print("[app] ✅ monitoring.metrics imported OK")
+except ImportError as e:
+    print(f"[app] ❌ monitoring.metrics import FAILED: {e}")
+    raise
+
+
+# ══════════════════════════════════════════════════════════════
+# BLOCK 6 — COMPONENT INITIALISATION
 # ──────────────────────────────────────────────────────────────
-# Unchanged — exactly as your original app.py had it.
+# Import order:
+#   BLOCK 3 (Flask app) → BLOCK 4 (agent_monitor) →
+#   BLOCK 5 (metrics)   → BLOCK 6 (init components)
+#
+# SCAN_PATH priority:
+#   1. SCAN_PATH env var  (explicit override)
+#   2. /var/app/current   (AWS Beanstalk standard)
+#   3. BASE_DIR           (local dev fallback)
 # ══════════════════════════════════════════════════════════════
 
-from monitoring.metrics import (
-    start_metrics_updater,
-    update_metrics,
-    app_requests_total,
-    app_request_duration_seconds,
-    app_errors_total,
-    app_exceptions_total,
-    http_status_codes_total,
-    APP_STATS,
+_BEANSTALK_PATH = "/var/app/current"
+SCAN_PATH = os.environ.get(
+    "SCAN_PATH",
+    _BEANSTALK_PATH if os.path.exists(_BEANSTALK_PATH) else str(BASE_DIR)
 )
+print(f"[app] 📁 SCAN_PATH = {SCAN_PATH}")
+
+# ── Database ──────────────────────────────────────────────────
+try:
+    _db = MetricsDB()
+    print("[app] ✅ MetricsDB ready")
+except Exception as e:
+    print(f"[app] ❌ MetricsDB FAILED: {e}")
+    raise
+
+# ── Scanner ───────────────────────────────────────────────────
+try:
+    _scanner = ProjectScanner(_db)
+    print("[app] ✅ ProjectScanner ready")
+except Exception as e:
+    print(f"[app] ❌ ProjectScanner FAILED: {e}")
+    raise
+
+# ── Resource monitor ──────────────────────────────────────────
+try:
+    _monitor = ResourceMonitor(_db)
+    _monitor.start_monitoring()
+    print("[app] ✅ ResourceMonitor started")
+except Exception as e:
+    print(f"[app] ❌ ResourceMonitor FAILED: {e}")
+    raise
+
+# ── Initial scan (non-fatal) ──────────────────────────────────
+try:
+    _files = _scanner.scan_project(SCAN_PATH)
+    _ai = sum(1 for f in _files if f['is_ai_agent'])
+    _sc = sum(1 for f in _files if f['is_script'])
+    _mn = sum(1 for f in _files if f['is_main_file'])
+    print(
+        f"[app] ✅ Scan done — "
+        f"{len(_files)} files | {_ai} AI | {_sc} scripts | {_mn} main"
+    )
+except Exception as e:
+    print(f"[app] ⚠ Initial scan error (non-fatal): {e}")
 
 
 # ══════════════════════════════════════════════════════════════
-# BLOCK 5 — THREAD-SAFETY LOCKS
+# BLOCK 7 — THREAD-SAFETY LOCKS
 # ══════════════════════════════════════════════════════════════
 
-APP_STATS_LOCK = threading.Lock()   # protects APP_STATS dict
-_SCANNER_LOCK  = threading.Lock()   # protects scanner collections
-
-
-# ══════════════════════════════════════════════════════════════
-# BLOCK 6 — DEFERRED METRICS INIT INSIDE APP CONTEXT
-# ══════════════════════════════════════════════════════════════
-
-with application.app_context():
-    update_metrics()
-    start_metrics_updater(interval=15)
+APP_STATS_LOCK = threading.Lock()
+_SCANNER_LOCK  = threading.Lock()
 
 
 # ══════════════════════════════════════════════════════════════
-# BLOCK 7 — PROMETHEUS REQUEST LIFECYCLE HOOKS
+# BLOCK 8 — DEFERRED METRICS INIT INSIDE APP CONTEXT
 # ──────────────────────────────────────────────────────────────
-# Unchanged — exactly as your original app.py had it.
+# Must run after BLOCK 3 (app exists) and BLOCK 5 (metrics imported).
+# Non-fatal so app still starts if Prometheus init fails.
+# ══════════════════════════════════════════════════════════════
+
+try:
+    with application.app_context():
+        update_metrics()
+        start_metrics_updater(interval=15)
+    print("[app] ✅ Prometheus metrics updater started")
+except Exception as e:
+    print(f"[app] ⚠ Metrics updater error (non-fatal): {e}")
+
+
+# ══════════════════════════════════════════════════════════════
+# BLOCK 9 — PROMETHEUS REQUEST LIFECYCLE HOOKS
 # ══════════════════════════════════════════════════════════════
 
 @application.before_request
@@ -168,7 +237,6 @@ def _track_request_end(response):
         endpoint = request.path
         status   = str(response.status_code)
 
-        # ── Prometheus counters / histogram ──────────────────
         app_requests_total.labels(
             method=method, endpoint=endpoint, status=status
         ).inc()
@@ -180,7 +248,6 @@ def _track_request_end(response):
         if response.status_code >= 500:
             app_errors_total.inc()
 
-        # ── In-process live stats ─────────────────────────────
         with APP_STATS_LOCK:
             APP_STATS["total_requests"]     += 1
             APP_STATS["total_request_time"] += duration
@@ -196,35 +263,27 @@ def _track_request_end(response):
 
 
 # ══════════════════════════════════════════════════════════════
-# BLOCK 8 — CORE FLASK ROUTES  ← COMPLETELY UNCHANGED
+# BLOCK 10 — CORE FLASK ROUTES  (COMPLETELY UNCHANGED)
 # ──────────────────────────────────────────────────────────────
-# / → index.html        UNTOUCHED
-# /health               UNTOUCHED
-# /metrics              UNTOUCHED (Prometheus)
-# /dashboard/agents     UNTOUCHED
+# These 4 routes are exactly as they were originally.
+# DO NOT modify them.
 # ══════════════════════════════════════════════════════════════
 
 @application.get("/")
 def home():
-    """
-    Main UI — serves templates/index.html.
-    THIS ROUTE IS UNTOUCHED.
-    """
+    """Main UI — serves templates/index.html. UNTOUCHED."""
     return render_template("index.html")
 
 
 @application.get("/health")
 def health_check():
-    """Liveness / readiness probe."""
+    """Liveness / readiness probe for load balancers."""
     return Response("Healthy", status=200, content_type="text/plain")
 
 
 @application.get("/metrics", endpoint="app_prometheus_metrics")
 def prometheus_metrics():
-    """
-    Prometheus scrape endpoint.
-    THIS ROUTE IS UNTOUCHED.
-    """
+    """Prometheus scrape endpoint. UNTOUCHED."""
     return Response(generate_latest(), content_type=CONTENT_TYPE_LATEST)
 
 
@@ -235,26 +294,31 @@ def agents_dashboard():
 
 
 # ══════════════════════════════════════════════════════════════
-# BLOCK 9 — AGENT MONITOR HTML ROUTES  (NEW)
+# BLOCK 11 — AGENT MONITOR HTML ROUTES
 # ──────────────────────────────────────────────────────────────
-# All routes return colorful HTML via HTMLBuilder.
-# Navigation buttons on every page link them all together.
-# /metrics is taken by Prometheus so we use /monitor here.
+# All return colorful HTML via HTMLBuilder static methods.
+# Every page has a nav bar linking all pages together.
+# /metrics is taken by Prometheus — we use /monitor instead.
 # ══════════════════════════════════════════════════════════════
 
 def _get_data():
-    """Fetch files + metrics — used by every HTML page."""
-    files = _db.execute(
+    """
+    Fetch files + metrics from DB and monitor.
+    Used by every HTML route and JSON API route.
+    """
+    rows = _db.execute(
         "SELECT * FROM detected_files "
         "ORDER BY is_ai_agent DESC, is_script DESC, "
         "is_main_file DESC, file_name",
         fetch=True
     )
-    return [dict(f) for f in files], _monitor.get_all_metrics()
+    files   = [dict(r) for r in rows]
+    metrics = _monitor.get_all_metrics()
+    return files, metrics
 
 
 def _html(html_str):
-    """Wrap string in Flask HTML Response."""
+    """Return a Flask HTML Response from a string."""
     return Response(
         html_str,
         status=200,
@@ -262,89 +326,60 @@ def _html(html_str):
     )
 
 
-# ── /dashboard ────────────────────────────────────────────────
 @application.get("/dashboard")
 def monitor_dashboard():
     """
-    Full HTML dashboard — system resources, token/request usage.
+    Full overview — files, system resources, token/request usage.
     Auto-refreshes every 10 seconds.
     """
     files, metrics = _get_data()
     return _html(HTMLBuilder.dashboard(files, metrics))
 
 
-# ── /files ────────────────────────────────────────────────────
 @application.get("/files")
 def files_page():
-    """
-    HTML page listing all detected project files with
-    type, purpose, description, size and flags.
-    """
+    """All detected project files — type, purpose, description, size."""
     files, _ = _get_data()
     return _html(HTMLBuilder.files(files))
 
 
-# ── /agents ───────────────────────────────────────────────────
 @application.get("/agents")
 def agents_page():
     """
-    HTML page showing per-agent token, request and
-    resource metrics. Auto-refreshes every 10 seconds.
+    Per-agent token, request and resource metrics.
+    Auto-refreshes every 10 seconds.
     """
     files, metrics = _get_data()
     return _html(HTMLBuilder.agents(files, metrics))
 
 
-# ── /monitor ──────────────────────────────────────────────────
-# NOTE: Cannot use /metrics — that is Prometheus (BLOCK 8).
-# Navigation bar shows this as "📈 Metrics" but route is /monitor.
 @application.get("/monitor")
 def monitor_page():
     """
-    HTML page for token/request usage vs limits + cost estimate.
+    Token/request usage vs limits + estimated cost.
     Auto-refreshes every 10 seconds.
+    NOTE: route is /monitor because /metrics is Prometheus.
     """
     _, metrics = _get_data()
     return _html(HTMLBuilder.monitor(metrics))
 
 
-# ── /model ────────────────────────────────────────────────────
 @application.get("/model")
 def model_page():
-    """
-    HTML page showing active model config, all providers,
-    rate limits and pricing.
-    """
+    """Active model config, rate limits, pricing, all providers."""
     return _html(HTMLBuilder.model())
 
 
-# ── /history ──────────────────────────────────────────────────
 @application.get("/history")
 def history_page():
-    """
-    HTML page showing last 50 scan history records.
-    """
+    """Last 50 scan history records."""
     return _html(HTMLBuilder.history(_db))
 
-@application.get("/debug/env")
-def debug_env():
-    """TEMPORARY — remove after debugging."""
-    key = os.environ.get("GEMINI_API_KEY", "")
-    masked = key[:4] + "****" + key[-4:] if len(key) > 8 else "EMPTY"
-    return jsonify({
-        "GEMINI_API_KEY": masked,
-        "AI_PROVIDER":    os.environ.get("AI_PROVIDER", "not set"),
-        "AI_MODEL":       os.environ.get("AI_MODEL", "not set"),
-        "provider":       ACTIVE_CONFIG.get("provider"),
-        "api_key_in_cfg": bool(ACTIVE_CONFIG.get("api_key")),
-    })
 
-# ── /scan ─────────────────────────────────────────────────────
 @application.get("/scan")
 def scan_page():
     """
-    Triggers a project scan then shows HTML result page
-    with counts and links to dashboard / files.
+    Triggers a fresh project scan then shows result page.
     Optional query param: ?path=/your/project/path
     """
     sp      = request.args.get("path", SCAN_PATH)
@@ -358,15 +393,9 @@ def scan_page():
     return _html(HTMLBuilder.scan_done(result))
 
 
-# ── /reset ────────────────────────────────────────────────────
 @application.get("/reset")
 def reset_page():
-    """
-    Clears all DB tables and in-memory monitor state,
-    then shows HTML confirmation page with nav buttons.
-    """
-    from collections import defaultdict
-
+    """Clears all DB tables + in-memory monitor state → shows confirmation."""
     _db.execute("DELETE FROM detected_files")
     _db.execute("DELETE FROM token_usage")
     _db.execute("DELETE FROM request_usage")
@@ -389,22 +418,12 @@ def reset_page():
 
 
 # ══════════════════════════════════════════════════════════════
-# BLOCK 10 — AGENT MONITOR API ROUTES  (JSON)
-# ──────────────────────────────────────────────────────────────
-# These remain JSON for any frontend / external consumers.
-# Unchanged from your original app.py — only the scanner
-# source changed (now uses _db + _monitor instead of old scanner).
-# ══════════════════════════════════════════════════════════════
-# ══════════════════════════════════════════════════════════════
 # BLOCK 12 — AGENT MONITOR API ROUTES  (JSON)
-# ──────────────────────────────────────────────────────────────
-# All return JSON for frontend / external API consumers.
 # ══════════════════════════════════════════════════════════════
 
-# ── /api/metrics/system ──────────────────────────────────────
 @application.route("/api/metrics/system", methods=["GET"])
 def get_system_metrics():
-    """System CPU, memory, disk metrics."""
+    """System CPU, memory, disk metrics as JSON."""
     try:
         _, metrics = _get_data()
         return jsonify(metrics.get("system", {})), 200
@@ -414,7 +433,6 @@ def get_system_metrics():
         return jsonify({"error": str(e)}), 500
 
 
-# ── /api/metrics/tokens ──────────────────────────────────────
 @application.route("/api/metrics/tokens", methods=["GET"])
 def get_token_metrics():
     """Token usage per file — per_min / per_hour / per_day."""
@@ -427,20 +445,16 @@ def get_token_metrics():
         return jsonify({"error": str(e)}), 500
 
 
-# ── /api/metrics/requests ────────────────────────────────────
 @application.route("/api/metrics/requests", methods=["GET"])
 def get_request_metrics():
-    """Request rates rpm / rph / rpd plus timestamp."""
+    """Aggregated request rates — rpm / rph / rpd."""
     try:
         _, metrics = _get_data()
         reqs = metrics.get("requests", {})
-        rpm  = sum(v.get("per_min",  0) for v in reqs.values())
-        rph  = sum(v.get("per_hour", 0) for v in reqs.values())
-        rpd  = sum(v.get("per_day",  0) for v in reqs.values())
         return jsonify({
-            "rpm":       rpm,
-            "rph":       rph,
-            "rpd":       rpd,
+            "rpm":       sum(v.get("per_min",  0) for v in reqs.values()),
+            "rph":       sum(v.get("per_hour", 0) for v in reqs.values()),
+            "rpd":       sum(v.get("per_day",  0) for v in reqs.values()),
             "timestamp": time.time()
         }), 200
     except Exception as e:
@@ -449,7 +463,6 @@ def get_request_metrics():
         return jsonify({"error": str(e)}), 500
 
 
-# ── /api/agents ──────────────────────────────────────────────
 @application.route("/api/agents", methods=["GET"])
 def get_agents():
     """All detected AI agent files with count."""
@@ -467,14 +480,12 @@ def get_agents():
         return jsonify({"error": str(e)}), 500
 
 
-# ── /api/agents/<agent_id> ───────────────────────────────────
 @application.route("/api/agents/<int:agent_id>", methods=["GET"])
 def get_agent(agent_id):
     """Single agent by DB id, or 404."""
     try:
         row = _db.execute(
-            "SELECT * FROM detected_files "
-            "WHERE id=? AND is_ai_agent=1",
+            "SELECT * FROM detected_files WHERE id=? AND is_ai_agent=1",
             (agent_id,), fetch=True
         )
         if row:
@@ -486,15 +497,13 @@ def get_agent(agent_id):
         return jsonify({"error": str(e)}), 500
 
 
-# ── /api/requests ────────────────────────────────────────────
 @application.route("/api/requests", methods=["GET"])
 def get_requests():
     """Recent request_usage rows, paginated by ?limit=."""
     try:
         limit            = request.args.get("limit", 20, type=int)
         rows             = _db.execute(
-            "SELECT * FROM request_usage "
-            "ORDER BY timestamp DESC LIMIT ?",
+            "SELECT * FROM request_usage ORDER BY timestamp DESC LIMIT ?",
             (limit,), fetch=True
         )
         scanned_requests = [dict(r) for r in rows]
@@ -509,17 +518,12 @@ def get_requests():
         return jsonify({"error": str(e)}), 500
 
 
-# ── /api/providers ───────────────────────────────────────────
-# FIX: MODEL_REGISTRY imported at top — not inside function
 @application.route("/api/providers", methods=["GET"])
 def get_providers():
-    """Provider list built from MODEL_REGISTRY."""
+    """All providers and their models from MODEL_REGISTRY."""
     try:
         providers = [
-            {
-                "name":   p,
-                "models": list(cfg["models"].keys())
-            }
+            {"name": p, "models": list(cfg["models"].keys())}
             for p, cfg in MODEL_REGISTRY.items()
         ]
         return jsonify({
@@ -533,10 +537,9 @@ def get_providers():
         return jsonify({"error": str(e)}), 500
 
 
-# ── /api/report ──────────────────────────────────────────────
 @application.route("/api/report", methods=["GET"])
 def get_report():
-    """Full snapshot — files + metrics + config."""
+    """Full snapshot — files + metrics + active config."""
     try:
         files, metrics = _get_data()
         return jsonify({
@@ -556,14 +559,13 @@ def get_report():
         return jsonify({"error": str(e)}), 500
 
 
-# ── /api/status ──────────────────────────────────────────────
 @application.route("/api/status", methods=["GET"])
 def get_status():
     """
     Lightweight running summary.
-    Original JSON shape:
-    {"active_agents":0,"agents_count":0,"status":"running",
-     "timestamp":...,"total_requests":0}
+    Matches original JSON shape:
+      {"active_agents":0,"agents_count":0,"status":"running",
+       "timestamp":...,"total_requests":0}
     """
     try:
         files, metrics = _get_data()
@@ -586,13 +588,9 @@ def get_status():
         return jsonify({"error": str(e)}), 500
 
 
-# ── /api/refresh  (POST) ─────────────────────────────────────
 @application.route("/api/refresh", methods=["POST"])
 def refresh_metrics():
-    """
-    Re-read metrics and return snapshot.
-    FIX: Returns empty data instead of 400 when no agents found.
-    """
+    """Re-read metrics and return current snapshot."""
     try:
         files, metrics = _get_data()
         ai_files       = [f for f in files if f.get("is_ai_agent")]
@@ -610,13 +608,11 @@ def refresh_metrics():
         return jsonify({"error": str(e)}), 500
 
 
-# ── /api/clear  (POST) ───────────────────────────────────────
 @application.route("/api/clear", methods=["POST"])
 def clear_data():
     """
     Wipes all DB tables and in-memory monitor state.
-    Same as /reset but returns JSON for API consumers.
-    FIX: defaultdict imported at top of file — not inside function.
+    JSON version of /reset — for API consumers.
     """
     try:
         with _SCANNER_LOCK:
@@ -666,18 +662,18 @@ def handle_exception(e):
 
 @application.errorhandler(404)
 def not_found(error):
-    """404 handler."""
+    """404 — path not matched by any route."""
     return jsonify({"error": "Not found", "status": 404}), 404
 
 
 # ══════════════════════════════════════════════════════════════
 # BLOCK 14 — WSGI / __main__ ENTRY POINT
 # ──────────────────────────────────────────────────────────────
-# Gunicorn imports `application` directly in production.
-# This block only runs for local dev: python app.py
+# Production: gunicorn imports `application` directly.
+# Local dev:  python app.py
 # ══════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
     port  = int(os.environ.get("PORT", "5000"))
-    debug = os.environ.get("FLASK_DEBUG") == "1"
+    debug = os.environ.get("FLASK_DEBUG", "0") == "1"
     application.run(host="0.0.0.0", port=port, debug=debug)
