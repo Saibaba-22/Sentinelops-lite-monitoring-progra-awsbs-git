@@ -35,8 +35,20 @@ _CFG = {
     "monitor_token": os.environ.get("MONITOR_TOKEN", ""),
     "target_cloud":  os.environ.get("TARGET_CLOUD",  "aws"),
     "aws_region":    os.environ.get("AWS_REGION",    "us-east-1"),
-    "scan_path":     os.environ.get("SCAN_PATH",     ""),
+    SCAN_PATH = os.environ.get("SCAN_PATH", str(BASE_DIR))
+
+# Verify the path exists and is a directory
+if not os.path.isdir(SCAN_PATH):
+    print(f"[WARNING] SCAN_PATH {SCAN_PATH} does not exist, defaulting to BASE_DIR")
+    SCAN_PATH = str(BASE_DIR)
+
+print(f"[app] 📁 SCAN_PATH = {SCAN_PATH}")
 }
+
+# Force initial scan if database is empty
+if not _db.execute("SELECT COUNT(*) FROM detected_files", fetch=True)[0][0]:
+    print("[app] ⚠ Database empty - forcing initial scan")
+    _files = _scanner.scan_project(SCAN_PATH)
 
 application = Flask(__name__)
 
@@ -285,6 +297,31 @@ def agent_status_route():
         "uptime_seconds": _uptime(),
     }), 200
 
+@application.get("/debug2")
+def debug2():
+    try:
+        rows = _db.execute("SELECT * FROM detected_files LIMIT 5", fetch=True)
+        return jsonify({
+            "count":  len(rows) if rows else 0,
+            "sample": [dict(r) for r in (rows or [])],
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@application.get("/rescan")
+def rescan():
+    """Force a fresh scan and return the count."""
+    try:
+        files = _scanner.scan_project(str(BASE_DIR))
+        return jsonify({
+            "scanned": len(files),
+            "path":    str(BASE_DIR),
+            "ai":      sum(1 for f in files if f.get('is_ai_agent')),
+            "sc":      sum(1 for f in files if f.get('is_script')),
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @application.get("/metrics", endpoint="app_prometheus_metrics")
 def prom_metrics():
@@ -309,11 +346,18 @@ def _get_data():
                 "SELECT * FROM detected_files ORDER BY is_ai_agent DESC, "
                 "is_script DESC, is_main_file DESC, file_name", fetch=True
             )
-            return [dict(r) for r in rows], _monitor.get_all_metrics()
+            # Auto-scan if DB is empty (first request after restart)
+            if not rows and _scanner:
+                print("[app] DB empty, triggering scan...")
+                _scanner.scan_project(str(BASE_DIR))
+                rows = _db.execute(
+                    "SELECT * FROM detected_files ORDER BY is_ai_agent DESC, "
+                    "is_script DESC, is_main_file DESC, file_name", fetch=True
+                )
+            return [dict(r) for r in (rows or [])], _monitor.get_all_metrics()
         except Exception as e:
             print(f"[app] _get_data error: {e}")
     return [], {"system": {}, "tokens": {}, "requests": {}, "resources": {}}
-
 
 def _html(body):
     return Response(body, status=200, content_type="text/html; charset=utf-8")
