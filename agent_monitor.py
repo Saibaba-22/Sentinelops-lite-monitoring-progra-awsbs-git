@@ -2,12 +2,9 @@
 """
 AI Agent & Script Monitor Dashboard
 ====================================
-A self-contained monitoring dashboard that:
-- Scans entire project for AI agents/scripts
-- Detects file purposes and main files
-- Tracks token usage, request counts, CPU, memory, storage
-- Collects all metrics independently (no Prometheus/Grafana)
-- Shows everything in a web dashboard
+All endpoints output colorful HTML (no JSON).
+All pages interlinked with navigation buttons.
+Model/Key from environment variables and secrets.
 """
 
 import os
@@ -17,362 +14,173 @@ import json
 import ast
 import re
 import threading
-import hashlib
 import sqlite3
 import socket
 import psutil
 import datetime
+import random
 from pathlib import Path
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 from collections import defaultdict
-import importlib.util
 
 # ══════════════════════════════════════════════════════════════
-# BLOCK 2 — ENVIRONMENT & MODEL CONFIGURATION
-# ──────────────────────────────────────────────────────────────
-# What  : Reads AI provider, model, and API key from environment
-#         variables injected by GitHub Actions pipeline.yml.
-#
-# Source in pipeline.yml:
-# ┌─────────────────────────────────────────────────────────────┐
-# │  env:                                                       │
-# │    GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}            │
-# │    AI_MODEL:       ${{ vars.AI_MODEL || 'gemini-2.5-flash'}}│
-# │    AI_PROVIDER:    ${{ vars.AI_PROVIDER || 'gemini' }}      │
-# └─────────────────────────────────────────────────────────────┘
-#
-# To change model or provider:
-#   GitHub → Settings → Secrets and Variables → Actions → Variables
-#   Edit AI_MODEL or AI_PROVIDER
-#
-# To change API key:
-#   GitHub → Settings → Secrets and Variables → Actions → Secrets
-#   Edit GEMINI_API_KEY
-#
-# DO NOT hardcode anything here.
-# DO NOT commit API keys to git.
+# ENVIRONMENT & MODEL CONFIGURATION
 # ══════════════════════════════════════════════════════════════
-
-# ── Step 1: Read raw values from environment ──────────────────
-# These three variables are injected by GitHub Actions pipeline.
-# Fallback defaults match pipeline.yml defaults so local dev
-# works the same way as CI/CD.
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 AI_MODEL       = os.environ.get("AI_MODEL",       "gemini-2.5-flash")
 AI_PROVIDER    = os.environ.get("AI_PROVIDER",    "gemini")
 
-# ── Step 2: Normalise provider name ───────────────────────────
-# GitHub variable AI_PROVIDER is set to "gemini"
-# MODEL_REGISTRY below uses "google" as the key
-# because google is the official API provider for Gemini.
-# This mapping keeps both in sync automatically.
-#
-# ┌─────────────────┬──────────────────────────────────────────┐
-# │ AI_PROVIDER env │ ACTIVE_PROVIDER used in MODEL_REGISTRY   │
-# ├─────────────────┼──────────────────────────────────────────┤
-# │ gemini          │ google                                   │
-# │ google          │ google                                   │
-# │ openai          │ openai                                   │
-# │ anthropic       │ anthropic                                │
-# │ groq            │ groq                                     │
-# │ mistral         │ mistral                                  │
-# │ ollama          │ ollama                                   │
-# └─────────────────┴──────────────────────────────────────────┘
-
 _PROVIDER_MAP = {
-    "gemini":    "google",
-    "google":    "google",
-    "openai":    "openai",
-    "anthropic": "anthropic",
-    "groq":      "groq",
-    "mistral":   "mistral",
-    "ollama":    "ollama",
+    "gemini": "google", "google": "google",
+    "openai": "openai", "anthropic": "anthropic",
+    "groq": "groq", "mistral": "mistral", "ollama": "ollama",
 }
 
 ACTIVE_PROVIDER = _PROVIDER_MAP.get(AI_PROVIDER.lower().strip(), AI_PROVIDER.lower().strip())
 ACTIVE_MODEL    = AI_MODEL.strip()
-API_KEY         = GEMINI_API_KEY
-
-# ── Step 3: API keys per provider ─────────────────────────────
-# Only GEMINI_API_KEY is set via GitHub secret right now.
-# If you add other providers later, add their secrets to
-# GitHub and read them here the same way.
 
 OPENAI_API_KEY    = os.environ.get("OPENAI_API_KEY",    "")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-GOOGLE_API_KEY    = GEMINI_API_KEY   # Gemini secret → Google key
+GOOGLE_API_KEY    = GEMINI_API_KEY
 GROQ_API_KEY      = os.environ.get("GROQ_API_KEY",      "")
 MISTRAL_API_KEY   = os.environ.get("MISTRAL_API_KEY",   "")
 OLLAMA_BASE_URL   = os.environ.get("OLLAMA_BASE_URL",   "http://localhost:11434")
 
-# ── Step 4: MODEL REGISTRY ────────────────────────────────────
-# Single source of truth for all model limits and costs.
-# Keys must match ACTIVE_PROVIDER value after Step 2 mapping.
-# ──────────────────────────────────────────────────────────────
-# Column guide:
-#   tpm_limit  → max tokens  per minute
-#   tph_limit  → max tokens  per hour
-#   tpd_limit  → max tokens  per day
-#   rpm_limit  → max requests per minute
-#   rph_limit  → max requests per hour
-#   rpd_limit  → max requests per day
-#   cost_input_per_1k   → USD cost per 1,000 input  tokens
-#   cost_output_per_1k  → USD cost per 1,000 output tokens
-#   context_window      → max tokens in one request
-# ──────────────────────────────────────────────────────────────
-
 MODEL_REGISTRY = {
-
-    # ── Google / Gemini ───────────────────────────────────────
-    # AI_PROVIDER="gemini" maps to this "google" key via Step 2
     "google": {
-        "api_key":  GOOGLE_API_KEY,
+        "api_key": GOOGLE_API_KEY,
         "base_url": "https://generativelanguage.googleapis.com/v1beta",
         "models": {
-
             "gemini-2.5-flash": {
-                "tpm_limit":              1_000_000,
-                "tph_limit":             60_000_000,
-                "tpd_limit":          1_000_000_000,
-                "rpm_limit":                  10_000,
-                "rph_limit":                 600_000,
-                "rpd_limit":              10_000_000,
-                "cost_input_per_1k":         0.00015,
-                "cost_output_per_1k":        0.00060,
-                "context_window":          1_048_576,
+                "tpm_limit": 1_000_000, "tph_limit": 60_000_000,
+                "tpd_limit": 1_000_000_000, "rpm_limit": 10_000,
+                "rph_limit": 600_000, "rpd_limit": 10_000_000,
+                "cost_input_per_1k": 0.00015, "cost_output_per_1k": 0.00060,
+                "context_window": 1_048_576,
             },
-
             "gemini-2.5-pro": {
-                "tpm_limit":                800_000,
-                "tph_limit":             48_000_000,
-                "tpd_limit":            800_000_000,
-                "rpm_limit":                   2_000,
-                "rph_limit":                 120_000,
-                "rpd_limit":               2_000_000,
-                "cost_input_per_1k":         0.00125,
-                "cost_output_per_1k":        0.01000,
-                "context_window":          1_048_576,
+                "tpm_limit": 800_000, "tph_limit": 48_000_000,
+                "tpd_limit": 800_000_000, "rpm_limit": 2_000,
+                "rph_limit": 120_000, "rpd_limit": 2_000_000,
+                "cost_input_per_1k": 0.00125, "cost_output_per_1k": 0.01000,
+                "context_window": 1_048_576,
             },
-
             "gemini-1.5-flash": {
-                "tpm_limit":              1_000_000,
-                "tph_limit":             60_000_000,
-                "tpd_limit":          1_000_000_000,
-                "rpm_limit":                   2_000,
-                "rph_limit":                 120_000,
-                "rpd_limit":               2_000_000,
-                "cost_input_per_1k":        0.000075,
-                "cost_output_per_1k":       0.000300,
-                "context_window":          1_048_576,
+                "tpm_limit": 1_000_000, "tph_limit": 60_000_000,
+                "tpd_limit": 1_000_000_000, "rpm_limit": 2_000,
+                "rph_limit": 120_000, "rpd_limit": 2_000_000,
+                "cost_input_per_1k": 0.000075, "cost_output_per_1k": 0.000300,
+                "context_window": 1_048_576,
             },
-
             "gemini-1.5-pro": {
-                "tpm_limit":                 32_000,
-                "tph_limit":              1_920_000,
-                "tpd_limit":             32_000_000,
-                "rpm_limit":                   1_000,
-                "rph_limit":                  60_000,
-                "rpd_limit":               1_000_000,
-                "cost_input_per_1k":         0.00125,
-                "cost_output_per_1k":        0.00375,
-                "context_window":          1_048_576,
+                "tpm_limit": 32_000, "tph_limit": 1_920_000,
+                "tpd_limit": 32_000_000, "rpm_limit": 1_000,
+                "rph_limit": 60_000, "rpd_limit": 1_000_000,
+                "cost_input_per_1k": 0.00125, "cost_output_per_1k": 0.00375,
+                "context_window": 1_048_576,
             },
-
         },
     },
-
-    # ── OpenAI ────────────────────────────────────────────────
-    # Not active now but ready if you switch.
     "openai": {
-        "api_key":  OPENAI_API_KEY,
+        "api_key": OPENAI_API_KEY,
         "base_url": "https://api.openai.com/v1",
         "models": {
             "gpt-4o": {
-                "tpm_limit":             30_000,
-                "tph_limit":          1_800_000,
-                "tpd_limit":         30_000_000,
-                "rpm_limit":                500,
-                "rph_limit":             30_000,
-                "rpd_limit":            500_000,
-                "cost_input_per_1k":      0.005,
-                "cost_output_per_1k":     0.015,
-                "context_window":       128_000,
+                "tpm_limit": 30_000, "tph_limit": 1_800_000,
+                "tpd_limit": 30_000_000, "rpm_limit": 500,
+                "rph_limit": 30_000, "rpd_limit": 500_000,
+                "cost_input_per_1k": 0.005, "cost_output_per_1k": 0.015,
+                "context_window": 128_000,
             },
             "gpt-3.5-turbo": {
-                "tpm_limit":             90_000,
-                "tph_limit":          5_400_000,
-                "tpd_limit":         90_000_000,
-                "rpm_limit":              3_500,
-                "rph_limit":            210_000,
-                "rpd_limit":          3_500_000,
-                "cost_input_per_1k":     0.0005,
-                "cost_output_per_1k":    0.0015,
-                "context_window":        16_385,
+                "tpm_limit": 90_000, "tph_limit": 5_400_000,
+                "tpd_limit": 90_000_000, "rpm_limit": 3_500,
+                "rph_limit": 210_000, "rpd_limit": 3_500_000,
+                "cost_input_per_1k": 0.0005, "cost_output_per_1k": 0.0015,
+                "context_window": 16_385,
             },
         },
     },
-
-    # ── Anthropic ─────────────────────────────────────────────
     "anthropic": {
-        "api_key":  ANTHROPIC_API_KEY,
+        "api_key": ANTHROPIC_API_KEY,
         "base_url": "https://api.anthropic.com",
         "models": {
             "claude-3-5-sonnet-20241022": {
-                "tpm_limit":             80_000,
-                "tph_limit":          4_800_000,
-                "tpd_limit":         80_000_000,
-                "rpm_limit":              4_000,
-                "rph_limit":            240_000,
-                "rpd_limit":          4_000_000,
-                "cost_input_per_1k":      0.003,
-                "cost_output_per_1k":     0.015,
-                "context_window":       200_000,
+                "tpm_limit": 80_000, "tph_limit": 4_800_000,
+                "tpd_limit": 80_000_000, "rpm_limit": 4_000,
+                "rph_limit": 240_000, "rpd_limit": 4_000_000,
+                "cost_input_per_1k": 0.003, "cost_output_per_1k": 0.015,
+                "context_window": 200_000,
             },
         },
     },
-
-    # ── Groq ──────────────────────────────────────────────────
     "groq": {
-        "api_key":  GROQ_API_KEY,
+        "api_key": GROQ_API_KEY,
         "base_url": "https://api.groq.com/openai/v1",
         "models": {
             "llama3-70b-8192": {
-                "tpm_limit":              6_000,
-                "tph_limit":            360_000,
-                "tpd_limit":          6_000_000,
-                "rpm_limit":                 30,
-                "rph_limit":              1_800,
-                "rpd_limit":             30_000,
-                "cost_input_per_1k":    0.00059,
-                "cost_output_per_1k":   0.00079,
-                "context_window":         8_192,
+                "tpm_limit": 6_000, "tph_limit": 360_000,
+                "tpd_limit": 6_000_000, "rpm_limit": 30,
+                "rph_limit": 1_800, "rpd_limit": 30_000,
+                "cost_input_per_1k": 0.00059, "cost_output_per_1k": 0.00079,
+                "context_window": 8_192,
             },
         },
     },
-
-    # ── Mistral ───────────────────────────────────────────────
     "mistral": {
-        "api_key":  MISTRAL_API_KEY,
+        "api_key": MISTRAL_API_KEY,
         "base_url": "https://api.mistral.ai/v1",
         "models": {
             "mistral-large-latest": {
-                "tpm_limit":            500_000,
-                "tph_limit":         30_000_000,
-                "tpd_limit":        500_000_000,
-                "rpm_limit":              1_000,
-                "rph_limit":             60_000,
-                "rpd_limit":          1_000_000,
-                "cost_input_per_1k":      0.003,
-                "cost_output_per_1k":     0.009,
-                "context_window":       128_000,
+                "tpm_limit": 500_000, "tph_limit": 30_000_000,
+                "tpd_limit": 500_000_000, "rpm_limit": 1_000,
+                "rph_limit": 60_000, "rpd_limit": 1_000_000,
+                "cost_input_per_1k": 0.003, "cost_output_per_1k": 0.009,
+                "context_window": 128_000,
             },
         },
     },
-
-    # ── Ollama (local) ────────────────────────────────────────
     "ollama": {
-        "api_key":  "",
+        "api_key": "",
         "base_url": OLLAMA_BASE_URL,
         "models": {
             "llama3": {
-                "tpm_limit":          9_999_999,
-                "tph_limit":        999_999_999,
-                "tpd_limit":      9_999_999_999,
-                "rpm_limit":             99_999,
-                "rph_limit":          5_999_999,
-                "rpd_limit":         99_999_999,
-                "cost_input_per_1k":        0.0,
-                "cost_output_per_1k":       0.0,
-                "context_window":         8_192,
+                "tpm_limit": 9_999_999, "tph_limit": 999_999_999,
+                "tpd_limit": 9_999_999_999, "rpm_limit": 99_999,
+                "rph_limit": 5_999_999, "rpd_limit": 99_999_999,
+                "cost_input_per_1k": 0.0, "cost_output_per_1k": 0.0,
+                "context_window": 8_192,
             },
         },
     },
-
 }
 
-# ── Step 5: Resolve ACTIVE_CONFIG from registry ───────────────
-# Reads ACTIVE_PROVIDER + ACTIVE_MODEL set in Steps 1 and 2,
-# looks them up in MODEL_REGISTRY, and builds one flat dict
-# that the rest of agent_monitor.py reads from.
-# You do NOT need to change anything below this line.
 
-def _resolve_active_config() -> dict:
-    """
-    Resolves the active provider + model from MODEL_REGISTRY.
-    Falls back to zero/empty values if provider or model not found.
-    Prints a startup line so you can confirm config in CI/CD logs.
-    """
-    provider_cfg = MODEL_REGISTRY.get(ACTIVE_PROVIDER, {})
-    models_cfg   = provider_cfg.get("models", {})
-    model_cfg    = models_cfg.get(ACTIVE_MODEL, {})
-
-    if not provider_cfg:
-        print(
-            f"[agent_monitor] ❌  Provider '{ACTIVE_PROVIDER}' not found "
-            f"in MODEL_REGISTRY. Check AI_PROVIDER variable in GitHub."
-        )
-
-    if not model_cfg:
-        print(
-            f"[agent_monitor] ❌  Model '{ACTIVE_MODEL}' not found under "
-            f"provider '{ACTIVE_PROVIDER}' in MODEL_REGISTRY. "
-            f"Check AI_MODEL variable in GitHub."
-        )
-        model_cfg = {
-            "tpm_limit":            0,
-            "tph_limit":            0,
-            "tpd_limit":            0,
-            "rpm_limit":            0,
-            "rph_limit":            0,
-            "rpd_limit":            0,
-            "cost_input_per_1k":  0.0,
-            "cost_output_per_1k": 0.0,
-            "context_window":       0,
-        }
-
-    config = {
-        # ── Identity ──────────────────────────────────────────
-        "provider":             ACTIVE_PROVIDER,
-        "model":                ACTIVE_MODEL,
-        "ai_provider_env":      AI_PROVIDER,       # raw value from GitHub var
-        # ── Auth ──────────────────────────────────────────────
-        "api_key":              provider_cfg.get("api_key",  ""),
-        "base_url":             provider_cfg.get("base_url", ""),
-        # ── Token limits ──────────────────────────────────────
-        "tpm_limit":            model_cfg.get("tpm_limit",   0),
-        "tph_limit":            model_cfg.get("tph_limit",   0),
-        "tpd_limit":            model_cfg.get("tpd_limit",   0),
-        # ── Request limits ────────────────────────────────────
-        "rpm_limit":            model_cfg.get("rpm_limit",   0),
-        "rph_limit":            model_cfg.get("rph_limit",   0),
-        "rpd_limit":            model_cfg.get("rpd_limit",   0),
-        # ── Cost ──────────────────────────────────────────────
-        "cost_input_per_1k":    model_cfg.get("cost_input_per_1k",  0.0),
-        "cost_output_per_1k":   model_cfg.get("cost_output_per_1k", 0.0),
-        # ── Context ───────────────────────────────────────────
-        "context_window":       model_cfg.get("context_window", 0),
+def _resolve_config():
+    pcfg = MODEL_REGISTRY.get(ACTIVE_PROVIDER, {})
+    mcfg = pcfg.get("models", {}).get(ACTIVE_MODEL, {})
+    if not mcfg:
+        mcfg = {"tpm_limit":0,"tph_limit":0,"tpd_limit":0,"rpm_limit":0,
+                "rph_limit":0,"rpd_limit":0,"cost_input_per_1k":0.0,
+                "cost_output_per_1k":0.0,"context_window":0}
+    key_status = "SET" if pcfg.get("api_key") else "MISSING"
+    print(f"[monitor] Provider: {AI_PROVIDER}→{ACTIVE_PROVIDER} | Model: {ACTIVE_MODEL} | Key: {key_status}")
+    return {
+        "name": ACTIVE_MODEL, "provider": ACTIVE_PROVIDER,
+        "api_key": pcfg.get("api_key",""), "base_url": pcfg.get("base_url",""),
+        "tpm": mcfg["tpm_limit"], "tph": mcfg["tph_limit"], "tpd": mcfg["tpd_limit"],
+        "rpm": mcfg["rpm_limit"], "rph": mcfg["rph_limit"], "rpd": mcfg["rpd_limit"],
+        "cost_in": mcfg["cost_input_per_1k"], "cost_out": mcfg["cost_output_per_1k"],
+        "ctx": mcfg["context_window"],
     }
 
-    # ── Startup confirmation line (visible in GitHub Actions logs)
-    key_status = "✅ SET" if config["api_key"] else "❌ MISSING"
-    print(
-        f"[agent_monitor] ✅  Provider : {AI_PROVIDER} → {ACTIVE_PROVIDER}\n"
-        f"[agent_monitor] ✅  Model    : {ACTIVE_MODEL}\n"
-        f"[agent_monitor] ✅  API Key  : {key_status}\n"
-        f"[agent_monitor] ✅  TPM      : {config['tpm_limit']:,}\n"
-        f"[agent_monitor] ✅  RPM      : {config['rpm_limit']:,}\n"
-        f"[agent_monitor] ✅  Context  : {config['context_window']:,} tokens"
-    )
-
-    return config
+ACTIVE_CONFIG = _resolve_config()
 
 
-# ── This is the single object the rest of the file reads ──────
-ACTIVE_CONFIG: dict = _resolve_active_config()
 # ============================================================
-# DATABASE FOR METRICS COLLECTION
+# DATABASE
 # ============================================================
 class MetricsDB:
     def __init__(self, db_path="agent_monitor.db"):
@@ -380,1742 +188,1288 @@ class MetricsDB:
         self.lock = threading.Lock()
         self._init_db()
 
-    def _get_conn(self):
-        conn = sqlite3.connect(self.db_path, check_same_thread=False)
-        conn.row_factory = sqlite3.Row
-        return conn
+    def _conn(self):
+        c = sqlite3.connect(self.db_path, check_same_thread=False)
+        c.row_factory = sqlite3.Row
+        return c
 
     def _init_db(self):
-        conn = self._get_conn()
-        cursor = conn.cursor()
-        cursor.executescript("""
+        c = self._conn()
+        c.executescript("""
             CREATE TABLE IF NOT EXISTS detected_files (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                file_path TEXT UNIQUE,
-                file_name TEXT,
-                file_type TEXT,
-                purpose TEXT,
-                is_main_file INTEGER DEFAULT 0,
-                is_ai_agent INTEGER DEFAULT 0,
-                is_script INTEGER DEFAULT 0,
-                description TEXT,
-                size_bytes INTEGER,
-                last_modified REAL,
-                scan_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-
+                file_path TEXT UNIQUE, file_name TEXT, file_type TEXT,
+                purpose TEXT, is_main_file INTEGER DEFAULT 0,
+                is_ai_agent INTEGER DEFAULT 0, is_script INTEGER DEFAULT 0,
+                description TEXT, size_bytes INTEGER, last_modified REAL,
+                scan_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP);
             CREATE TABLE IF NOT EXISTS token_usage (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                file_path TEXT,
-                tokens_used INTEGER,
-                token_type TEXT,
-                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-
+                file_path TEXT, tokens_used INTEGER, token_type TEXT,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP);
             CREATE TABLE IF NOT EXISTS request_usage (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                file_path TEXT,
-                request_count INTEGER DEFAULT 1,
+                file_path TEXT, request_count INTEGER DEFAULT 1,
                 status_code INTEGER,
-                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP);
             CREATE TABLE IF NOT EXISTS resource_usage (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                file_path TEXT,
-                pid INTEGER,
-                cpu_percent REAL,
-                memory_mb REAL,
-                storage_mb REAL,
-                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-
+                file_path TEXT, pid INTEGER, cpu_percent REAL,
+                memory_mb REAL, storage_mb REAL,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP);
             CREATE TABLE IF NOT EXISTS scan_history (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                scan_path TEXT,
-                total_files INTEGER,
-                ai_agents INTEGER,
-                scripts INTEGER,
-                main_files INTEGER,
-                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
+                scan_path TEXT, total_files INTEGER, ai_agents INTEGER,
+                scripts INTEGER, main_files INTEGER,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP);
         """)
-        conn.commit()
-        conn.close()
+        c.commit(); c.close()
 
-    def execute(self, query, params=(), fetch=False):
+    def execute(self, q, p=(), fetch=False):
         with self.lock:
-            conn = self._get_conn()
-            cursor = conn.cursor()
-            cursor.execute(query, params)
+            c = self._conn(); cur = c.cursor(); cur.execute(q, p)
             if fetch:
-                result = cursor.fetchall()
-                conn.close()
-                return result
-            conn.commit()
-            conn.close()
-
-    def executemany(self, query, params_list):
-        with self.lock:
-            conn = self._get_conn()
-            cursor = conn.cursor()
-            cursor.executemany(query, params_list)
-            conn.commit()
-            conn.close()
+                r = cur.fetchall(); c.close(); return r
+            c.commit(); c.close()
 
     def clear_files(self):
         with self.lock:
-            conn = self._get_conn()
-            cursor = conn.cursor()
-            cursor.execute("DELETE FROM detected_files")
-            conn.commit()
-            conn.close()
+            c = self._conn(); c.execute("DELETE FROM detected_files")
+            c.commit(); c.close()
 
 
 # ============================================================
 # PROJECT SCANNER
 # ============================================================
 class ProjectScanner:
-    AI_KEYWORDS = [
-        'openai', 'anthropic', 'langchain', 'llama', 'transformers',
-        'torch', 'tensorflow', 'keras', 'huggingface', 'ollama',
-        'gpt', 'claude', 'gemini', 'agent', 'llm', 'embedding',
-        'vector', 'rag', 'chatbot', 'ai_', 'ml_', 'model',
-        'predict', 'inference', 'neural', 'deep_learning',
-        'crewai', 'autogen', 'swarm', 'prompt', 'completion',
-        'chat_completion', 'api_key', 'OPENAI_API_KEY',
-        'ANTHROPIC_API_KEY', 'langsmith', 'chromadb', 'pinecone',
-        'weaviate', 'faiss', 'sentence_transformers'
-    ]
+    AI_KW = ['openai','anthropic','langchain','llama','transformers','torch',
+             'tensorflow','keras','huggingface','ollama','gpt','claude','gemini',
+             'agent','llm','embedding','vector','rag','chatbot','ai_','ml_','model',
+             'predict','inference','neural','deep_learning','crewai','autogen','swarm',
+             'prompt','completion','chat_completion','api_key','OPENAI_API_KEY',
+             'ANTHROPIC_API_KEY','langsmith','chromadb','pinecone','weaviate','faiss',
+             'sentence_transformers']
+    SC_KW = ['if __name__','argparse','click','typer','subprocess','os.system',
+             'schedule','cron','celery','asyncio.run','main()','def main','flask',
+             'fastapi','django','uvicorn','gunicorn','streamlit','gradio']
+    SKIP  = {'__pycache__','.git','.svn','node_modules','.venv','venv','env',
+             '.env','.idea','.vscode','.tox','dist','build','site-packages',
+             '.mypy_cache','.pytest_cache','.hg','.bzr'}
+    EXTS  = {'.py','.js','.ts','.jsx','.tsx','.yaml','.yml','.json','.toml',
+             '.cfg','.ini','.sh','.bat','.ps1','.r','.R','.ipynb','.dockerfile','.env'}
 
-    SCRIPT_KEYWORDS = [
-        'if __name__', 'argparse', 'click', 'typer', 'subprocess',
-        'os.system', 'schedule', 'cron', 'celery', 'asyncio.run',
-        'main()', 'def main', 'flask', 'fastapi', 'django',
-        'uvicorn', 'gunicorn', 'streamlit', 'gradio'
-    ]
-
-    IGNORE_DIRS = {
-        '__pycache__', '.git', '.svn', 'node_modules', '.venv',
-        'venv', 'env', '.env', '.idea', '.vscode', '.tox',
-        'dist', 'build', '*.egg-info', '.mypy_cache', '.pytest_cache',
-        'site-packages', '.hg', '.bzr'
-    }
-
-    SCAN_EXTENSIONS = {
-        '.py', '.js', '.ts', '.jsx', '.tsx', '.yaml', '.yml',
-        '.json', '.toml', '.cfg', '.ini', '.sh', '.bat', '.ps1',
-        '.r', '.R', '.ipynb', '.dockerfile', '.env'
-    }
-
-    def __init__(self, db: MetricsDB):
+    def __init__(self, db):
         self.db = db
         self.detected_files = []
 
-    def scan_project(self, root_path="."):
-        """Scan entire project directory"""
-        root_path = os.path.abspath(root_path)
+    def scan_project(self, root="."):
+        root = os.path.abspath(root)
         self.db.clear_files()
         self.detected_files = []
-        all_files = []
-
-        for dirpath, dirnames, filenames in os.walk(root_path):
-            # Filter out ignored directories
-            dirnames[:] = [d for d in dirnames if d not in self.IGNORE_DIRS
-                          and not d.startswith('.')]
-
-            for filename in filenames:
-                filepath = os.path.join(dirpath, filename)
-                ext = Path(filename).suffix.lower()
-
-                if ext in self.SCAN_EXTENSIONS or filename in ('Dockerfile', 'Makefile', 'Procfile'):
-                    file_info = self._analyze_file(filepath, root_path)
-                    if file_info:
-                        all_files.append(file_info)
-
-        # Determine main files
-        self._identify_main_files(all_files)
-
-        # Store in DB
-        for f in all_files:
+        files = []
+        for dp, dn, fn in os.walk(root):
+            dn[:] = [d for d in dn if d not in self.SKIP and not d.startswith('.')]
+            for f in fn:
+                fp = os.path.join(dp, f)
+                ext = Path(f).suffix.lower()
+                if ext in self.EXTS or f in ('Dockerfile','Makefile','Procfile'):
+                    info = self._analyze(fp, root)
+                    if info:
+                        files.append(info)
+        self._find_mains(files)
+        for f in files:
             try:
-                self.db.execute("""
-                    INSERT OR REPLACE INTO detected_files 
-                    (file_path, file_name, file_type, purpose, is_main_file, 
-                     is_ai_agent, is_script, description, size_bytes, last_modified)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    f['file_path'], f['file_name'], f['file_type'],
-                    f['purpose'], f['is_main_file'], f['is_ai_agent'],
-                    f['is_script'], f['description'], f['size_bytes'],
-                    f['last_modified']
-                ))
-            except Exception as e:
-                print(f"Error storing file {f['file_name']}: {e}")
+                self.db.execute("""INSERT OR REPLACE INTO detected_files
+                    (file_path,file_name,file_type,purpose,is_main_file,
+                     is_ai_agent,is_script,description,size_bytes,last_modified)
+                    VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                    (f['file_path'],f['file_name'],f['file_type'],f['purpose'],
+                     f['is_main_file'],f['is_ai_agent'],f['is_script'],
+                     f['description'],f['size_bytes'],f['last_modified']))
+            except: pass
+        ac=sum(1 for f in files if f['is_ai_agent'])
+        sc=sum(1 for f in files if f['is_script'])
+        mc=sum(1 for f in files if f['is_main_file'])
+        self.db.execute("INSERT INTO scan_history (scan_path,total_files,ai_agents,scripts,main_files) VALUES(?,?,?,?,?)",
+                        (root,len(files),ac,sc,mc))
+        self.detected_files = files
+        return files
 
-        # Record scan history
-        ai_count = sum(1 for f in all_files if f['is_ai_agent'])
-        script_count = sum(1 for f in all_files if f['is_script'])
-        main_count = sum(1 for f in all_files if f['is_main_file'])
-
-        self.db.execute("""
-            INSERT INTO scan_history (scan_path, total_files, ai_agents, scripts, main_files)
-            VALUES (?, ?, ?, ?, ?)
-        """, (root_path, len(all_files), ai_count, script_count, main_count))
-
-        self.detected_files = all_files
-        return all_files
-
-    def _analyze_file(self, filepath, root_path):
-        """Analyze a single file for its purpose and type"""
+    def _analyze(self, fp, root):
         try:
-            filename = os.path.basename(filepath)
-            rel_path = os.path.relpath(filepath, root_path)
-            stat = os.stat(filepath)
-            ext = Path(filename).suffix.lower()
-
-            # Read file content
-            content = ""
+            fn = os.path.basename(fp)
+            rp = os.path.relpath(fp, root)
+            st = os.stat(fp)
+            ext = Path(fn).suffix.lower()
             try:
-                with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
-                    content = f.read(50000)  # Read first 50KB
-            except:
-                return None
-
-            content_lower = content.lower()
-
-            # Determine if AI agent
-            ai_score = 0
-            ai_indicators = []
-            for kw in self.AI_KEYWORDS:
-                if kw.lower() in content_lower:
-                    ai_score += 1
-                    ai_indicators.append(kw)
-
-            is_ai_agent = ai_score >= 2
-
-            # Determine if script
-            script_score = 0
-            script_indicators = []
-            for kw in self.SCRIPT_KEYWORDS:
-                if kw.lower() in content_lower:
-                    script_score += 1
-                    script_indicators.append(kw)
-
-            is_script = script_score >= 1
-
-            # Determine purpose
-            purpose = self._determine_purpose(filename, content, ext, ai_indicators, script_indicators)
-
-            # Generate description
-            description = self._generate_description(filename, content, ext, ai_indicators, script_indicators, is_ai_agent, is_script)
-
-            # Determine file type
-            file_type = self._get_file_type(ext, is_ai_agent, is_script)
-
+                with open(fp,'r',encoding='utf-8',errors='ignore') as fh:
+                    content = fh.read(50000)
+            except: return None
+            cl = content.lower()
+            ai = [k for k in self.AI_KW if k.lower() in cl]
+            sc = [k for k in self.SC_KW if k.lower() in cl]
+            is_ai = len(ai) >= 2
+            is_sc = len(sc) >= 1
             return {
-                'file_path': rel_path,
-                'file_name': filename,
-                'file_type': file_type,
-                'purpose': purpose,
-                'is_main_file': 0,
-                'is_ai_agent': 1 if is_ai_agent else 0,
-                'is_script': 1 if is_script else 0,
-                'description': description,
-                'size_bytes': stat.st_size,
-                'last_modified': stat.st_mtime,
-                'ai_indicators': ai_indicators,
-                'script_indicators': script_indicators,
-                'content_preview': content[:500]
+                'file_path': rp, 'file_name': fn,
+                'file_type': self._ftype(ext, is_ai, is_sc),
+                'purpose': self._purpose(fn, content, ext, ai, sc),
+                'is_main_file': 0, 'is_ai_agent': 1 if is_ai else 0,
+                'is_script': 1 if is_sc else 0,
+                'description': self._desc(fn, content, ext, ai, sc, is_ai, is_sc),
+                'size_bytes': st.st_size, 'last_modified': st.st_mtime,
+                'content_preview': content[:500],
             }
-        except Exception as e:
-            return None
+        except: return None
 
-    def _determine_purpose(self, filename, content, ext, ai_indicators, script_indicators):
-        """Determine the purpose of a file"""
-        fname_lower = filename.lower()
-
-        # Config files
-        if fname_lower in ('requirements.txt', 'setup.py', 'setup.cfg', 'pyproject.toml',
-                           'package.json', 'tsconfig.json', 'webpack.config.js'):
-            return "Configuration / Dependencies"
-
-        if fname_lower in ('.env', '.env.example', '.env.local'):
-            return "Environment Variables"
-
-        if fname_lower in ('dockerfile', 'docker-compose.yml', 'docker-compose.yaml'):
-            return "Container Configuration"
-
-        if fname_lower in ('makefile', 'procfile', 'rakefile'):
-            return "Build / Process Management"
-
-        if fname_lower.startswith('test_') or fname_lower.endswith('_test.py') or '/tests/' in filename:
-            return "Testing"
-
-        if 'readme' in fname_lower:
-            return "Documentation"
-
-        # AI specific
-        if ai_indicators:
-            if any(kw in ai_indicators for kw in ['agent', 'crewai', 'autogen', 'swarm']):
-                return "AI Agent Orchestration"
-            if any(kw in ai_indicators for kw in ['embedding', 'vector', 'chromadb', 'pinecone', 'faiss']):
-                return "Vector Store / Embeddings"
-            if any(kw in ai_indicators for kw in ['rag']):
-                return "RAG Pipeline"
-            if any(kw in ai_indicators for kw in ['prompt', 'completion', 'chat_completion']):
-                return "LLM Interaction / Prompting"
-            if any(kw in ai_indicators for kw in ['model', 'predict', 'inference']):
-                return "ML Model / Inference"
-            if any(kw in ai_indicators for kw in ['transformers', 'torch', 'tensorflow', 'keras']):
-                return "Deep Learning / Training"
+    def _purpose(self, fn, content, ext, ai, sc):
+        fl = fn.lower(); cl = content.lower()
+        if fl in ('requirements.txt','setup.py','setup.cfg','pyproject.toml','package.json'):
+            return "Config / Dependencies"
+        if fl in ('.env','.env.example'): return "Environment Variables"
+        if fl in ('dockerfile','docker-compose.yml','docker-compose.yaml'): return "Container Config"
+        if fl in ('makefile','procfile'): return "Build / Process"
+        if fl.startswith('test_') or fl.endswith('_test.py'): return "Testing"
+        if 'readme' in fl: return "Documentation"
+        if ai:
+            if any(k in ai for k in ['agent','crewai','autogen','swarm']): return "AI Agent Orchestration"
+            if any(k in ai for k in ['embedding','vector','chromadb','pinecone','faiss']): return "Vector Store"
+            if 'rag' in ai: return "RAG Pipeline"
+            if any(k in ai for k in ['prompt','completion','chat_completion']): return "LLM Interaction"
+            if any(k in ai for k in ['model','predict','inference']): return "ML Inference"
+            if any(k in ai for k in ['transformers','torch','tensorflow','keras']): return "Deep Learning"
             return "AI/ML Component"
-
-        # Script specific
-        if 'flask' in content.lower() or 'fastapi' in content.lower():
-            return "Web API Server"
-        if 'streamlit' in content.lower() or 'gradio' in content.lower():
-            return "UI / Dashboard"
-        if 'schedule' in content.lower() or 'cron' in content.lower():
-            return "Scheduled Task / Automation"
-        if 'celery' in content.lower():
-            return "Task Queue Worker"
-        if 'subprocess' in content.lower() or 'os.system' in content.lower():
-            return "System Automation Script"
-        if 'argparse' in content.lower() or 'click' in content.lower():
-            return "CLI Tool"
-
-        # General
+        if 'flask' in cl or 'fastapi' in cl: return "Web API"
+        if 'streamlit' in cl or 'gradio' in cl: return "UI / Dashboard"
+        if 'subprocess' in cl or 'os.system' in cl: return "System Automation"
+        if 'argparse' in cl or 'click' in cl: return "CLI Tool"
         if ext == '.py':
-            if 'class ' in content:
-                return "Python Module (Classes)"
-            if 'def ' in content:
-                return "Python Module (Functions)"
+            if 'class ' in content: return "Python (Classes)"
+            if 'def ' in content: return "Python (Functions)"
             return "Python Script"
-
-        if ext in ('.js', '.ts', '.jsx', '.tsx'):
-            return "JavaScript/TypeScript Module"
-
-        if ext in ('.yaml', '.yml'):
-            return "YAML Configuration"
-
-        if ext == '.json':
-            return "JSON Data / Configuration"
-
-        if ext in ('.sh', '.bat', '.ps1'):
-            return "Shell Script"
-
-        if ext == '.ipynb':
-            return "Jupyter Notebook"
-
+        if ext in ('.yaml','.yml'): return "YAML Config"
+        if ext == '.json': return "JSON Data"
+        if ext in ('.sh','.bat','.ps1'): return "Shell Script"
         return "Project File"
 
-    def _generate_description(self, filename, content, ext, ai_indicators, script_indicators, is_ai, is_script):
-        """Generate a human-readable description"""
-        parts = []
-
-        if is_ai:
-            parts.append(f"AI component using: {', '.join(ai_indicators[:5])}")
-
-        if is_script:
-            parts.append(f"Executable script with: {', '.join(script_indicators[:5])}")
-
-        # Extract docstring if Python
+    def _desc(self, fn, content, ext, ai, sc, is_ai, is_sc):
+        p = []
+        if is_ai: p.append(f"AI: {', '.join(ai[:5])}")
+        if is_sc: p.append(f"Script: {', '.join(sc[:5])}")
         if ext == '.py':
-            docstring = self._extract_docstring(content)
-            if docstring:
-                parts.append(f"Docstring: {docstring[:200]}")
+            try:
+                ds = ast.get_docstring(ast.parse(content))
+                if ds: p.append(f"Doc: {ds[:120]}")
+            except: pass
+            cls = re.findall(r'^class (\w+)', content, re.MULTILINE)
+            fns = re.findall(r'^def (\w+)', content, re.MULTILINE)
+            if cls: p.append(f"Classes: {', '.join(cls[:5])}")
+            if fns: p.append(f"Funcs: {', '.join(fns[:8])}")
+        return " | ".join(p) if p else "Standard file"
 
-            # Count functions and classes
-            functions = re.findall(r'^def (\w+)', content, re.MULTILINE)
-            classes = re.findall(r'^class (\w+)', content, re.MULTILINE)
-            if classes:
-                parts.append(f"Classes: {', '.join(classes[:5])}")
-            if functions:
-                parts.append(f"Functions: {', '.join(functions[:8])}")
+    def _ftype(self, ext, ai, sc):
+        if ai: return "AI Agent"
+        if sc: return "Script"
+        return {'.py':'Python','.js':'JavaScript','.ts':'TypeScript','.json':'JSON',
+                '.yaml':'YAML','.yml':'YAML','.sh':'Shell','.toml':'TOML',
+                '.ipynb':'Notebook'}.get(ext,'Other')
 
-        # Extract imports
-        imports = re.findall(r'^(?:import|from)\s+(\S+)', content, re.MULTILINE)
-        if imports:
-            unique_imports = list(set(imp.split('.')[0] for imp in imports))[:10]
-            parts.append(f"Imports: {', '.join(unique_imports)}")
-
-        return " | ".join(parts) if parts else "Standard project file"
-
-    def _extract_docstring(self, content):
-        """Extract module-level docstring"""
-        try:
-            tree = ast.parse(content)
-            docstring = ast.get_docstring(tree)
-            return docstring
-        except:
-            # Fallback regex
-            match = re.match(r'^(?:\s*#[^\n]*\n)*\s*(?:\'\'\'|""")(.+?)(?:\'\'\'|""")', content, re.DOTALL)
-            if match:
-                return match.group(1).strip()[:200]
-        return None
-
-    def _get_file_type(self, ext, is_ai, is_script):
-        if is_ai:
-            return "AI Agent"
-        if is_script:
-            return "Script"
-        type_map = {
-            '.py': 'Python', '.js': 'JavaScript', '.ts': 'TypeScript',
-            '.json': 'JSON', '.yaml': 'YAML', '.yml': 'YAML',
-            '.sh': 'Shell', '.bat': 'Batch', '.toml': 'TOML',
-            '.ipynb': 'Notebook', '.jsx': 'React', '.tsx': 'React/TS',
-            '.r': 'R', '.R': 'R', '.cfg': 'Config', '.ini': 'Config'
-        }
-        return type_map.get(ext, 'Other')
-
-    def _identify_main_files(self, files):
-        """Identify main entry point files"""
-        main_patterns = [
-            'main.py', 'app.py', 'server.py', 'run.py', 'manage.py',
-            'index.py', 'cli.py', 'wsgi.py', 'asgi.py', '__main__.py',
-            'index.js', 'index.ts', 'server.js', 'app.js',
-            'main.js', 'main.ts'
-        ]
-
+    def _find_mains(self, files):
+        mains = {'main.py','app.py','server.py','run.py','manage.py','index.py',
+                 'cli.py','wsgi.py','asgi.py','__main__.py','index.js','server.js',
+                 'app.js','main.js','main.ts','index.ts'}
         for f in files:
-            fname = f['file_name'].lower()
-            # Check filename patterns
-            if fname in main_patterns:
+            if f['file_name'].lower() in mains:
                 f['is_main_file'] = 1
-                continue
-
-            # Check for if __name__ == "__main__" pattern
-            if f.get('content_preview', '') and 'if __name__' in f.get('content_preview', ''):
-                content = ''
-                try:
-                    with open(os.path.join('.', f['file_path']), 'r', errors='ignore') as fh:
-                        content = fh.read()
-                except:
-                    content = f.get('content_preview', '')
-
-                if re.search(r'if\s+__name__\s*==\s*[\'"]__main__[\'"]', content):
-                    f['is_main_file'] = 1
+            elif re.search(r'if\s+__name__\s*==\s*[\'"]__main__[\'"]', f.get('content_preview','')):
+                f['is_main_file'] = 1
 
 
 # ============================================================
-# RESOURCE MONITOR (Self-contained - No Prometheus/Grafana)
+# RESOURCE MONITOR
 # ============================================================
 class ResourceMonitor:
-    def __init__(self, db: MetricsDB):
+    def __init__(self, db):
         self.db = db
         self.monitoring = False
-        self.monitor_thread = None
-        self._process_cache = {}
-
-        # In-memory metrics for fast access
         self.metrics = {
-            'tokens': defaultdict(lambda: {'per_min': 0, 'per_hour': 0, 'per_day': 0}),
-            'requests': defaultdict(lambda: {'per_min': 0, 'per_hour': 0, 'per_day': 0}),
-            'resources': {},
-            'system': {}
+            'tokens': defaultdict(lambda: {'per_min':0,'per_hour':0,'per_day':0}),
+            'requests': defaultdict(lambda: {'per_min':0,'per_hour':0,'per_day':0}),
+            'resources': {}, 'system': {}
         }
+        self._tok_log = defaultdict(list)
+        self._req_log = defaultdict(list)
 
-        # Token/Request tracking timestamps
-        self._token_log = defaultdict(list)  # file -> [(timestamp, count), ...]
-        self._request_log = defaultdict(list)
-
-    def start_monitoring(self):
-        """Start background monitoring thread"""
+    def start(self):
         self.monitoring = True
-        self.monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True)
-        self.monitor_thread.start()
+        threading.Thread(target=self._loop, daemon=True).start()
 
-    def stop_monitoring(self):
+    def stop(self):
         self.monitoring = False
 
-    def _monitor_loop(self):
-        """Main monitoring loop - collects metrics every 5 seconds"""
+    def _loop(self):
         while self.monitoring:
             try:
-                self._collect_system_metrics()
-                self._collect_process_metrics()
-                self._calculate_rate_metrics()
-                self._simulate_token_requests()  # Simulate for demo
+                self._sys(); self._proc(); self._rates(); self._sim()
             except Exception as e:
-                print(f"Monitor error: {e}")
+                print(f"Monitor: {e}")
             time.sleep(5)
 
-    def _collect_system_metrics(self):
-        """Collect system-wide metrics"""
+    def _sys(self):
         cpu = psutil.cpu_percent(interval=1)
         mem = psutil.virtual_memory()
         disk = psutil.disk_usage('/')
-
         self.metrics['system'] = {
-            'cpu_percent': cpu,
-            'memory_total_gb': round(mem.total / (1024**3), 2),
-            'memory_used_gb': round(mem.used / (1024**3), 2),
-            'memory_percent': mem.percent,
-            'disk_total_gb': round(disk.total / (1024**3), 2),
-            'disk_used_gb': round(disk.used / (1024**3), 2),
-            'disk_percent': round(disk.percent, 1),
-            'timestamp': datetime.datetime.now().isoformat()
+            'cpu_pct': cpu,
+            'mem_total': round(mem.total/(1024**3),2),
+            'mem_used': round(mem.used/(1024**3),2),
+            'mem_pct': mem.percent,
+            'disk_total': round(disk.total/(1024**3),2),
+            'disk_used': round(disk.used/(1024**3),2),
+            'disk_pct': round(disk.percent,1),
+            'ts': datetime.datetime.now().isoformat()
         }
 
-    def _collect_process_metrics(self):
-        """Collect per-process metrics for detected AI agents/scripts"""
+    def _proc(self):
         files = self.db.execute(
-            "SELECT file_path, file_name FROM detected_files WHERE is_ai_agent=1 OR is_script=1",
-            fetch=True
-        )
-
+            "SELECT file_path,file_name FROM detected_files WHERE is_ai_agent=1 OR is_script=1", fetch=True)
         for f in files:
-            file_path = f['file_path']
-            file_name = f['file_name']
-
-            # Find running processes matching this file
-            cpu_total = 0.0
-            mem_total = 0.0
-            storage = 0.0
-            pid = 0
-
+            fp, fn = f['file_path'], f['file_name']
+            cpu=mem=storage=0.0; pid=0
             try:
-                # Check file size for storage
-                if os.path.exists(file_path):
-                    storage = os.path.getsize(file_path) / (1024 * 1024)  # MB
-                elif os.path.exists(os.path.join('.', file_path)):
-                    storage = os.path.getsize(os.path.join('.', file_path)) / (1024 * 1024)
-
-                # Find matching processes
-                for proc in psutil.process_iter(['pid', 'name', 'cmdline', 'cpu_percent', 'memory_info']):
+                p = fp if os.path.exists(fp) else os.path.join('.',fp)
+                if os.path.exists(p): storage = os.path.getsize(p)/(1024*1024)
+                for pr in psutil.process_iter(['pid','cmdline','cpu_percent','memory_info']):
                     try:
-                        cmdline = ' '.join(proc.info.get('cmdline') or [])
-                        if file_name in cmdline or file_path in cmdline:
-                            cpu_total += proc.info.get('cpu_percent', 0) or 0
-                            mem_info = proc.info.get('memory_info')
-                            if mem_info:
-                                mem_total += mem_info.rss / (1024 * 1024)  # MB
-                            pid = proc.info['pid']
-                    except (psutil.NoSuchProcess, psutil.AccessDenied):
-                        continue
+                        cmd = ' '.join(pr.info.get('cmdline') or [])
+                        if fn in cmd or fp in cmd:
+                            cpu += pr.info.get('cpu_percent',0) or 0
+                            mi = pr.info.get('memory_info')
+                            if mi: mem += mi.rss/(1024*1024)
+                            pid = pr.info['pid']
+                    except: pass
+            except: pass
+            self.metrics['resources'][fp] = {
+                'pid':pid,'cpu':round(cpu,2),'mem':round(mem,2),'store':round(storage,4)}
+            self.db.execute("INSERT INTO resource_usage (file_path,pid,cpu_percent,memory_mb,storage_mb) VALUES(?,?,?,?,?)",
+                           (fp,pid,cpu,mem,storage))
 
-            except Exception:
-                pass
-
-            self.metrics['resources'][file_path] = {
-                'pid': pid,
-                'cpu_percent': round(cpu_total, 2),
-                'memory_mb': round(mem_total, 2),
-                'storage_mb': round(storage, 4),
-                'timestamp': datetime.datetime.now().isoformat()
-            }
-
-            # Store in DB
-            self.db.execute("""
-                INSERT INTO resource_usage (file_path, pid, cpu_percent, memory_mb, storage_mb)
-                VALUES (?, ?, ?, ?, ?)
-            """, (file_path, pid, cpu_total, mem_total, storage))
-
-    def _calculate_rate_metrics(self):
-        """Calculate per-minute, per-hour, per-day rates"""
+    def _rates(self):
         now = time.time()
+        for fp, ent in list(self._tok_log.items()):
+            ent[:] = [(t,c) for t,c in ent if now-t<86400]
+            self.metrics['tokens'][fp] = {
+                'per_min': sum(c for t,c in ent if now-t<60),
+                'per_hour': sum(c for t,c in ent if now-t<3600),
+                'per_day': sum(c for t,c in ent if now-t<86400)}
+        for fp, ent in list(self._req_log.items()):
+            ent[:] = [(t,c) for t,c in ent if now-t<86400]
+            self.metrics['requests'][fp] = {
+                'per_min': sum(c for t,c in ent if now-t<60),
+                'per_hour': sum(c for t,c in ent if now-t<3600),
+                'per_day': sum(c for t,c in ent if now-t<86400)}
 
-        for file_path in list(self._token_log.keys()):
-            entries = self._token_log[file_path]
-            # Clean old entries (older than 24h)
-            entries[:] = [(t, c) for t, c in entries if now - t < 86400]
-
-            per_min = sum(c for t, c in entries if now - t < 60)
-            per_hour = sum(c for t, c in entries if now - t < 3600)
-            per_day = sum(c for t, c in entries if now - t < 86400)
-
-            self.metrics['tokens'][file_path] = {
-                'per_min': per_min,
-                'per_hour': per_hour,
-                'per_day': per_day
-            }
-
-        for file_path in list(self._request_log.keys()):
-            entries = self._request_log[file_path]
-            entries[:] = [(t, c) for t, c in entries if now - t < 86400]
-
-            per_min = sum(c for t, c in entries if now - t < 60)
-            per_hour = sum(c for t, c in entries if now - t < 3600)
-            per_day = sum(c for t, c in entries if now - t < 86400)
-
-            self.metrics['requests'][file_path] = {
-                'per_min': per_min,
-                'per_hour': per_hour,
-                'per_day': per_day
-            }
-
-    def _simulate_token_requests(self):
-        """Simulate token and request usage for detected AI agents (for demo purposes).
-           In production, replace this with actual API call interception."""
-        files = self.db.execute(
-            "SELECT file_path FROM detected_files WHERE is_ai_agent=1",
-            fetch=True
-        )
+    def _sim(self):
+        files = self.db.execute("SELECT file_path FROM detected_files WHERE is_ai_agent=1", fetch=True)
         now = time.time()
-        import random
-
         for f in files:
             fp = f['file_path']
-            # Simulate occasional API calls
-            if random.random() < 0.3:  # 30% chance every 5 seconds
-                tokens = random.randint(50, 2000)
-                self._token_log[fp].append((now, tokens))
-                self._request_log[fp].append((now, 1))
+            if random.random() < 0.3:
+                tok = random.randint(50,2000)
+                self._tok_log[fp].append((now,tok))
+                self._req_log[fp].append((now,1))
+                self.db.execute("INSERT INTO token_usage (file_path,tokens_used,token_type) VALUES(?,?,?)",
+                               (fp,tok,'total'))
+                self.db.execute("INSERT INTO request_usage (file_path,request_count,status_code) VALUES(?,?,?)",
+                               (fp,1,200))
 
-                self.db.execute(
-                    "INSERT INTO token_usage (file_path, tokens_used, token_type) VALUES (?, ?, ?)",
-                    (fp, tokens, 'total')
-                )
-                self.db.execute(
-                    "INSERT INTO request_usage (file_path, request_count, status_code) VALUES (?, ?, ?)",
-                    (fp, 1, 200)
-                )
-
-    def record_tokens(self, file_path, tokens_used):
-        """Manually record token usage"""
-        now = time.time()
-        self._token_log[file_path].append((now, tokens_used))
-        self.db.execute(
-            "INSERT INTO token_usage (file_path, tokens_used, token_type) VALUES (?, ?, ?)",
-            (file_path, tokens_used, 'total')
-        )
-
-    def record_request(self, file_path, status_code=200):
-        """Manually record API request"""
-        now = time.time()
-        self._request_log[file_path].append((now, 1))
-        self.db.execute(
-            "INSERT INTO request_usage (file_path, request_count, status_code) VALUES (?, ?, ?)",
-            (file_path, 1, status_code)
-        )
-
-    def get_all_metrics(self):
-        """Get all current metrics"""
-        self._calculate_rate_metrics()
+    def get_all(self):
+        self._rates()
         return {
             'system': self.metrics['system'],
             'tokens': dict(self.metrics['tokens']),
             'requests': dict(self.metrics['requests']),
-            'resources': self.metrics['resources']
-        }
+            'resources': self.metrics['resources']}
 
 
 # ============================================================
-# WEB DASHBOARD SERVER
+# HTML TEMPLATE ENGINE
+# ============================================================
+class HTMLBuilder:
+    """Generates all HTML pages with navigation and styling"""
+
+    @staticmethod
+    def _nav(active=""):
+        items = [
+            ("/", "🏠 Home", "home"),
+            ("/dashboard", "📊 Dashboard", "dashboard"),
+            ("/files", "📂 Files", "files"),
+            ("/metrics", "📈 Metrics", "metrics"),
+            ("/agents", "🤖 Agents", "agents"),
+            ("/model", "🧠 Model", "model"),
+            ("/history", "📜 History", "history"),
+            ("/scan", "🔍 Scan Now", "scan"),
+            ("/reset", "🗑️ Reset", "reset"),
+        ]
+        btns = ""
+        for href, label, key in items:
+            cls = "nav-btn active" if key == active else "nav-btn"
+            if key == "reset":
+                cls += " danger"
+            elif key == "scan":
+                cls += " success"
+            btns += f'<a href="{href}" class="{cls}">{label}</a>\n'
+        return btns
+
+    @staticmethod
+    def _head(title):
+        return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>{title} — AI Agent Monitor</title>
+<style>
+*{{margin:0;padding:0;box-sizing:border-box}}
+body{{
+    font-family:'Segoe UI',system-ui,-apple-system,sans-serif;
+    background:#060911;color:#cbd5e1;min-height:100vh;
+}}
+::-webkit-scrollbar{{width:7px}}
+::-webkit-scrollbar-track{{background:#0b1120}}
+::-webkit-scrollbar-thumb{{background:#334155;border-radius:4px}}
+
+/* ── Top Bar ─────────────────────────────── */
+.topbar{{
+    background:linear-gradient(135deg,#0f172a,#1e1b4b,#0f172a);
+    border-bottom:1px solid #312e81;
+    padding:14px 24px;
+    display:flex;align-items:center;justify-content:space-between;
+    flex-wrap:wrap;gap:10px;
+    position:sticky;top:0;z-index:100;
+    box-shadow:0 4px 20px rgba(99,102,241,.12);
+}}
+.topbar h1{{
+    font-size:20px;
+    background:linear-gradient(135deg,#818cf8,#c084fc,#38bdf8);
+    -webkit-background-clip:text;-webkit-text-fill-color:transparent;
+}}
+.live{{display:flex;align-items:center;gap:6px;font-size:12px;color:#4ade80}}
+.live::before{{
+    content:'';width:8px;height:8px;border-radius:50%;
+    background:#22c55e;animation:pulse 1.5s infinite;
+}}
+@keyframes pulse{{0%,100%{{opacity:1}}50%{{opacity:.3}}}}
+
+/* ── Navigation ──────────────────────────── */
+.nav{{
+    background:#080d1a;border-bottom:1px solid #1e293b;
+    padding:10px 24px;display:flex;gap:8px;flex-wrap:wrap;
+    overflow-x:auto;
+}}
+.nav-btn{{
+    padding:8px 18px;border-radius:8px;font-size:12px;
+    font-weight:600;text-decoration:none;
+    background:#111827;color:#94a3b8;border:1px solid #1e293b;
+    transition:all .2s;white-space:nowrap;
+}}
+.nav-btn:hover{{background:#1e293b;color:#e2e8f0;transform:translateY(-1px);
+    box-shadow:0 4px 12px rgba(0,0,0,.3)}}
+.nav-btn.active{{background:#312e81;color:#a5b4fc;border-color:#4f46e5}}
+.nav-btn.danger{{color:#f87171;border-color:#7f1d1d}}
+.nav-btn.danger:hover{{background:#7f1d1d;color:#fecaca}}
+.nav-btn.success{{color:#4ade80;border-color:#14532d}}
+.nav-btn.success:hover{{background:#14532d;color:#bbf7d0}}
+
+/* ── Container ───────────────────────────── */
+.container{{max-width:1800px;margin:0 auto;padding:24px}}
+
+/* ── Cards ────────────────────────────────── */
+.grid{{display:grid;gap:16px;margin-bottom:24px}}
+.grid-6{{grid-template-columns:repeat(auto-fit,minmax(170px,1fr))}}
+.grid-3{{grid-template-columns:repeat(auto-fit,minmax(280px,1fr))}}
+.grid-4{{grid-template-columns:repeat(auto-fit,minmax(200px,1fr))}}
+.grid-2{{grid-template-columns:repeat(auto-fit,minmax(340px,1fr))}}
+.card{{
+    border-radius:14px;padding:20px;border:1px solid;
+    position:relative;overflow:hidden;transition:transform .2s;
+}}
+.card:hover{{transform:translateY(-2px)}}
+.card::before{{content:'';position:absolute;top:0;left:0;right:0;height:3px}}
+
+.card.blue{{background:#0c1a2e;border-color:#1d4ed830}}
+.card.blue::before{{background:linear-gradient(90deg,#2563eb,#3b82f6)}}
+.card.purple{{background:#160c2e;border-color:#7c3aed30}}
+.card.purple::before{{background:linear-gradient(90deg,#7c3aed,#a78bfa)}}
+.card.green{{background:#0a1f0a;border-color:#15803d30}}
+.card.green::before{{background:linear-gradient(90deg,#059669,#22c55e)}}
+.card.orange{{background:#1f1000;border-color:#d9770630}}
+.card.orange::before{{background:linear-gradient(90deg,#d97706,#f59e0b)}}
+.card.cyan{{background:#001f2e;border-color:#0891b230}}
+.card.cyan::before{{background:linear-gradient(90deg,#0891b2,#06b6d4)}}
+.card.red{{background:#1f0808;border-color:#dc262630}}
+.card.red::before{{background:linear-gradient(90deg,#dc2626,#ef4444)}}
+.card.dark{{background:#080d1a;border-color:#1e293b}}
+
+.lbl{{font-size:11px;text-transform:uppercase;letter-spacing:.8px;color:#475569;margin-bottom:6px}}
+.val{{font-size:34px;font-weight:800;line-height:1}}
+.sub{{font-size:11px;color:#475569;margin-top:6px}}
+.card.blue   .val{{color:#3b82f6}}
+.card.purple .val{{color:#a78bfa}}
+.card.green  .val{{color:#22c55e}}
+.card.orange .val{{color:#f59e0b}}
+.card.cyan   .val{{color:#06b6d4}}
+.card.red    .val{{color:#ef4444}}
+
+/* ── Section Header ──────────────────────── */
+.sec{{
+    display:flex;align-items:center;justify-content:space-between;
+    margin:28px 0 14px;padding-bottom:10px;border-bottom:1px solid #1e293b;
+}}
+.sec h2{{font-size:16px;color:#e2e8f0;display:flex;align-items:center;gap:8px}}
+.badge{{
+    background:#1e293b;border:1px solid #334155;border-radius:12px;
+    padding:3px 12px;font-size:12px;color:#60a5fa;
+}}
+
+/* ── Progress Bars ───────────────────────── */
+.pbar-wrap{{
+    background:#0f172a;border-radius:8px;height:26px;
+    overflow:hidden;border:1px solid #1e293b;
+}}
+.pbar{{
+    height:100%;border-radius:8px;display:flex;align-items:center;
+    justify-content:flex-end;padding-right:8px;font-size:11px;
+    font-weight:700;color:#fff;min-width:40px;transition:width .5s;
+}}
+.pbar-detail{{display:flex;justify-content:space-between;font-size:12px;color:#475569;margin-top:6px}}
+
+/* ── Tables ───────────────────────────────── */
+.tw{{
+    background:#080d1a;border:1px solid #1e293b;border-radius:14px;
+    overflow:hidden;margin-bottom:24px;
+}}
+.ts{{overflow-x:auto;max-height:520px;overflow-y:auto}}
+table{{width:100%;border-collapse:collapse;min-width:800px}}
+thead{{position:sticky;top:0;z-index:10}}
+th{{
+    background:#0d1424;padding:12px 14px;text-align:left;
+    font-size:11px;text-transform:uppercase;letter-spacing:.8px;
+    color:#475569;font-weight:600;border-bottom:1px solid #1e293b;
+    white-space:nowrap;
+}}
+td{{padding:10px 14px;border-bottom:1px solid #0f172a;font-size:13px;vertical-align:middle}}
+tr:hover td{{background:#0d1628}}
+.empty{{text-align:center;color:#334155;padding:48px!important;font-size:14px}}
+
+/* ── Tags ─────────────────────────────────── */
+.tag{{
+    display:inline-flex;align-items:center;gap:3px;padding:3px 8px;
+    border-radius:5px;font-size:11px;font-weight:600;white-space:nowrap;
+}}
+.t-ai{{background:#1e3a5f;color:#60a5fa;border:1px solid #2563eb40}}
+.t-sc{{background:#2d1b4e;color:#c084fc;border:1px solid #7c3aed40}}
+.t-mn{{background:#0d2e1a;color:#4ade80;border:1px solid #15803d40}}
+.t-fl{{background:#1e293b;color:#94a3b8;border:1px solid #33415540}}
+
+.path{{font-family:monospace;font-size:11px;color:#64748b}}
+.purp{{color:#818cf8;font-weight:500;font-size:12px}}
+.desc{{color:#64748b;font-size:11px;max-width:300px;display:block;
+       white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
+.sz{{font-family:monospace;font-size:12px;color:#475569}}
+
+/* ── Usage Bars ──────────────────────────── */
+.urow{{
+    display:flex;justify-content:space-between;align-items:center;
+    padding:10px 0;border-bottom:1px solid #0f172a;gap:16px;
+}}
+.urow:last-child{{border-bottom:none}}
+.ulbl{{font-size:12px;color:#64748b;margin-bottom:4px}}
+.ubar{{height:6px;background:#1e293b;border-radius:3px;overflow:hidden;width:100%}}
+.ufill{{height:100%;border-radius:3px}}
+.uval{{font-size:15px;font-weight:700;font-family:monospace;color:#e2e8f0;text-align:right}}
+.ulim{{font-size:11px;color:#334155;text-align:right}}
+
+/* ── Model Items ─────────────────────────── */
+.mi{{background:#080d1a;border:1px solid #1e293b;border-radius:10px;padding:14px 16px}}
+.mi-l{{font-size:11px;color:#475569;text-transform:uppercase;letter-spacing:.8px;margin-bottom:4px}}
+.mi-v{{font-size:14px;font-weight:600;color:#a5b4fc;font-family:monospace}}
+
+/* ── Hero Section (Home) ─────────────────── */
+.hero{{
+    text-align:center;padding:60px 24px;
+    background:linear-gradient(180deg,#0f172a 0%,#060911 100%);
+    border-bottom:1px solid #1e293b;
+}}
+.hero h2{{
+    font-size:42px;font-weight:800;
+    background:linear-gradient(135deg,#818cf8,#c084fc,#38bdf8,#22c55e);
+    -webkit-background-clip:text;-webkit-text-fill-color:transparent;
+    margin-bottom:12px;
+}}
+.hero p{{color:#64748b;font-size:16px;max-width:600px;margin:0 auto 32px}}
+.hero-cards{{
+    display:flex;gap:24px;justify-content:center;flex-wrap:wrap;
+    margin-top:32px;
+}}
+.hero-card{{
+    background:#111827;border:1px solid #1e293b;border-radius:16px;
+    padding:24px 32px;text-align:center;min-width:200px;
+    transition:transform .2s;
+}}
+.hero-card:hover{{transform:translateY(-4px);box-shadow:0 8px 24px rgba(0,0,0,.4)}}
+.hero-card .icon{{font-size:32px;margin-bottom:8px}}
+.hero-card .hc-val{{font-size:28px;font-weight:800;margin:4px 0}}
+.hero-card .hc-lbl{{font-size:12px;color:#64748b}}
+
+/* ── Alert Box ───────────────────────────── */
+.alert{{
+    padding:16px 20px;border-radius:10px;margin-bottom:24px;
+    display:flex;align-items:center;gap:12px;font-size:14px;
+}}
+.alert-success{{background:#052e16;border:1px solid #15803d;color:#4ade80}}
+.alert-warn{{background:#431407;border:1px solid #d97706;color:#fbbf24}}
+.alert-danger{{background:#450a0a;border:1px solid #dc2626;color:#f87171}}
+.alert-info{{background:#0c1a2e;border:1px solid #2563eb;color:#60a5fa}}
+
+/* ── Footer ───────────────────────────────── */
+.footer{{
+    text-align:center;padding:20px;color:#1e293b;
+    font-size:12px;border-top:1px solid #0f172a;margin-top:32px;
+}}
+
+@media(max-width:768px){{
+    .grid-6{{grid-template-columns:repeat(2,1fr)}}
+    .grid-3,.grid-4{{grid-template-columns:1fr}}
+    .hero h2{{font-size:28px}}
+    .hero-cards{{flex-direction:column;align-items:center}}
+}}
+</style>
+</head>
+<body>"""
+
+    @staticmethod
+    def _topbar():
+        return f"""
+<div class="topbar">
+    <h1>🤖 AI Agent Monitor</h1>
+    <div style="display:flex;align-items:center;gap:16px">
+        <span style="font-size:12px;color:#818cf8;font-weight:600">
+            🧠 {ACTIVE_CONFIG['name']} • ⚡ {ACTIVE_CONFIG['provider'].upper()}</span>
+        <span class="live">Live</span>
+    </div>
+</div>"""
+
+    @staticmethod
+    def _footer():
+        return f"""
+<div class="footer">
+    AI Agent Monitor • {ACTIVE_CONFIG['name']} ({ACTIVE_CONFIG['provider']}) •
+    {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+</div>
+</body></html>"""
+
+    @staticmethod
+    def _page(title, active, content, auto_refresh=0):
+        refresh_meta = f'<meta http-equiv="refresh" content="{auto_refresh}">' if auto_refresh > 0 else ''
+        h = HTMLBuilder._head(title)
+        # Insert refresh meta if needed
+        if refresh_meta:
+            h = h.replace('</head>', refresh_meta + '\n</head>')
+        return (h +
+                HTMLBuilder._topbar() +
+                f'\n<div class="nav">{HTMLBuilder._nav(active)}</div>\n' +
+                content +
+                HTMLBuilder._footer())
+
+    # ═══════════════════════════════════════════════════════════
+    # PAGE BUILDERS
+    # ═══════════════════════════════════════════════════════════
+
+    @staticmethod
+    def home_page(files, metrics):
+        sys_m = metrics.get('system', {})
+        ai = sum(1 for f in files if f.get('is_ai_agent'))
+        sc = sum(1 for f in files if f.get('is_script'))
+        mn = sum(1 for f in files if f.get('is_main_file'))
+        tok = sum(v.get('per_day',0) for v in metrics.get('tokens',{}).values())
+        req = sum(v.get('per_day',0) for v in metrics.get('requests',{}).values())
+
+        content = f"""
+<div class="hero">
+    <h2>AI Agent Monitor</h2>
+    <p>Real-time monitoring dashboard for AI agents, scripts, tokens, requests,
+       and system resources in your project.</p>
+    <div class="hero-cards">
+        <div class="hero-card">
+            <div class="icon">📂</div>
+            <div class="hc-val" style="color:#3b82f6">{len(files)}</div>
+            <div class="hc-lbl">Total Files</div>
+        </div>
+        <div class="hero-card">
+            <div class="icon">🤖</div>
+            <div class="hc-val" style="color:#a78bfa">{ai}</div>
+            <div class="hc-lbl">AI Agents</div>
+        </div>
+        <div class="hero-card">
+            <div class="icon">⚡</div>
+            <div class="hc-val" style="color:#22c55e">{sc}</div>
+            <div class="hc-lbl">Scripts</div>
+        </div>
+        <div class="hero-card">
+            <div class="icon">★</div>
+            <div class="hc-val" style="color:#f59e0b">{mn}</div>
+            <div class="hc-lbl">Main Files</div>
+        </div>
+        <div class="hero-card">
+            <div class="icon">🪙</div>
+            <div class="hc-val" style="color:#06b6d4">{tok:,}</div>
+            <div class="hc-lbl">Tokens Today</div>
+        </div>
+        <div class="hero-card">
+            <div class="icon">📡</div>
+            <div class="hc-val" style="color:#ef4444">{req:,}</div>
+            <div class="hc-lbl">Requests Today</div>
+        </div>
+    </div>
+</div>
+<div class="container">
+    <div class="sec"><h2>💡 Quick Navigation</h2></div>
+    <div class="grid grid-3">
+        <a href="/dashboard" style="text-decoration:none">
+            <div class="card blue" style="cursor:pointer">
+                <div class="lbl">📊 DASHBOARD</div>
+                <div style="color:#94a3b8;font-size:13px;margin-top:8px">
+                    Full overview with system resources, tokens, and requests</div>
+            </div>
+        </a>
+        <a href="/files" style="text-decoration:none">
+            <div class="card green" style="cursor:pointer">
+                <div class="lbl">📂 FILES</div>
+                <div style="color:#94a3b8;font-size:13px;margin-top:8px">
+                    View all detected files with types, purposes, descriptions</div>
+            </div>
+        </a>
+        <a href="/agents" style="text-decoration:none">
+            <div class="card purple" style="cursor:pointer">
+                <div class="lbl">🤖 AGENTS</div>
+                <div style="color:#94a3b8;font-size:13px;margin-top:8px">
+                    Detailed metrics for AI agents and scripts</div>
+            </div>
+        </a>
+        <a href="/metrics" style="text-decoration:none">
+            <div class="card cyan" style="cursor:pointer">
+                <div class="lbl">📈 METRICS</div>
+                <div style="color:#94a3b8;font-size:13px;margin-top:8px">
+                    Token usage, request counts, and limits</div>
+            </div>
+        </a>
+        <a href="/model" style="text-decoration:none">
+            <div class="card orange" style="cursor:pointer">
+                <div class="lbl">🧠 MODEL</div>
+                <div style="color:#94a3b8;font-size:13px;margin-top:8px">
+                    Active model configuration, limits, costs</div>
+            </div>
+        </a>
+        <a href="/history" style="text-decoration:none">
+            <div class="card dark" style="cursor:pointer">
+                <div class="lbl">📜 HISTORY</div>
+                <div style="color:#94a3b8;font-size:13px;margin-top:8px">
+                    Past scan results and timeline</div>
+            </div>
+        </a>
+    </div>
+
+    <div class="sec"><h2>💻 System Status</h2></div>
+    <div class="grid grid-3">
+        <div class="card dark">
+            <div class="lbl">🔲 CPU</div>
+            <div class="pbar-wrap" style="margin-top:8px">
+                <div class="pbar" style="width:{sys_m.get('cpu_pct',0)}%;
+                     background:{_bar_color(sys_m.get('cpu_pct',0))}">
+                    {sys_m.get('cpu_pct',0):.1f}%</div>
+            </div>
+        </div>
+        <div class="card dark">
+            <div class="lbl">🧠 Memory</div>
+            <div class="pbar-wrap" style="margin-top:8px">
+                <div class="pbar" style="width:{sys_m.get('mem_pct',0)}%;
+                     background:{_bar_color(sys_m.get('mem_pct',0))}">
+                    {sys_m.get('mem_pct',0):.1f}%</div>
+            </div>
+            <div class="pbar-detail">
+                <span>{sys_m.get('mem_used',0)} GB</span>
+                <span>{sys_m.get('mem_total',0)} GB</span>
+            </div>
+        </div>
+        <div class="card dark">
+            <div class="lbl">💾 Disk</div>
+            <div class="pbar-wrap" style="margin-top:8px">
+                <div class="pbar" style="width:{sys_m.get('disk_pct',0)}%;
+                     background:{_bar_color(sys_m.get('disk_pct',0))}">
+                    {sys_m.get('disk_pct',0):.1f}%</div>
+            </div>
+            <div class="pbar-detail">
+                <span>{sys_m.get('disk_used',0)} GB</span>
+                <span>{sys_m.get('disk_total',0)} GB</span>
+            </div>
+        </div>
+    </div>
+</div>"""
+        return HTMLBuilder._page("Home", "home", content)
+
+    @staticmethod
+    def dashboard_page(files, metrics):
+        sys_m = metrics.get('system', {})
+        tokens = metrics.get('tokens', {})
+        reqs = metrics.get('requests', {})
+        cfg = ACTIVE_CONFIG
+
+        ai = sum(1 for f in files if f.get('is_ai_agent'))
+        sc = sum(1 for f in files if f.get('is_script'))
+        mn = sum(1 for f in files if f.get('is_main_file'))
+        tok_min = sum(v.get('per_min',0) for v in tokens.values())
+        tok_hr  = sum(v.get('per_hour',0) for v in tokens.values())
+        tok_day = sum(v.get('per_day',0) for v in tokens.values())
+        req_min = sum(v.get('per_min',0) for v in reqs.values())
+        req_hr  = sum(v.get('per_hour',0) for v in reqs.values())
+        req_day = sum(v.get('per_day',0) for v in reqs.values())
+
+        content = f"""
+<div class="container">
+    <div class="sec"><h2>📊 Overview</h2><span class="badge">Live</span></div>
+    <div class="grid grid-6">
+        <div class="card blue"><div class="lbl">Total Files</div><div class="val">{len(files)}</div></div>
+        <div class="card purple"><div class="lbl">AI Agents</div><div class="val">{ai}</div></div>
+        <div class="card green"><div class="lbl">Scripts</div><div class="val">{sc}</div></div>
+        <div class="card orange"><div class="lbl">Main Files</div><div class="val">{mn}</div></div>
+        <div class="card cyan"><div class="lbl">Tokens/Day</div><div class="val">{tok_day:,}</div></div>
+        <div class="card red"><div class="lbl">Requests/Day</div><div class="val">{req_day:,}</div></div>
+    </div>
+
+    <div class="sec"><h2>💻 System Resources</h2>
+        <span class="badge">{sys_m.get('ts','N/A')[:19]}</span></div>
+    <div class="grid grid-3">
+        <div class="card dark">
+            <div class="lbl">🔲 CPU Usage</div>
+            <div class="pbar-wrap" style="margin:12px 0 8px">
+                <div class="pbar" style="width:{sys_m.get('cpu_pct',0)}%;
+                     background:{_bar_color(sys_m.get('cpu_pct',0))}">
+                    {sys_m.get('cpu_pct',0):.1f}%</div></div>
+            <div class="pbar-detail"><span>Processor</span><span>{sys_m.get('cpu_pct',0):.1f}%</span></div>
+        </div>
+        <div class="card dark">
+            <div class="lbl">🧠 Memory Usage</div>
+            <div class="pbar-wrap" style="margin:12px 0 8px">
+                <div class="pbar" style="width:{sys_m.get('mem_pct',0)}%;
+                     background:{_bar_color(sys_m.get('mem_pct',0))}">
+                    {sys_m.get('mem_pct',0):.1f}%</div></div>
+            <div class="pbar-detail">
+                <span>{sys_m.get('mem_used',0)} GB used</span>
+                <span>/ {sys_m.get('mem_total',0)} GB</span></div>
+        </div>
+        <div class="card dark">
+            <div class="lbl">💾 Disk Usage</div>
+            <div class="pbar-wrap" style="margin:12px 0 8px">
+                <div class="pbar" style="width:{sys_m.get('disk_pct',0)}%;
+                     background:{_bar_color(sys_m.get('disk_pct',0))}">
+                    {sys_m.get('disk_pct',0):.1f}%</div></div>
+            <div class="pbar-detail">
+                <span>{sys_m.get('disk_used',0)} GB used</span>
+                <span>/ {sys_m.get('disk_total',0)} GB</span></div>
+        </div>
+    </div>
+
+    <div class="sec"><h2>📊 Token & Request Usage</h2></div>
+    <div class="grid grid-2">
+        <div class="card dark" style="padding:24px">
+            <h3 style="font-size:14px;color:#e2e8f0;margin-bottom:16px;
+                       border-bottom:1px solid #1e293b;padding-bottom:10px">🪙 Token Usage</h3>
+            {_usage_row('Per Minute', tok_min, cfg['tpm'], '#3b82f6')}
+            {_usage_row('Per Hour',   tok_hr,  cfg['tph'], '#8b5cf6')}
+            {_usage_row('Per Day',    tok_day, cfg['tpd'], '#06b6d4')}
+        </div>
+        <div class="card dark" style="padding:24px">
+            <h3 style="font-size:14px;color:#e2e8f0;margin-bottom:16px;
+                       border-bottom:1px solid #1e293b;padding-bottom:10px">📡 Request Usage</h3>
+            {_usage_row('Per Minute', req_min, cfg['rpm'], '#22c55e')}
+            {_usage_row('Per Hour',   req_hr,  cfg['rph'], '#f59e0b')}
+            {_usage_row('Per Day',    req_day, cfg['rpd'], '#ef4444')}
+        </div>
+    </div>
+</div>"""
+        return HTMLBuilder._page("Dashboard", "dashboard", content, auto_refresh=10)
+
+    @staticmethod
+    def files_page(files):
+        rows = ""
+        for f in files:
+            if f.get('is_ai_agent'):
+                tag = '<span class="tag t-ai">🤖 AI Agent</span>'
+            elif f.get('is_script'):
+                tag = '<span class="tag t-sc">⚡ Script</span>'
+            else:
+                tag = f'<span class="tag t-fl">{f.get("file_type","")}</span>'
+            flags = ""
+            if f.get('is_main_file'): flags += '<span class="tag t-mn">★ Main</span> '
+            if f.get('is_ai_agent'):  flags += '<span class="tag t-ai">AI</span> '
+            if f.get('is_script'):    flags += '<span class="tag t-sc">Scr</span>'
+            desc = (f.get('description','') or '')[:150]
+            sz = _fmt_size(f.get('size_bytes',0))
+            rows += f"""<tr>
+                <td>{tag}</td>
+                <td><strong style="color:#e2e8f0">{f['file_name']}</strong></td>
+                <td><code class="path">{f['file_path']}</code></td>
+                <td><span class="purp">{f.get('purpose','-')}</span></td>
+                <td><span class="desc">{desc}</span></td>
+                <td><span class="sz">{sz}</span></td>
+                <td>{flags}</td></tr>"""
+        if not rows:
+            rows = '<tr><td colspan="7" class="empty">No files detected. Click "Scan Now"</td></tr>'
+
+        content = f"""
+<div class="container">
+    <div class="sec"><h2>📂 Detected Files</h2><span class="badge">{len(files)} files</span></div>
+    <div class="tw"><div class="ts"><table>
+        <thead><tr>
+            <th>Type</th><th>Name</th><th>Path</th><th>Purpose</th>
+            <th>Description</th><th>Size</th><th>Flags</th>
+        </tr></thead>
+        <tbody>{rows}</tbody>
+    </table></div></div>
+</div>"""
+        return HTMLBuilder._page("Files", "files", content)
+
+    @staticmethod
+    def agents_page(files, metrics):
+        tokens = metrics.get('tokens', {})
+        reqs   = metrics.get('requests', {})
+        res    = metrics.get('resources', {})
+        cfg    = ACTIVE_CONFIG
+        agents = [f for f in files if f.get('is_ai_agent') or f.get('is_script')]
+
+        rows = ""
+        for a in agents:
+            fp  = a['file_path']
+            tok = tokens.get(fp, {'per_min':0,'per_hour':0,'per_day':0})
+            rq  = reqs.get(fp,   {'per_min':0,'per_hour':0,'per_day':0})
+            rc  = res.get(fp,    {'cpu':0,'mem':0,'store':0})
+            sn  = re.sub(r'\.[^.]+$','', a['file_name'])
+            sd  = (a.get('description','') or '')[:100]
+
+            rows += f"""<tr>
+                <td><strong style="color:#60a5fa">{sn}</strong></td>
+                <td style="color:#94a3b8">{a['file_name']}</td>
+                <td><span class="purp">{a.get('purpose','-')}</span></td>
+                <td><span class="desc">{sd}</span></td>
+                <td style="color:{_mc(_pct(tok['per_min'],cfg['tpm']))};font-family:monospace">
+                    {tok['per_min']:,}<small style="color:#334155">/{cfg['tpm']:,}</small></td>
+                <td style="color:{_mc(_pct(tok['per_hour'],cfg['tph']))};font-family:monospace">
+                    {tok['per_hour']:,}<small style="color:#334155">/{cfg['tph']:,}</small></td>
+                <td style="color:{_mc(_pct(tok['per_day'],cfg['tpd']))};font-family:monospace">
+                    {tok['per_day']:,}<small style="color:#334155">/{cfg['tpd']:,}</small></td>
+                <td style="color:{_mc(_pct(rq['per_min'],cfg['rpm']))};font-family:monospace">
+                    {rq['per_min']:,}<small style="color:#334155">/{cfg['rpm']:,}</small></td>
+                <td style="color:{_mc(_pct(rq['per_hour'],cfg['rph']))};font-family:monospace">
+                    {rq['per_hour']:,}<small style="color:#334155">/{cfg['rph']:,}</small></td>
+                <td style="color:{_mc(_pct(rq['per_day'],cfg['rpd']))};font-family:monospace">
+                    {rq['per_day']:,}<small style="color:#334155">/{cfg['rpd']:,}</small></td>
+                <td style="color:{_mc(rc.get('cpu',0))}">{rc.get('cpu',0):.1f}%</td>
+                <td style="color:#a78bfa">{rc.get('mem',0):.1f}</td>
+                <td style="color:#64748b">{rc.get('store',0):.3f}</td></tr>"""
+        if not rows:
+            rows = '<tr><td colspan="13" class="empty">No AI agents or scripts detected</td></tr>'
+
+        content = f"""
+<div class="container">
+    <div class="sec"><h2>🤖 AI Agent & Script Metrics</h2>
+        <span class="badge">{len(agents)} agents/scripts</span></div>
+    <div class="tw"><div class="ts"><table>
+        <thead><tr>
+            <th>Script</th><th>File</th><th>Purpose</th><th>Desc</th>
+            <th>Tok/Min</th><th>Tok/Hr</th><th>Tok/Day</th>
+            <th>Req/Min</th><th>Req/Hr</th><th>Req/Day</th>
+            <th>CPU</th><th>Mem MB</th><th>Store MB</th>
+        </tr></thead>
+        <tbody>{rows}</tbody>
+    </table></div></div>
+</div>"""
+        return HTMLBuilder._page("Agents", "agents", content, auto_refresh=10)
+
+    @staticmethod
+    def metrics_page(metrics):
+        tokens = metrics.get('tokens', {})
+        reqs   = metrics.get('requests', {})
+        cfg    = ACTIVE_CONFIG
+
+        tok_min = sum(v.get('per_min',0) for v in tokens.values())
+        tok_hr  = sum(v.get('per_hour',0) for v in tokens.values())
+        tok_day = sum(v.get('per_day',0) for v in tokens.values())
+        req_min = sum(v.get('per_min',0) for v in reqs.values())
+        req_hr  = sum(v.get('per_hour',0) for v in reqs.values())
+        req_day = sum(v.get('per_day',0) for v in reqs.values())
+
+        # Cost estimation
+        est_cost_in  = (tok_day / 1000) * cfg['cost_in']
+        est_cost_out = (tok_day / 1000) * cfg['cost_out']
+        est_total    = est_cost_in + est_cost_out
+
+        content = f"""
+<div class="container">
+    <div class="sec"><h2>📈 Live Metrics</h2><span class="badge">Auto-refresh 10s</span></div>
+
+    <div class="grid grid-6">
+        <div class="card blue"><div class="lbl">Tok/Min</div><div class="val">{tok_min:,}</div>
+            <div class="sub">Limit: {cfg['tpm']:,}</div></div>
+        <div class="card purple"><div class="lbl">Tok/Hour</div><div class="val">{tok_hr:,}</div>
+            <div class="sub">Limit: {cfg['tph']:,}</div></div>
+        <div class="card cyan"><div class="lbl">Tok/Day</div><div class="val">{tok_day:,}</div>
+            <div class="sub">Limit: {cfg['tpd']:,}</div></div>
+        <div class="card green"><div class="lbl">Req/Min</div><div class="val">{req_min:,}</div>
+            <div class="sub">Limit: {cfg['rpm']:,}</div></div>
+        <div class="card orange"><div class="lbl">Req/Hour</div><div class="val">{req_hr:,}</div>
+            <div class="sub">Limit: {cfg['rph']:,}</div></div>
+        <div class="card red"><div class="lbl">Req/Day</div><div class="val">{req_day:,}</div>
+            <div class="sub">Limit: {cfg['rpd']:,}</div></div>
+    </div>
+
+    <div class="sec"><h2>📊 Usage Bars</h2></div>
+    <div class="grid grid-2">
+        <div class="card dark" style="padding:24px">
+            <h3 style="font-size:14px;color:#e2e8f0;margin-bottom:16px;
+                       border-bottom:1px solid #1e293b;padding-bottom:10px">🪙 Tokens vs Limits</h3>
+            {_usage_row('Per Minute', tok_min, cfg['tpm'], '#3b82f6')}
+            {_usage_row('Per Hour',   tok_hr,  cfg['tph'], '#8b5cf6')}
+            {_usage_row('Per Day',    tok_day, cfg['tpd'], '#06b6d4')}
+        </div>
+        <div class="card dark" style="padding:24px">
+            <h3 style="font-size:14px;color:#e2e8f0;margin-bottom:16px;
+                       border-bottom:1px solid #1e293b;padding-bottom:10px">📡 Requests vs Limits</h3>
+            {_usage_row('Per Minute', req_min, cfg['rpm'], '#22c55e')}
+            {_usage_row('Per Hour',   req_hr,  cfg['rph'], '#f59e0b')}
+            {_usage_row('Per Day',    req_day, cfg['rpd'], '#ef4444')}
+        </div>
+    </div>
+
+    <div class="sec"><h2>💰 Estimated Cost</h2></div>
+    <div class="grid grid-3">
+        <div class="card green"><div class="lbl">Input Cost (Today)</div>
+            <div class="val">${est_cost_in:.4f}</div></div>
+        <div class="card orange"><div class="lbl">Output Cost (Today)</div>
+            <div class="val">${est_cost_out:.4f}</div></div>
+        <div class="card red"><div class="lbl">Total Est. Cost</div>
+            <div class="val">${est_total:.4f}</div></div>
+    </div>
+</div>"""
+        return HTMLBuilder._page("Metrics", "metrics", content, auto_refresh=10)
+
+    @staticmethod
+    def model_page():
+        cfg = ACTIVE_CONFIG
+        key_status = "✅ API Key Set" if cfg['api_key'] else "❌ API Key Missing"
+        key_color = "alert-success" if cfg['api_key'] else "alert-danger"
+
+        content = f"""
+<div class="container">
+    <div class="sec"><h2>🧠 Active Model Configuration</h2>
+        <span class="badge">{cfg['provider'].upper()} → {cfg['name']}</span></div>
+
+    <div class="alert {key_color}">{key_status}</div>
+
+    <div class="grid grid-4">
+        <div class="mi"><div class="mi-l">Provider</div><div class="mi-v">{cfg['provider'].upper()}</div></div>
+        <div class="mi"><div class="mi-l">Model</div><div class="mi-v">{cfg['name']}</div></div>
+        <div class="mi"><div class="mi-l">Base URL</div><div class="mi-v" style="font-size:11px">{cfg['base_url']}</div></div>
+        <div class="mi"><div class="mi-l">Context Window</div><div class="mi-v">{cfg['ctx']:,} tokens</div></div>
+    </div>
+
+    <div class="sec"><h2>🔒 Rate Limits</h2></div>
+    <div class="grid grid-3">
+        <div class="card blue"><div class="lbl">Tokens / Minute</div><div class="val">{cfg['tpm']:,}</div></div>
+        <div class="card purple"><div class="lbl">Tokens / Hour</div><div class="val">{cfg['tph']:,}</div></div>
+        <div class="card cyan"><div class="lbl">Tokens / Day</div><div class="val">{cfg['tpd']:,}</div></div>
+        <div class="card green"><div class="lbl">Requests / Minute</div><div class="val">{cfg['rpm']:,}</div></div>
+        <div class="card orange"><div class="lbl">Requests / Hour</div><div class="val">{cfg['rph']:,}</div></div>
+        <div class="card red"><div class="lbl">Requests / Day</div><div class="val">{cfg['rpd']:,}</div></div>
+    </div>
+
+    <div class="sec"><h2>💰 Pricing</h2></div>
+    <div class="grid grid-3">
+        <div class="card dark"><div class="lbl">Input Cost / 1K tokens</div>
+            <div style="font-size:24px;font-weight:700;color:#22c55e;margin-top:8px">
+                ${cfg['cost_in']:.5f}</div></div>
+        <div class="card dark"><div class="lbl">Output Cost / 1K tokens</div>
+            <div style="font-size:24px;font-weight:700;color:#f59e0b;margin-top:8px">
+                ${cfg['cost_out']:.5f}</div></div>
+        <div class="card dark"><div class="lbl">Env Variable Source</div>
+            <div style="font-size:14px;color:#94a3b8;margin-top:8px;font-family:monospace">
+                AI_PROVIDER={AI_PROVIDER}<br>AI_MODEL={AI_MODEL}</div></div>
+    </div>
+
+    <div class="sec"><h2>📋 All Available Models</h2></div>
+    <div class="tw"><div class="ts"><table>
+        <thead><tr><th>Provider</th><th>Model</th><th>TPM</th><th>RPM</th>
+            <th>Context</th><th>Input $/1K</th><th>Output $/1K</th><th>Status</th></tr></thead>
+        <tbody>"""
+        for prov, pcfg in MODEL_REGISTRY.items():
+            for mname, mcfg in pcfg['models'].items():
+                active = "✅ ACTIVE" if prov == ACTIVE_PROVIDER and mname == ACTIVE_MODEL else ""
+                act_style = "color:#22c55e;font-weight:700" if active else "color:#475569"
+                content += f"""<tr>
+                    <td style="color:#a5b4fc">{prov.upper()}</td>
+                    <td><strong style="color:#e2e8f0">{mname}</strong></td>
+                    <td style="font-family:monospace">{mcfg['tpm_limit']:,}</td>
+                    <td style="font-family:monospace">{mcfg['rpm_limit']:,}</td>
+                    <td style="font-family:monospace">{mcfg['context_window']:,}</td>
+                    <td style="font-family:monospace">${mcfg['cost_input_per_1k']:.5f}</td>
+                    <td style="font-family:monospace">${mcfg['cost_output_per_1k']:.5f}</td>
+                    <td style="{act_style}">{active}</td></tr>"""
+
+        content += """</tbody></table></div></div>
+</div>"""
+        return HTMLBuilder._page("Model", "model", content)
+
+    @staticmethod
+    def history_page(db):
+        history = db.execute("SELECT * FROM scan_history ORDER BY timestamp DESC LIMIT 50", fetch=True)
+        rows = ""
+        for h in history:
+            h = dict(h)
+            rows += f"""<tr>
+                <td style="color:#64748b;font-family:monospace;font-size:12px">{h.get('timestamp','')}</td>
+                <td><code class="path">{h.get('scan_path','')}</code></td>
+                <td style="color:#3b82f6;font-weight:600">{h.get('total_files',0)}</td>
+                <td style="color:#a78bfa;font-weight:600">{h.get('ai_agents',0)}</td>
+                <td style="color:#22c55e;font-weight:600">{h.get('scripts',0)}</td>
+                <td style="color:#f59e0b;font-weight:600">{h.get('main_files',0)}</td></tr>"""
+        if not rows:
+            rows = '<tr><td colspan="6" class="empty">No scan history. Click "Scan Now"</td></tr>'
+
+        content = f"""
+<div class="container">
+    <div class="sec"><h2>📜 Scan History</h2>
+        <span class="badge">{len(history)} scans</span></div>
+    <div class="tw"><div class="ts"><table>
+        <thead><tr><th>Timestamp</th><th>Path</th><th>Total</th><th>AI</th>
+            <th>Scripts</th><th>Main</th></tr></thead>
+        <tbody>{rows}</tbody>
+    </table></div></div>
+</div>"""
+        return HTMLBuilder._page("History", "history", content)
+
+    @staticmethod
+    def scan_done_page(result):
+        content = f"""
+<div class="container">
+    <div class="alert alert-success" style="margin-top:24px">
+        ✅ Scan completed successfully!</div>
+    <div class="grid grid-4" style="margin-top:16px">
+        <div class="card blue"><div class="lbl">Total Files</div><div class="val">{result['total']}</div></div>
+        <div class="card purple"><div class="lbl">AI Agents</div><div class="val">{result['ai']}</div></div>
+        <div class="card green"><div class="lbl">Scripts</div><div class="val">{result['sc']}</div></div>
+        <div class="card orange"><div class="lbl">Main Files</div><div class="val">{result['mn']}</div></div>
+    </div>
+    <div style="text-align:center;margin-top:32px">
+        <a href="/dashboard" class="nav-btn" style="font-size:16px;padding:14px 32px;
+           background:#312e81;color:#a5b4fc;border-color:#4f46e5;display:inline-block">
+           📊 Go to Dashboard</a>
+    </div>
+</div>"""
+        return HTMLBuilder._page("Scan Complete", "scan", content)
+
+    @staticmethod
+    def reset_done_page():
+        content = f"""
+<div class="container">
+    <div class="alert alert-warn" style="margin-top:24px">
+        🗑️ All data has been reset successfully.</div>
+    <div style="text-align:center;margin-top:32px">
+        <a href="/" class="nav-btn" style="font-size:16px;padding:14px 32px;
+           background:#312e81;color:#a5b4fc;border-color:#4f46e5;display:inline-block">
+           🏠 Go Home</a>
+        <a href="/scan" class="nav-btn success" style="font-size:16px;padding:14px 32px;
+           display:inline-block;margin-left:12px">
+           🔍 Scan Again</a>
+    </div>
+</div>"""
+        return HTMLBuilder._page("Reset Complete", "reset", content)
+
+
+# ============================================================
+# HELPER FUNCTIONS
+# ============================================================
+def _bar_color(p):
+    if p > 80: return '#ef4444'
+    if p > 60: return '#f59e0b'
+    if p > 40: return '#3b82f6'
+    return '#22c55e'
+
+def _pct(used, limit):
+    return min(round(used / max(limit, 1) * 100, 1), 100)
+
+def _mc(p):
+    if p > 80: return '#ef4444'
+    if p > 50: return '#f59e0b'
+    return '#22c55e'
+
+def _fmt_size(b):
+    if b > 1_048_576: return f"{b/1_048_576:.1f} MB"
+    if b > 1024: return f"{b/1024:.1f} KB"
+    return f"{b} B"
+
+def _usage_row(label, used, limit, color):
+    p = _pct(used, limit)
+    c = '#ef4444' if p > 80 else '#f59e0b' if p > 50 else color
+    return f"""
+    <div class="urow">
+        <div style="flex:1">
+            <div class="ulbl">{label}</div>
+            <div class="ubar"><div class="ufill" style="width:{p}%;background:{c}"></div></div>
+        </div>
+        <div>
+            <div class="uval">{used:,}</div>
+            <div class="ulim">/ {limit:,}</div>
+        </div>
+    </div>"""
+
+
+# ============================================================
+# WEB SERVER — ALL HTML, NO JSON
 # ============================================================
 class DashboardHandler(BaseHTTPRequestHandler):
     scanner = None
     monitor = None
-    db = None
-    model_config = None
+    db      = None
     scan_path = "."
 
-    def log_message(self, format, *args):
-        pass  # Suppress default logging
+    def log_message(self, *a): pass
 
     def do_GET(self):
-        parsed = urlparse(self.path)
-        path = parsed.path
-        params = parse_qs(parsed.query)
+        path = urlparse(self.path).path
+        params = parse_qs(urlparse(self.path).query)
 
-        if path == '/' or path == '/dashboard':
-            self._serve_dashboard()
-        elif path == '/api/scan':
-            self._api_scan(params)
-        elif path == '/api/files':
-            self._api_files()
-        elif path == '/api/metrics':
-            self._api_metrics()
-        elif path == '/api/reset':
-            self._api_reset()
-        elif path == '/api/model':
-            self._api_model()
-        elif path == '/api/scan-history':
-            self._api_scan_history()
+        files = self.db.execute(
+            "SELECT * FROM detected_files ORDER BY is_ai_agent DESC,is_script DESC,is_main_file DESC,file_name",
+            fetch=True)
+        files = [dict(f) for f in files]
+        metrics = self.monitor.get_all()
+
+        if path == '/':
+            html = HTMLBuilder.home_page(files, metrics)
+        elif path == '/dashboard':
+            html = HTMLBuilder.dashboard_page(files, metrics)
+        elif path == '/files':
+            html = HTMLBuilder.files_page(files)
+        elif path == '/agents':
+            html = HTMLBuilder.agents_page(files, metrics)
+        elif path == '/metrics':
+            html = HTMLBuilder.metrics_page(metrics)
+        elif path == '/model':
+            html = HTMLBuilder.model_page()
+        elif path == '/history':
+            html = HTMLBuilder.history_page(self.db)
+        elif path == '/scan':
+            sp = params.get('path', [self.scan_path])[0]
+            DashboardHandler.scan_path = sp
+            scanned = self.scanner.scan_project(sp)
+            result = {
+                'total': len(scanned),
+                'ai': sum(1 for f in scanned if f['is_ai_agent']),
+                'sc': sum(1 for f in scanned if f['is_script']),
+                'mn': sum(1 for f in scanned if f['is_main_file']),
+            }
+            html = HTMLBuilder.scan_done_page(result)
+        elif path == '/reset':
+            self.db.execute("DELETE FROM detected_files")
+            self.db.execute("DELETE FROM token_usage")
+            self.db.execute("DELETE FROM request_usage")
+            self.db.execute("DELETE FROM resource_usage")
+            self.monitor.metrics = {
+                'tokens': defaultdict(lambda: {'per_min':0,'per_hour':0,'per_day':0}),
+                'requests': defaultdict(lambda: {'per_min':0,'per_hour':0,'per_day':0}),
+                'resources': {}, 'system': {}}
+            self.monitor._tok_log.clear()
+            self.monitor._req_log.clear()
+            html = HTMLBuilder.reset_done_page()
         else:
             self.send_error(404)
+            return
 
-    def _send_json(self, data):
         self.send_response(200)
-        self.send_header('Content-Type', 'application/json')
-        self.send_header('Access-Control-Allow-Origin', '*')
-        self.end_headers()
-        self.wfile.write(json.dumps(data, default=str).encode())
-
-    def _api_scan(self, params):
-        scan_path = params.get('path', [DashboardHandler.scan_path])[0]
-        DashboardHandler.scan_path = scan_path
-        files = DashboardHandler.scanner.scan_project(scan_path)
-        self._send_json({
-            'status': 'success',
-            'total_files': len(files),
-            'ai_agents': sum(1 for f in files if f['is_ai_agent']),
-            'scripts': sum(1 for f in files if f['is_script']),
-            'main_files': sum(1 for f in files if f['is_main_file']),
-            'scan_path': os.path.abspath(scan_path)
-        })
-
-    def _api_files(self):
-        files = DashboardHandler.db.execute(
-            "SELECT * FROM detected_files ORDER BY is_ai_agent DESC, is_script DESC, is_main_file DESC, file_name",
-            fetch=True
-        )
-        self._send_json([dict(f) for f in files])
-
-    def _api_metrics(self):
-        metrics = DashboardHandler.monitor.get_all_metrics()
-        metrics['model'] = DashboardHandler.model_config
-        self._send_json(metrics)
-
-    def _api_reset(self):
-        DashboardHandler.db.execute("DELETE FROM detected_files")
-        DashboardHandler.db.execute("DELETE FROM token_usage")
-        DashboardHandler.db.execute("DELETE FROM request_usage")
-        DashboardHandler.db.execute("DELETE FROM resource_usage")
-        DashboardHandler.monitor.metrics = {
-            'tokens': defaultdict(lambda: {'per_min': 0, 'per_hour': 0, 'per_day': 0}),
-            'requests': defaultdict(lambda: {'per_min': 0, 'per_hour': 0, 'per_day': 0}),
-            'resources': {},
-            'system': {}
-        }
-        DashboardHandler.monitor._token_log.clear()
-        DashboardHandler.monitor._request_log.clear()
-        self._send_json({'status': 'reset_complete'})
-
-    def _api_model(self):
-        self._send_json(DashboardHandler.model_config)
-
-    def _api_scan_history(self):
-        history = DashboardHandler.db.execute(
-            "SELECT * FROM scan_history ORDER BY timestamp DESC LIMIT 20",
-            fetch=True
-        )
-        self._send_json([dict(h) for h in history])
-
-    def _serve_dashboard(self):
-        model_name = DashboardHandler.model_config['name']
-        model_json = json.dumps(DashboardHandler.model_config)
-
-        html = f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AI Agent Monitor Dashboard</title>
-    <style>
-        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-        body {{
-            font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
-            background: #0a0e17;
-            color: #e0e6f0;
-            min-height: 100vh;
-        }}
-        
-        /* Header */
-        .header {{
-            background: linear-gradient(135deg, #1a1f35 0%, #0d1225 100%);
-            border-bottom: 1px solid #2a3456;
-            padding: 16px 24px;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            flex-wrap: wrap;
-            gap: 12px;
-        }}
-        .header h1 {{
-            font-size: 22px;
-            background: linear-gradient(135deg, #60a5fa, #a78bfa);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-            display: flex;
-            align-items: center;
-            gap: 10px;
-        }}
-        .header h1::before {{ content: "🤖"; -webkit-text-fill-color: initial; }}
-        .model-badge {{
-            background: #1e293b;
-            border: 1px solid #3b82f6;
-            border-radius: 20px;
-            padding: 6px 16px;
-            font-size: 13px;
-            color: #60a5fa;
-        }}
-        .btn-group {{
-            display: flex;
-            gap: 8px;
-            flex-wrap: wrap;
-        }}
-        .btn {{
-            padding: 8px 20px;
-            border: none;
-            border-radius: 8px;
-            font-size: 13px;
-            font-weight: 600;
-            cursor: pointer;
-            transition: all 0.2s;
-            display: flex;
-            align-items: center;
-            gap: 6px;
-        }}
-        .btn:hover {{ transform: translateY(-1px); box-shadow: 0 4px 12px rgba(0,0,0,0.3); }}
-        .btn-scan {{ background: #2563eb; color: white; }}
-        .btn-scan:hover {{ background: #3b82f6; }}
-        .btn-refresh {{ background: #059669; color: white; }}
-        .btn-refresh:hover {{ background: #10b981; }}
-        .btn-reset {{ background: #dc2626; color: white; }}
-        .btn-reset:hover {{ background: #ef4444; }}
-        
-        /* Scan Path Input */
-        .scan-bar {{
-            background: #111827;
-            padding: 12px 24px;
-            border-bottom: 1px solid #1e293b;
-            display: flex;
-            align-items: center;
-            gap: 12px;
-        }}
-        .scan-bar label {{ font-size: 13px; color: #94a3b8; white-space: nowrap; }}
-        .scan-bar input {{
-            flex: 1;
-            background: #1e293b;
-            border: 1px solid #334155;
-            border-radius: 6px;
-            padding: 8px 14px;
-            color: #e0e6f0;
-            font-size: 13px;
-            font-family: 'Courier New', monospace;
-        }}
-        .scan-bar input:focus {{ outline: none; border-color: #3b82f6; }}
-
-        /* Status Bar */
-        .status-bar {{
-            background: #111827;
-            padding: 8px 24px;
-            border-bottom: 1px solid #1e293b;
-            font-size: 12px;
-            color: #64748b;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-        }}
-        .status-bar .live {{ color: #22c55e; }}
-
-        /* Main Content */
-        .container {{
-            padding: 20px 24px;
-            max-width: 1800px;
-            margin: 0 auto;
-        }}
-
-        /* Stats Cards */
-        .stats-grid {{
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-            gap: 16px;
-            margin-bottom: 24px;
-        }}
-        .stat-card {{
-            background: linear-gradient(135deg, #1a1f35, #151b2e);
-            border: 1px solid #2a3456;
-            border-radius: 12px;
-            padding: 20px;
-            text-align: center;
-        }}
-        .stat-card .stat-value {{
-            font-size: 32px;
-            font-weight: 700;
-            margin: 8px 0;
-        }}
-        .stat-card .stat-label {{
-            font-size: 12px;
-            color: #64748b;
-            text-transform: uppercase;
-            letter-spacing: 1px;
-        }}
-        .stat-card.blue .stat-value {{ color: #3b82f6; }}
-        .stat-card.green .stat-value {{ color: #22c55e; }}
-        .stat-card.purple .stat-value {{ color: #a78bfa; }}
-        .stat-card.orange .stat-value {{ color: #f59e0b; }}
-        .stat-card.red .stat-value {{ color: #ef4444; }}
-        .stat-card.cyan .stat-value {{ color: #06b6d4; }}
-
-        /* System Resources */
-        .system-grid {{
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
-            gap: 16px;
-            margin-bottom: 24px;
-        }}
-        .resource-card {{
-            background: #111827;
-            border: 1px solid #1e293b;
-            border-radius: 12px;
-            padding: 20px;
-        }}
-        .resource-card h3 {{
-            font-size: 14px;
-            color: #94a3b8;
-            margin-bottom: 12px;
-        }}
-        .progress-bar {{
-            background: #1e293b;
-            border-radius: 8px;
-            height: 24px;
-            overflow: hidden;
-            margin: 8px 0;
-            position: relative;
-        }}
-        .progress-fill {{
-            height: 100%;
-            border-radius: 8px;
-            transition: width 0.5s ease;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            font-size: 11px;
-            font-weight: 600;
-            color: white;
-            min-width: 40px;
-        }}
-        .progress-fill.blue {{ background: linear-gradient(90deg, #2563eb, #3b82f6); }}
-        .progress-fill.green {{ background: linear-gradient(90deg, #059669, #10b981); }}
-        .progress-fill.orange {{ background: linear-gradient(90deg, #d97706, #f59e0b); }}
-        .progress-fill.red {{ background: linear-gradient(90deg, #dc2626, #ef4444); }}
-        .resource-details {{
-            display: flex;
-            justify-content: space-between;
-            font-size: 12px;
-            color: #64748b;
-            margin-top: 4px;
-        }}
-
-        /* Section Headers */
-        .section-header {{
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin: 24px 0 12px;
-            padding-bottom: 8px;
-            border-bottom: 1px solid #1e293b;
-        }}
-        .section-header h2 {{
-            font-size: 18px;
-            color: #e0e6f0;
-            display: flex;
-            align-items: center;
-            gap: 8px;
-        }}
-        .section-header .count {{
-            background: #1e293b;
-            border-radius: 12px;
-            padding: 2px 10px;
-            font-size: 12px;
-            color: #60a5fa;
-        }}
-
-        /* File Tables */
-        .table-container {{
-            background: #111827;
-            border: 1px solid #1e293b;
-            border-radius: 12px;
-            overflow: hidden;
-            margin-bottom: 24px;
-        }}
-        table {{
-            width: 100%;
-            border-collapse: collapse;
-        }}
-        th {{
-            background: #1a1f35;
-            padding: 12px 16px;
-            text-align: left;
-            font-size: 11px;
-            text-transform: uppercase;
-            letter-spacing: 1px;
-            color: #64748b;
-            font-weight: 600;
-            border-bottom: 1px solid #2a3456;
-            position: sticky;
-            top: 0;
-        }}
-        td {{
-            padding: 10px 16px;
-            border-bottom: 1px solid #1e293b;
-            font-size: 13px;
-            vertical-align: top;
-        }}
-        tr:hover td {{ background: #1a1f35; }}
-        .tag {{
-            display: inline-block;
-            padding: 2px 8px;
-            border-radius: 4px;
-            font-size: 11px;
-            font-weight: 600;
-        }}
-        .tag-ai {{ background: #3b82f620; color: #60a5fa; border: 1px solid #3b82f640; }}
-        .tag-script {{ background: #8b5cf620; color: #a78bfa; border: 1px solid #8b5cf640; }}
-        .tag-main {{ background: #22c55e20; color: #4ade80; border: 1px solid #22c55e40; }}
-        .tag-file {{ background: #64748b20; color: #94a3b8; border: 1px solid #64748b40; }}
-        .file-path {{
-            font-family: 'Courier New', monospace;
-            font-size: 12px;
-            color: #94a3b8;
-        }}
-        .purpose-text {{ color: #60a5fa; font-weight: 500; }}
-        .desc-text {{ color: #94a3b8; font-size: 12px; max-width: 400px; }}
-        .size-text {{ color: #64748b; font-size: 12px; font-family: monospace; }}
-
-        /* Token/Request Cards */
-        .usage-grid {{
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(350px, 1fr));
-            gap: 16px;
-            margin-bottom: 24px;
-        }}
-        .usage-card {{
-            background: #111827;
-            border: 1px solid #1e293b;
-            border-radius: 12px;
-            padding: 20px;
-        }}
-        .usage-card h3 {{
-            font-size: 14px;
-            margin-bottom: 16px;
-            color: #e0e6f0;
-            display: flex;
-            align-items: center;
-            gap: 8px;
-        }}
-        .usage-row {{
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            padding: 8px 0;
-            border-bottom: 1px solid #1e293b;
-        }}
-        .usage-row:last-child {{ border-bottom: none; }}
-        .usage-label {{ font-size: 12px; color: #94a3b8; }}
-        .usage-value {{ font-size: 14px; font-weight: 600; font-family: monospace; }}
-        .usage-limit {{ font-size: 11px; color: #64748b; }}
-        .usage-bar-mini {{
-            width: 100%;
-            height: 6px;
-            background: #1e293b;
-            border-radius: 3px;
-            margin-top: 4px;
-            overflow: hidden;
-        }}
-        .usage-bar-fill {{
-            height: 100%;
-            border-radius: 3px;
-            transition: width 0.3s;
-        }}
-
-        /* Loading overlay */
-        .loading {{
-            position: fixed;
-            top: 0;
-            left: 0;
-            right: 0;
-            bottom: 0;
-            background: rgba(10, 14, 23, 0.8);
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            z-index: 1000;
-            display: none;
-        }}
-        .loading.active {{ display: flex; }}
-        .spinner {{
-            width: 50px;
-            height: 50px;
-            border: 3px solid #1e293b;
-            border-top-color: #3b82f6;
-            border-radius: 50%;
-            animation: spin 0.8s linear infinite;
-        }}
-        @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
-
-        /* Scrollable table wrapper */
-        .table-scroll {{
-            max-height: 500px;
-            overflow-y: auto;
-        }}
-        .table-scroll::-webkit-scrollbar {{ width: 8px; }}
-        .table-scroll::-webkit-scrollbar-track {{ background: #111827; }}
-        .table-scroll::-webkit-scrollbar-thumb {{ background: #334155; border-radius: 4px; }}
-        .table-scroll::-webkit-scrollbar-thumb:hover {{ background: #475569; }}
-
-        /* Per-agent metrics table */
-        .agent-metrics-table td {{ font-size: 12px; }}
-        .metric-good {{ color: #22c55e; }}
-        .metric-warn {{ color: #f59e0b; }}
-        .metric-danger {{ color: #ef4444; }}
-
-        /* Toast notifications */
-        .toast {{
-            position: fixed;
-            bottom: 24px;
-            right: 24px;
-            background: #1e293b;
-            border: 1px solid #334155;
-            border-radius: 8px;
-            padding: 12px 20px;
-            font-size: 13px;
-            z-index: 2000;
-            transform: translateY(100px);
-            opacity: 0;
-            transition: all 0.3s;
-        }}
-        .toast.show {{ transform: translateY(0); opacity: 1; }}
-        .toast.success {{ border-color: #22c55e; color: #4ade80; }}
-        .toast.error {{ border-color: #ef4444; color: #f87171; }}
-
-        /* Responsive */
-        @media (max-width: 768px) {{
-            .header {{ flex-direction: column; text-align: center; }}
-            .stats-grid {{ grid-template-columns: repeat(2, 1fr); }}
-            .system-grid {{ grid-template-columns: 1fr; }}
-            .usage-grid {{ grid-template-columns: 1fr; }}
-        }}
-    </style>
-</head>
-<body>
-    <!-- Loading Overlay -->
-    <div class="loading" id="loading">
-        <div class="spinner"></div>
-    </div>
-
-    <!-- Toast -->
-    <div class="toast" id="toast"></div>
-
-    <!-- Header -->
-    <div class="header">
-        <h1>AI Agent Monitor</h1>
-        <div class="model-badge">📡 Model: {model_name}</div>
-        <div class="btn-group">
-            <button class="btn btn-scan" onclick="scanProject()">🔍 Scan</button>
-            <button class="btn btn-refresh" onclick="refreshAll()">🔄 Refresh</button>
-            <button class="btn btn-reset" onclick="resetAll()">🗑️ Reset</button>
-        </div>
-    </div>
-
-    <!-- Scan Path -->
-    <div class="scan-bar">
-        <label>📁 Scan Path:</label>
-        <input type="text" id="scanPath" value="." placeholder="Enter project path to scan...">
-    </div>
-
-    <!-- Status Bar -->
-    <div class="status-bar">
-        <span id="statusText">Ready to scan</span>
-        <span class="live" id="liveIndicator">● Live Monitoring</span>
-    </div>
-
-    <!-- Main Content -->
-    <div class="container">
-        <!-- Summary Stats -->
-        <div class="stats-grid" id="statsGrid">
-            <div class="stat-card blue">
-                <div class="stat-label">Total Files</div>
-                <div class="stat-value" id="totalFiles">0</div>
-            </div>
-            <div class="stat-card purple">
-                <div class="stat-label">AI Agents</div>
-                <div class="stat-value" id="aiAgents">0</div>
-            </div>
-            <div class="stat-card green">
-                <div class="stat-label">Scripts</div>
-                <div class="stat-value" id="scripts">0</div>
-            </div>
-            <div class="stat-card orange">
-                <div class="stat-label">Main Files</div>
-                <div class="stat-value" id="mainFiles">0</div>
-            </div>
-            <div class="stat-card cyan">
-                <div class="stat-label">Total Tokens (Day)</div>
-                <div class="stat-value" id="totalTokens">0</div>
-            </div>
-            <div class="stat-card red">
-                <div class="stat-label">Total Requests (Day)</div>
-                <div class="stat-value" id="totalRequests">0</div>
-            </div>
-        </div>
-
-        <!-- System Resources -->
-        <div class="section-header">
-            <h2>💻 System Resources</h2>
-        </div>
-        <div class="system-grid" id="systemGrid">
-            <div class="resource-card">
-                <h3>🔲 CPU Usage</h3>
-                <div class="progress-bar">
-                    <div class="progress-fill blue" id="cpuBar" style="width: 0%">0%</div>
-                </div>
-                <div class="resource-details">
-                    <span id="cpuDetail">Loading...</span>
-                </div>
-            </div>
-            <div class="resource-card">
-                <h3>🧠 Memory Usage</h3>
-                <div class="progress-bar">
-                    <div class="progress-fill green" id="memBar" style="width: 0%">0%</div>
-                </div>
-                <div class="resource-details">
-                    <span id="memDetail">Loading...</span>
-                </div>
-            </div>
-            <div class="resource-card">
-                <h3>💾 Disk Usage</h3>
-                <div class="progress-bar">
-                    <div class="progress-fill orange" id="diskBar" style="width: 0%">0%</div>
-                </div>
-                <div class="resource-details">
-                    <span id="diskDetail">Loading...</span>
-                </div>
-            </div>
-        </div>
-
-        <!-- Detected Files Table -->
-        <div class="section-header">
-            <h2>📂 Detected Files</h2>
-            <span class="count" id="fileCount">0 files</span>
-        </div>
-        <div class="table-container">
-            <div class="table-scroll">
-                <table>
-                    <thead>
-                        <tr>
-                            <th>Type</th>
-                            <th>File Name</th>
-                            <th>Path</th>
-                            <th>Purpose</th>
-                            <th>Description</th>
-                            <th>Size</th>
-                            <th>Flags</th>
-                        </tr>
-                    </thead>
-                    <tbody id="filesTable">
-                        <tr><td colspan="7" style="text-align:center; color:#64748b; padding:40px;">Click "Scan" to detect project files</td></tr>
-                    </tbody>
-                </table>
-            </div>
-        </div>
-
-        <!-- AI Agent / Script Detailed Metrics -->
-        <div class="section-header">
-            <h2>🤖 AI Agent & Script Metrics</h2>
-            <span class="count" id="agentCount">0 agents/scripts</span>
-        </div>
-        <div class="table-container">
-            <div class="table-scroll">
-                <table class="agent-metrics-table">
-                    <thead>
-                        <tr>
-                            <th>Script Name</th>
-                            <th>File Name</th>
-                            <th>Purpose</th>
-                            <th>What It Does</th>
-                            <th>Tokens/Min</th>
-                            <th>Tokens/Hour</th>
-                            <th>Tokens/Day</th>
-                            <th>Req/Min</th>
-                            <th>Req/Hour</th>
-                            <th>Req/Day</th>
-                            <th>CPU %</th>
-                            <th>Memory MB</th>
-                            <th>Storage MB</th>
-                        </tr>
-                    </thead>
-                    <tbody id="agentTable">
-                        <tr><td colspan="13" style="text-align:center; color:#64748b; padding:40px;">No agents/scripts detected yet</td></tr>
-                    </tbody>
-                </table>
-            </div>
-        </div>
-
-        <!-- Token & Request Usage Overview -->
-        <div class="section-header">
-            <h2>📊 Token & Request Usage vs Limits</h2>
-        </div>
-        <div class="usage-grid" id="usageGrid">
-            <!-- Token Usage Card -->
-            <div class="usage-card">
-                <h3>🪙 Token Usage</h3>
-                <div class="usage-row">
-                    <div>
-                        <div class="usage-label">Per Minute</div>
-                        <div class="usage-bar-mini"><div class="usage-bar-fill" id="tokenMinBar" style="width:0%; background:#3b82f6;"></div></div>
-                    </div>
-                    <div style="text-align:right">
-                        <div class="usage-value" id="tokenMin">0</div>
-                        <div class="usage-limit" id="tokenMinLimit">/ {DashboardHandler.model_config['token_limit_per_min'] if DashboardHandler.model_config else 0}</div>
-                    </div>
-                </div>
-                <div class="usage-row">
-                    <div>
-                        <div class="usage-label">Per Hour</div>
-                        <div class="usage-bar-mini"><div class="usage-bar-fill" id="tokenHourBar" style="width:0%; background:#8b5cf6;"></div></div>
-                    </div>
-                    <div style="text-align:right">
-                        <div class="usage-value" id="tokenHour">0</div>
-                        <div class="usage-limit" id="tokenHourLimit">/ {DashboardHandler.model_config['token_limit_per_hour'] if DashboardHandler.model_config else 0}</div>
-                    </div>
-                </div>
-                <div class="usage-row">
-                    <div>
-                        <div class="usage-label">Per Day</div>
-                        <div class="usage-bar-mini"><div class="usage-bar-fill" id="tokenDayBar" style="width:0%; background:#06b6d4;"></div></div>
-                    </div>
-                    <div style="text-align:right">
-                        <div class="usage-value" id="tokenDay">0</div>
-                        <div class="usage-limit" id="tokenDayLimit">/ {DashboardHandler.model_config['token_limit_per_day'] if DashboardHandler.model_config else 0}</div>
-                    </div>
-                </div>
-            </div>
-
-            <!-- Request Usage Card -->
-            <div class="usage-card">
-                <h3>📡 Request Usage</h3>
-                <div class="usage-row">
-                    <div>
-                        <div class="usage-label">Per Minute</div>
-                        <div class="usage-bar-mini"><div class="usage-bar-fill" id="reqMinBar" style="width:0%; background:#22c55e;"></div></div>
-                    </div>
-                    <div style="text-align:right">
-                        <div class="usage-value" id="reqMin">0</div>
-                        <div class="usage-limit" id="reqMinLimit">/ {DashboardHandler.model_config['request_limit_per_min'] if DashboardHandler.model_config else 0}</div>
-                    </div>
-                </div>
-                <div class="usage-row">
-                    <div>
-                        <div class="usage-label">Per Hour</div>
-                        <div class="usage-bar-mini"><div class="usage-bar-fill" id="reqHourBar" style="width:0%; background:#f59e0b;"></div></div>
-                    </div>
-                    <div style="text-align:right">
-                        <div class="usage-value" id="reqHour">0</div>
-                        <div class="usage-limit" id="reqHourLimit">/ {DashboardHandler.model_config['request_limit_per_hour'] if DashboardHandler.model_config else 0}</div>
-                    </div>
-                </div>
-                <div class="usage-row">
-                    <div>
-                        <div class="usage-label">Per Day</div>
-                        <div class="usage-bar-mini"><div class="usage-bar-fill" id="reqDayBar" style="width:0%; background:#ef4444;"></div></div>
-                    </div>
-                    <div style="text-align:right">
-                        <div class="usage-value" id="reqDay">0</div>
-                        <div class="usage-limit" id="reqDayLimit">/ {DashboardHandler.model_config['request_limit_per_day'] if DashboardHandler.model_config else 0}</div>
-                    </div>
-                </div>
-            </div>
-        </div>
-    </div>
-
-    <script>
-        const MODEL = {model_json};
-        let allFiles = [];
-        let autoRefreshInterval = null;
-
-        // ---- API Calls ----
-        async function api(endpoint) {{
-            const resp = await fetch(endpoint);
-            return await resp.json();
-        }}
-
-        // ---- Scan Project ----
-        async function scanProject() {{
-            showLoading(true);
-            const path = document.getElementById('scanPath').value || '.';
-            try {{
-                const result = await api('/api/scan?path=' + encodeURIComponent(path));
-                showToast('Scan complete: ' + result.total_files + ' files found', 'success');
-                await refreshAll();
-            }} catch(e) {{
-                showToast('Scan failed: ' + e.message, 'error');
-            }}
-            showLoading(false);
-        }}
-
-        // ---- Refresh All Data ----
-        async function refreshAll() {{
-            try {{
-                await Promise.all([loadFiles(), loadMetrics()]);
-                document.getElementById('statusText').textContent = 
-                    'Last refreshed: ' + new Date().toLocaleTimeString();
-            }} catch(e) {{
-                console.error('Refresh error:', e);
-            }}
-        }}
-
-        // ---- Reset All ----
-        async function resetAll() {{
-            if (!confirm('Reset all data? This clears detected files and metrics.')) return;
-            showLoading(true);
-            try {{
-                await api('/api/reset');
-                allFiles = [];
-                renderFiles([]);
-                renderAgents([], {{}});
-                updateStats(0, 0, 0, 0);
-                showToast('All data reset', 'success');
-            }} catch(e) {{
-                showToast('Reset failed', 'error');
-            }}
-            showLoading(false);
-        }}
-
-        // ---- Load Files ----
-        async function loadFiles() {{
-            const files = await api('/api/files');
-            allFiles = files;
-            renderFiles(files);
-            
-            const aiCount = files.filter(f => f.is_ai_agent).length;
-            const scriptCount = files.filter(f => f.is_script).length;
-            const mainCount = files.filter(f => f.is_main_file).length;
-            updateStats(files.length, aiCount, scriptCount, mainCount);
-        }}
-
-        // ---- Load Metrics ----
-        async function loadMetrics() {{
-            const metrics = await api('/api/metrics');
-            updateSystemResources(metrics.system);
-            updateTokenRequests(metrics);
-            renderAgents(allFiles.filter(f => f.is_ai_agent || f.is_script), metrics);
-        }}
-
-        // ---- Render Files Table ----
-        function renderFiles(files) {{
-            const tbody = document.getElementById('filesTable');
-            document.getElementById('fileCount').textContent = files.length + ' files';
-            
-            if (files.length === 0) {{
-                tbody.innerHTML = '<tr><td colspan="7" style="text-align:center; color:#64748b; padding:40px;">No files detected. Click "Scan" to start.</td></tr>';
-                return;
-            }}
-
-            tbody.innerHTML = files.map(f => {{
-                let typeTag = '<span class="tag tag-file">' + f.file_type + '</span>';
-                if (f.is_ai_agent) typeTag = '<span class="tag tag-ai">🤖 AI Agent</span>';
-                else if (f.is_script) typeTag = '<span class="tag tag-script">⚡ Script</span>';
-                
-                let flags = [];
-                if (f.is_main_file) flags.push('<span class="tag tag-main">★ Main</span>');
-                if (f.is_ai_agent) flags.push('<span class="tag tag-ai">AI</span>');
-                if (f.is_script) flags.push('<span class="tag tag-script">Script</span>');
-                
-                const sizeStr = f.size_bytes > 1024*1024 
-                    ? (f.size_bytes/(1024*1024)).toFixed(1) + ' MB'
-                    : f.size_bytes > 1024 
-                    ? (f.size_bytes/1024).toFixed(1) + ' KB'
-                    : f.size_bytes + ' B';
-
-                const desc = (f.description || '').substring(0, 150);
-
-                return '<tr>' +
-                    '<td>' + typeTag + '</td>' +
-                    '<td><strong>' + f.file_name + '</strong></td>' +
-                    '<td><span class="file-path">' + f.file_path + '</span></td>' +
-                    '<td><span class="purpose-text">' + (f.purpose || '-') + '</span></td>' +
-                    '<td><span class="desc-text">' + desc + '</span></td>' +
-                    '<td><span class="size-text">' + sizeStr + '</span></td>' +
-                    '<td>' + flags.join(' ') + '</td>' +
-                    '</tr>';
-            }}).join('');
-        }}
-
-        // ---- Render Agent Metrics Table ----
-        function renderAgents(agents, metrics) {{
-            const tbody = document.getElementById('agentTable');
-            document.getElementById('agentCount').textContent = agents.length + ' agents/scripts';
-
-            if (agents.length === 0) {{
-                tbody.innerHTML = '<tr><td colspan="13" style="text-align:center; color:#64748b; padding:40px;">No AI agents or scripts detected</td></tr>';
-                return;
-            }}
-
-            tbody.innerHTML = agents.map(a => {{
-                const fp = a.file_path;
-                const tokens = (metrics.tokens && metrics.tokens[fp]) || {{per_min:0, per_hour:0, per_day:0}};
-                const reqs = (metrics.requests && metrics.requests[fp]) || {{per_min:0, per_hour:0, per_day:0}};
-                const res = (metrics.resources && metrics.resources[fp]) || {{cpu_percent:0, memory_mb:0, storage_mb:0}};
-
-                const tMinPct = (tokens.per_min / MODEL.token_limit_per_min * 100);
-                const tHourPct = (tokens.per_hour / MODEL.token_limit_per_hour * 100);
-                const tDayPct = (tokens.per_day / MODEL.token_limit_per_day * 100);
-                const rMinPct = (reqs.per_min / MODEL.request_limit_per_min * 100);
-                const rHourPct = (reqs.per_hour / MODEL.request_limit_per_hour * 100);
-                const rDayPct = (reqs.per_day / MODEL.request_limit_per_day * 100);
-
-                function metricClass(pct) {{
-                    if (pct > 80) return 'metric-danger';
-                    if (pct > 50) return 'metric-warn';
-                    return 'metric-good';
-                }}
-
-                const scriptName = a.file_name.replace(/\\.[^/.]+$/, "");
-                const shortDesc = (a.description || '').substring(0, 100);
-
-                return '<tr>' +
-                    '<td><strong>' + scriptName + '</strong></td>' +
-                    '<td>' + a.file_name + '</td>' +
-                    '<td><span class="purpose-text">' + (a.purpose || '-') + '</span></td>' +
-                    '<td><span class="desc-text">' + shortDesc + '</span></td>' +
-                    '<td class="' + metricClass(tMinPct) + '">' + tokens.per_min.toLocaleString() + ' <small>/' + MODEL.token_limit_per_min.toLocaleString() + '</small></td>' +
-                    '<td class="' + metricClass(tHourPct) + '">' + tokens.per_hour.toLocaleString() + ' <small>/' + MODEL.token_limit_per_hour.toLocaleString() + '</small></td>' +
-                    '<td class="' + metricClass(tDayPct) + '">' + tokens.per_day.toLocaleString() + ' <small>/' + MODEL.token_limit_per_day.toLocaleString() + '</small></td>' +
-                    '<td class="' + metricClass(rMinPct) + '">' + reqs.per_min + ' <small>/' + MODEL.request_limit_per_min + '</small></td>' +
-                    '<td class="' + metricClass(rHourPct) + '">' + reqs.per_hour + ' <small>/' + MODEL.request_limit_per_hour + '</small></td>' +
-                    '<td class="' + metricClass(rDayPct) + '">' + reqs.per_day + ' <small>/' + MODEL.request_limit_per_day + '</small></td>' +
-                    '<td>' + res.cpu_percent.toFixed(1) + '%</td>' +
-                    '<td>' + res.memory_mb.toFixed(1) + '</td>' +
-                    '<td>' + res.storage_mb.toFixed(3) + '</td>' +
-                    '</tr>';
-            }}).join('');
-        }}
-
-        // ---- Update Stats Cards ----
-        function updateStats(total, ai, scripts, main) {{
-            document.getElementById('totalFiles').textContent = total;
-            document.getElementById('aiAgents').textContent = ai;
-            document.getElementById('scripts').textContent = scripts;
-            document.getElementById('mainFiles').textContent = main;
-        }}
-
-        // ---- Update System Resources ----
-        function updateSystemResources(sys) {{
-            if (!sys || !sys.cpu_percent) return;
-
-            const cpuPct = sys.cpu_percent;
-            const memPct = sys.memory_percent;
-            const diskPct = sys.disk_percent;
-
-            setProgress('cpuBar', cpuPct);
-            setProgress('memBar', memPct);
-            setProgress('diskBar', diskPct);
-
-            document.getElementById('cpuDetail').textContent = cpuPct.toFixed(1) + '% utilized';
-            document.getElementById('memDetail').textContent = 
-                sys.memory_used_gb + ' GB / ' + sys.memory_total_gb + ' GB (' + memPct.toFixed(1) + '%)';
-            document.getElementById('diskDetail').textContent = 
-                sys.disk_used_gb + ' GB / ' + sys.disk_total_gb + ' GB (' + diskPct + '%)';
-        }}
-
-        function setProgress(id, pct) {{
-            const el = document.getElementById(id);
-            const val = Math.min(Math.max(pct, 0), 100);
-            el.style.width = val + '%';
-            el.textContent = val.toFixed(1) + '%';
-            
-            // Change color based on value
-            el.className = 'progress-fill';
-            if (val > 80) el.classList.add('red');
-            else if (val > 60) el.classList.add('orange');
-            else if (val > 40) el.classList.add('blue');
-            else el.classList.add('green');
-        }}
-
-        // ---- Update Token/Request Usage ----
-        function updateTokenRequests(metrics) {{
-            let totalTokenMin = 0, totalTokenHour = 0, totalTokenDay = 0;
-            let totalReqMin = 0, totalReqHour = 0, totalReqDay = 0;
-
-            if (metrics.tokens) {{
-                Object.values(metrics.tokens).forEach(t => {{
-                    totalTokenMin += t.per_min || 0;
-                    totalTokenHour += t.per_hour || 0;
-                    totalTokenDay += t.per_day || 0;
-                }});
-            }}
-            if (metrics.requests) {{
-                Object.values(metrics.requests).forEach(r => {{
-                    totalReqMin += r.per_min || 0;
-                    totalReqHour += r.per_hour || 0;
-                    totalReqDay += r.per_day || 0;
-                }});
-            }}
-
-            document.getElementById('totalTokens').textContent = totalTokenDay.toLocaleString();
-            document.getElementById('totalRequests').textContent = totalReqDay.toLocaleString();
-
-            // Token bars
-            setUsageBar('tokenMin', 'tokenMinBar', totalTokenMin, MODEL.token_limit_per_min);
-            setUsageBar('tokenHour', 'tokenHourBar', totalTokenHour, MODEL.token_limit_per_hour);
-            setUsageBar('tokenDay', 'tokenDayBar', totalTokenDay, MODEL.token_limit_per_day);
-
-            // Request bars
-            setUsageBar('reqMin', 'reqMinBar', totalReqMin, MODEL.request_limit_per_min);
-            setUsageBar('reqHour', 'reqHourBar', totalReqHour, MODEL.request_limit_per_hour);
-            setUsageBar('reqDay', 'reqDayBar', totalReqDay, MODEL.request_limit_per_day);
-        }}
-
-        function setUsageBar(valueId, barId, used, limit) {{
-            document.getElementById(valueId).textContent = used.toLocaleString();
-            const pct = limit > 0 ? Math.min((used / limit) * 100, 100) : 0;
-            const bar = document.getElementById(barId);
-            bar.style.width = pct + '%';
-            if (pct > 80) bar.style.background = '#ef4444';
-            else if (pct > 50) bar.style.background = '#f59e0b';
-        }}
-
-        // ---- Helpers ----
-        function showLoading(show) {{
-            document.getElementById('loading').classList.toggle('active', show);
-        }}
-
-        function showToast(msg, type) {{
-            const toast = document.getElementById('toast');
-            toast.textContent = msg;
-            toast.className = 'toast ' + type + ' show';
-            setTimeout(() => toast.classList.remove('show'), 3000);
-        }}
-
-        // ---- Auto-refresh every 5 seconds ----
-        function startAutoRefresh() {{
-            autoRefreshInterval = setInterval(async () => {{
-                try {{ await loadMetrics(); }} catch(e) {{}}
-            }}, 5000);
-        }}
-
-        // ---- Init ----
-        window.addEventListener('load', () => {{
-            startAutoRefresh();
-            // Blink live indicator
-            setInterval(() => {{
-                const el = document.getElementById('liveIndicator');
-                el.style.opacity = el.style.opacity === '0.3' ? '1' : '0.3';
-            }}, 1000);
-        }});
-
-        // Enter key triggers scan
-        document.addEventListener('DOMContentLoaded', () => {{
-            document.getElementById('scanPath').addEventListener('keypress', (e) => {{
-                if (e.key === 'Enter') scanProject();
-            }});
-        }});
-    </script>
-</body>
-</html>"""
-        self.send_response(200)
-        self.send_header('Content-Type', 'text/html')
+        self.send_header('Content-Type', 'text/html; charset=utf-8')
+        self.send_header('Cache-Control', 'no-cache, no-store')
         self.end_headers()
         self.wfile.write(html.encode('utf-8'))
 
 
 # ============================================================
-# MAIN - MODEL SELECTION & SERVER START
+# MAIN — No interactive prompts, uses env vars
 # ============================================================
-def select_model():
-    """Interactive model selection at startup"""
-    print("\n" + "=" * 60)
-    print("🤖 AI Agent & Script Monitor Dashboard")
-    print("=" * 60)
-    print("\nSelect which AI model you are using:\n")
-
-    for key, model in SUPPORTED_MODELS.items():
-        print(f"  [{key}] {model['name']}")
-        print(f"      Token limits: {model['token_limit_per_min']:,}/min | {model['token_limit_per_hour']:,}/hr | {model['token_limit_per_day']:,}/day")
-        print(f"      Request limits: {model['request_limit_per_min']}/min | {model['request_limit_per_hour']}/hr | {model['request_limit_per_day']}/day")
-        print()
-
-    while True:
-        choice = input("Enter your choice [1-6]: ").strip()
-        if choice in SUPPORTED_MODELS:
-            model = SUPPORTED_MODELS[choice]
-            print(f"\n✅ Selected: {model['name']}")
-            return model
-        print("❌ Invalid choice. Please enter 1-6.")
-
-
 def main():
-    # Step 1: Select AI Model
-    model_config = select_model()
+    scan_path = os.environ.get("SCAN_PATH", os.path.abspath("."))
+    port      = int(os.environ.get("PORT", "8787"))
 
-    # Step 2: Ask for scan path
-    scan_path = input("\nEnter project path to scan (default: current directory '.'): ").strip() or "."
-    scan_path = os.path.abspath(scan_path)
-    print(f"📁 Scan path: {scan_path}")
+    print(f"\n{'='*60}")
+    print(f"🤖  AI Agent Monitor")
+    print(f"{'='*60}")
+    print(f"   Provider : {AI_PROVIDER} → {ACTIVE_PROVIDER}")
+    print(f"   Model    : {ACTIVE_MODEL}")
+    print(f"   Key      : {'✅ SET' if ACTIVE_CONFIG['api_key'] else '❌ MISSING'}")
+    print(f"   Scan     : {scan_path}")
+    print(f"   Port     : {port}")
 
-    # Step 3: Initialize components
-    print("\n⚙️  Initializing...")
-    db = MetricsDB()
+    db      = MetricsDB()
     scanner = ProjectScanner(db)
     monitor = ResourceMonitor(db)
 
-    # Step 4: Initial scan
-    print(f"🔍 Scanning project at: {scan_path}")
+    print(f"\n🔍 Scanning {scan_path} ...")
     files = scanner.scan_project(scan_path)
+    ai = sum(1 for f in files if f['is_ai_agent'])
+    sc = sum(1 for f in files if f['is_script'])
+    mn = sum(1 for f in files if f['is_main_file'])
+    print(f"   {len(files)} files | {ai} AI | {sc} scripts | {mn} main")
 
-    total = len(files)
-    ai_agents = [f for f in files if f['is_ai_agent']]
-    scripts = [f for f in files if f['is_script']]
-    main_files = [f for f in files if f['is_main_file']]
+    print(f"\n📡 Starting monitor...")
+    monitor.start()
 
-    print(f"\n📊 Scan Results:")
-    print(f"   Total files detected: {total}")
-    print(f"   AI Agents: {len(ai_agents)}")
-    print(f"   Scripts: {len(scripts)}")
-    print(f"   Main files: {len(main_files)}")
-
-    if main_files:
-        print(f"\n   ★ Main files:")
-        for f in main_files:
-            print(f"     - {f['file_name']} ({f['file_path']}) → {f['purpose']}")
-
-    if ai_agents:
-        print(f"\n   🤖 AI Agents:")
-        for f in ai_agents:
-            print(f"     - {f['file_name']} → {f['purpose']}")
-
-    if scripts:
-        print(f"\n   ⚡ Scripts:")
-        for f in scripts[:10]:
-            print(f"     - {f['file_name']} → {f['purpose']}")
-        if len(scripts) > 10:
-            print(f"     ... and {len(scripts) - 10} more")
-
-    # Step 5: Start resource monitor
-    print("\n📡 Starting resource monitor...")
-    monitor.start_monitoring()
-
-    # Step 6: Setup web server
-    DashboardHandler.scanner = scanner
-    DashboardHandler.monitor = monitor
-    DashboardHandler.db = db
-    DashboardHandler.model_config = model_config
+    DashboardHandler.scanner   = scanner
+    DashboardHandler.monitor   = monitor
+    DashboardHandler.db        = db
     DashboardHandler.scan_path = scan_path
 
-    port = 8787
     # Find available port
     while True:
         try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.bind(('', port))
-            sock.close()
-            break
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.bind(('', port)); s.close(); break
         except OSError:
             port += 1
             if port > 9000:
-                print("❌ No available ports found")
-                sys.exit(1)
+                print("❌ No free port"); sys.exit(1)
 
     server = HTTPServer(('0.0.0.0', port), DashboardHandler)
-
-    print(f"\n{'=' * 60}")
-    print(f"🚀 Dashboard running at: http://localhost:{port}")
-    print(f"   Model: {model_config['name']}")
-    print(f"   Monitoring: {scan_path}")
-    print(f"{'=' * 60}")
-    print(f"\n   Press Ctrl+C to stop\n")
+    print(f"\n{'='*60}")
+    print(f"🚀  http://localhost:{port}")
+    print(f"{'='*60}")
+    print(f"\n   Pages:")
+    print(f"   🏠  /           Home")
+    print(f"   📊  /dashboard  Dashboard (auto-refresh)")
+    print(f"   📂  /files      Detected Files")
+    print(f"   🤖  /agents     Agent Metrics (auto-refresh)")
+    print(f"   📈  /metrics    Token/Request Usage (auto-refresh)")
+    print(f"   🧠  /model      Model Config")
+    print(f"   📜  /history    Scan History")
+    print(f"   🔍  /scan       Trigger Scan")
+    print(f"   🗑️   /reset      Reset All Data")
+    print(f"\n   Ctrl+C to stop\n")
 
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("\n\n🛑 Shutting down...")
-        monitor.stop_monitoring()
+        print("\n🛑 Stopping...")
+        monitor.stop()
         server.server_close()
-        print("✅ Goodbye!")
+        print("✅ Done")
 
 
 if __name__ == "__main__":
