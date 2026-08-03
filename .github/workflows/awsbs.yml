@@ -19,18 +19,18 @@ permissions:
   contents: read
   id-token: write
 
+# ── FIX 1: Removed duplicate AWS_REGION ──────────────────────
 env:
-  PYTHON_VERSION: ${{ vars.PYTHON_VERSION || '3.11' }}
-  DOCKERHUB_USERNAME: ${{ vars.DOCKERHUB_USERNAME }}
+  PYTHON_VERSION:       ${{ vars.PYTHON_VERSION || '3.11' }}
+  DOCKERHUB_USERNAME:   ${{ vars.DOCKERHUB_USERNAME }}
   DOCKERHUB_REPOSITORY: ${{ vars.DOCKERHUB_REPOSITORY || vars.REPOSITORY }}
-  AWS_APP_NAME: ${{ vars.AWS_APP_NAME }}
-  AWS_ENV_NAME: ${{ vars.AWS_ENV_NAME }}
-  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
-  AWS_BASE_URL: ${{ vars.AWS_BASE_URL }}
-  APP_HEALTH_PATH: ${{ vars.APP_HEALTH_PATH || '/health' }}
-  AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+  AWS_APP_NAME:         ${{ vars.AWS_APP_NAME }}
+  AWS_ENV_NAME:         ${{ vars.AWS_ENV_NAME }}
+  AWS_REGION:           ${{ vars.AWS_REGION || 'us-east-1' }}
+  AWS_BASE_URL:         ${{ vars.AWS_BASE_URL }}
+  APP_HEALTH_PATH:      ${{ vars.APP_HEALTH_PATH || '/health' }}
+  AWS_ACCESS_KEY_ID:    ${{ secrets.AWS_ACCESS_KEY_ID }}
   AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-  AWS_REGION:            ${{ vars.AWS_REGION }}
 
 jobs:
   precheck:
@@ -51,14 +51,14 @@ jobs:
 
       - name: Run deterministic pre-check agent
         env:
-          PROJECT_PATH: .
-          AI_MODEL: ${{ vars.AI_MODEL || 'gemini-2.5-flash' }}
-          AI_PROVIDER: ${{ vars.AI_PROVIDER || 'gemini' }}
-          RUN_AI_REVIEW: ${{ inputs.ai_review && '1' || '0' }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          TARGET_CLOUD: ${{ inputs.cloud }}
+          PROJECT_PATH:    .
+          AI_MODEL:        ${{ vars.AI_MODEL || 'gemini-2.5-flash' }}
+          AI_PROVIDER:     ${{ vars.AI_PROVIDER || 'gemini' }}
+          RUN_AI_REVIEW:   ${{ inputs.ai_review && '1' || '0' }}
+          GEMINI_API_KEY:  ${{ secrets.GEMINI_API_KEY }}
+          TARGET_CLOUD:    ${{ inputs.cloud }}
           MONITOR_API_URL: ${{ secrets.MONITOR_API_URL_AWS }}
-          MONITOR_TOKEN: ${{ secrets.MONITOR_TOKEN_AWS }}
+          MONITOR_TOKEN:   ${{ secrets.MONITOR_TOKEN_AWS }}
         run: python agent/test_agent.py
 
       - name: Upload pre-check reports
@@ -77,7 +77,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       image_base: ${{ steps.image-names.outputs.image_base }}
-      image_tag: ${{ steps.image-names.outputs.image_tag }}
+      image_tag:  ${{ steps.image-names.outputs.image_tag }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -86,9 +86,9 @@ jobs:
         env:
           DOCKERHUB_TOKEN_VALUE: ${{ secrets.DOCKERHUB_TOKEN }}
         run: |
-          test -n "$DOCKERHUB_USERNAME" || { echo "Missing repository variable DOCKERHUB_USERNAME"; exit 1; }
-          test -n "$DOCKERHUB_REPOSITORY" || { echo "Missing repository variable DOCKERHUB_REPOSITORY or REPOSITORY"; exit 1; }
-          test -n "$DOCKERHUB_TOKEN_VALUE" || { echo "Missing repository secret DOCKERHUB_TOKEN"; exit 1; }
+          test -n "$DOCKERHUB_USERNAME"      || { echo "Missing repository variable DOCKERHUB_USERNAME"; exit 1; }
+          test -n "$DOCKERHUB_REPOSITORY"    || { echo "Missing repository variable DOCKERHUB_REPOSITORY or REPOSITORY"; exit 1; }
+          test -n "$DOCKERHUB_TOKEN_VALUE"   || { echo "Missing repository secret DOCKERHUB_TOKEN"; exit 1; }
 
       - name: Set image names
         id: image-names
@@ -107,10 +107,10 @@ jobs:
 
       - name: Validate Prometheus and AWS manifests
         run: |
-          test -f monitoring/prometheus/prometheus.yml || { echo "Missing monitoring/prometheus/prometheus.yml"; exit 1; }
-          test -f monitoring/prometheus/alert.rules.yml || { echo "Missing monitoring/prometheus/alert.rules.yml"; exit 1; }
-          test -f monitoring/prometheus/recording.rules.yml || { echo "Missing monitoring/prometheus/recording.rules.yml"; exit 1; }
-          test -f Dockerrun.aws.json || { echo "Missing Dockerrun.aws.json"; exit 1; }
+          test -f monitoring/prometheus/prometheus.yml         || { echo "Missing monitoring/prometheus/prometheus.yml"; exit 1; }
+          test -f monitoring/prometheus/alert.rules.yml        || { echo "Missing monitoring/prometheus/alert.rules.yml"; exit 1; }
+          test -f monitoring/prometheus/recording.rules.yml    || { echo "Missing monitoring/prometheus/recording.rules.yml"; exit 1; }
+          test -f Dockerrun.aws.json                           || { echo "Missing Dockerrun.aws.json"; exit 1; }
           python -m json.tool Dockerrun.aws.json >/dev/null
           docker pull prom/prometheus:v2.53.0
           docker run --rm --entrypoint /bin/promtool \
@@ -135,15 +135,15 @@ jobs:
             docker.io/${{ env.DOCKERHUB_USERNAME }}/${{ env.DOCKERHUB_REPOSITORY }}:${{ github.sha }}
             docker.io/${{ env.DOCKERHUB_USERNAME }}/${{ env.DOCKERHUB_REPOSITORY }}:latest
           cache-from: type=gha,scope=app
-          cache-to: type=gha,mode=max,scope=app
+          cache-to:   type=gha,mode=max,scope=app
 
       - name: Prepare monitoring sidecar Dockerfiles
         run: |
-          test -f docker/nginx/nginx.conf || { echo "Missing docker/nginx/nginx.conf"; exit 1; }
-          test -f monitoring/prometheus/prometheus.yml || { echo "Missing monitoring/prometheus/prometheus.yml"; exit 1; }
-          test -f monitoring/grafana/provisioning/datasources/datasource.yml || { echo "Missing Grafana datasource provisioning"; exit 1; }
-          test -f monitoring/grafana/provisioning/dashboards/dashboard.yml || { echo "Missing Grafana dashboard provisioning"; exit 1; }
-          test -f monitoring/grafana/dashboards/ai-agent-dashboard.json || { echo "Missing ai-agent-dashboard.json"; exit 1; }
+          test -f docker/nginx/nginx.conf                                            || { echo "Missing docker/nginx/nginx.conf"; exit 1; }
+          test -f monitoring/prometheus/prometheus.yml                               || { echo "Missing monitoring/prometheus/prometheus.yml"; exit 1; }
+          test -f monitoring/grafana/provisioning/datasources/datasource.yml         || { echo "Missing Grafana datasource provisioning"; exit 1; }
+          test -f monitoring/grafana/provisioning/dashboards/dashboard.yml           || { echo "Missing Grafana dashboard provisioning"; exit 1; }
+          test -f monitoring/grafana/dashboards/ai-agent-dashboard.json              || { echo "Missing ai-agent-dashboard.json"; exit 1; }
           if grep -qE 'url: *\[' monitoring/grafana/provisioning/datasources/datasource.yml; then
             echo "Grafana datasource URL contains Markdown link syntax; use url: http://prometheus:9090/prometheus/"; exit 1
           fi
@@ -177,7 +177,7 @@ jobs:
           provenance: false
           tags: docker.io/${{ env.DOCKERHUB_USERNAME }}/${{ env.DOCKERHUB_REPOSITORY }}:nginx-${{ github.sha }}
           cache-from: type=gha,scope=nginx
-          cache-to: type=gha,mode=max,scope=nginx
+          cache-to:   type=gha,mode=max,scope=nginx
 
       - name: Build and push Prometheus monitoring image
         uses: docker/build-push-action@v6
@@ -189,7 +189,7 @@ jobs:
           provenance: false
           tags: docker.io/${{ env.DOCKERHUB_USERNAME }}/${{ env.DOCKERHUB_REPOSITORY }}:prometheus-${{ github.sha }}
           cache-from: type=gha,scope=prometheus
-          cache-to: type=gha,mode=max,scope=prometheus
+          cache-to:   type=gha,mode=max,scope=prometheus
 
       - name: Build and push Grafana monitoring image
         uses: docker/build-push-action@v6
@@ -201,7 +201,7 @@ jobs:
           provenance: false
           tags: docker.io/${{ env.DOCKERHUB_USERNAME }}/${{ env.DOCKERHUB_REPOSITORY }}:grafana-${{ github.sha }}
           cache-from: type=gha,scope=grafana
-          cache-to: type=gha,mode=max,scope=grafana
+          cache-to:   type=gha,mode=max,scope=grafana
 
       - name: Scan application image
         uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1
@@ -222,17 +222,18 @@ jobs:
       app_url: ${{ steps.aws-host.outputs.app_url }}
     env:
       GRAFANA_ADMIN_PASSWORD: ${{ secrets.GRAFANA_ADMIN_PASSWORD }}
-      MONITOR_TOKEN_AWS: ${{ secrets.MONITOR_TOKEN_AWS }}
-      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-      AI_PROVIDER: ${{ vars.AI_PROVIDER || 'gemini' }}
-      AI_MODEL: ${{ vars.AI_MODEL || 'gemini-2.5-flash' }}
+      MONITOR_TOKEN_AWS:      ${{ secrets.MONITOR_TOKEN_AWS }}
+      GEMINI_API_KEY:         ${{ secrets.GEMINI_API_KEY }}
+      AI_PROVIDER:            ${{ vars.AI_PROVIDER || 'gemini' }}
+      AI_MODEL:               ${{ vars.AI_MODEL || 'gemini-2.5-flash' }}
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Validate AWS configuration
         env:
-          AWS_ACCESS_KEY_ID_VALUE: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_ACCESS_KEY_ID_VALUE:     ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY_VALUE: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         run: |
           test -n "$AWS_APP_NAME"                || { echo "Missing variable AWS_APP_NAME"; exit 1; }
@@ -250,9 +251,9 @@ jobs:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
+          aws-region:            ${{ env.AWS_REGION }}
 
       - name: Set up Python for deployment agents
         uses: actions/setup-python@v5
@@ -276,7 +277,7 @@ jobs:
             --application-name "$AWS_APP_NAME" \
             --environment-names "$AWS_ENV_NAME" \
             --query 'Environments[0].SolutionStackName' --output text)
-          test -n "$CNAME" && test "$CNAME" != "None" || { echo "AWS environment has no CNAME"; exit 1; }
+          test -n "$CNAME"    && test "$CNAME"    != "None" || { echo "AWS environment has no CNAME"; exit 1; }
           test -n "$PLATFORM" && test "$PLATFORM" != "None" || { echo "AWS platform could not be resolved"; exit 1; }
           BASE_URL="${AWS_BASE_URL:-http://${CNAME}}"
           echo "cname=$CNAME"       >> "$GITHUB_OUTPUT"
@@ -287,7 +288,7 @@ jobs:
 
       - name: Set Elastic Beanstalk environment properties
         env:
-          CNAME: ${{ steps.aws-host.outputs.cname }}
+          CNAME:    ${{ steps.aws-host.outputs.cname }}
           BASE_URL: ${{ steps.aws-host.outputs.app_url }}
         run: |
           python - <<'PY'
@@ -303,10 +304,10 @@ jobs:
               "GF_SERVER_ROOT_URL":         os.environ["BASE_URL"].rstrip("/") + "/grafana/",
               "PROMETHEUS_URL":             "http://prometheus:9090/prometheus",
 
-              # AI variables: GitHub Secrets/Variables → AWS Beanstalk
-              "GEMINI_API_KEY":             os.environ["GEMINI_API_KEY"],
-              "AI_PROVIDER":                os.environ["AI_PROVIDER"],
-              "AI_MODEL":                   os.environ["AI_MODEL"],
+              # ── AI Agent Monitor → pushed to Beanstalk runtime ──
+              "GEMINI_API_KEY": os.environ["GEMINI_API_KEY"],
+              "AI_PROVIDER":    os.environ["AI_PROVIDER"],
+              "AI_MODEL":       os.environ["AI_MODEL"],
           }
           options = [{
               "Namespace":  "aws:elasticbeanstalk:application:environment",
@@ -319,38 +320,38 @@ jobs:
 
           aws elasticbeanstalk update-environment \
             --application-name "$AWS_APP_NAME" \
-            --environment-name "$AWS_ENV_NAME" \
+            --environment-name  "$AWS_ENV_NAME" \
             --option-settings file:///tmp/eb-options.json >/dev/null
 
-          echo "Waiting for the Elastic Beanstalk configuration update to finish..."
+          echo "Waiting for Elastic Beanstalk configuration update..."
           aws elasticbeanstalk wait environment-updated \
-            --application-name "$AWS_APP_NAME" \
+            --application-name  "$AWS_APP_NAME" \
             --environment-names "$AWS_ENV_NAME"
+
           STATUS=$(aws elasticbeanstalk describe-environments \
-            --application-name "$AWS_APP_NAME" \
+            --application-name  "$AWS_APP_NAME" \
             --environment-names "$AWS_ENV_NAME" \
             --query 'Environments[0].Status' --output text)
           test "$STATUS" = "Ready" || { echo "Elastic Beanstalk is not Ready: $STATUS"; exit 1; }
 
       - name: Render AWS ECS Dockerrun manifest
         env:
-          APP_IMAGE: docker.io/${{ env.DOCKERHUB_USERNAME }}/${{ env.DOCKERHUB_REPOSITORY }}:${{ github.sha }}
-          BASE_URL: ${{ steps.aws-host.outputs.app_url }}
-          CNAME: ${{ steps.aws-host.outputs.cname }}
-          MONITOR_TOKEN: ${{ secrets.MONITOR_TOKEN_AWS }}
+          APP_IMAGE:              docker.io/${{ env.DOCKERHUB_USERNAME }}/${{ env.DOCKERHUB_REPOSITORY }}:${{ github.sha }}
+          BASE_URL:               ${{ steps.aws-host.outputs.app_url }}
+          CNAME:                  ${{ steps.aws-host.outputs.cname }}
+          MONITOR_TOKEN:          ${{ secrets.MONITOR_TOKEN_AWS }}
           GRAFANA_ADMIN_PASSWORD: ${{ secrets.GRAFANA_ADMIN_PASSWORD }}
-          DOCKERHUB_USERNAME: ${{ env.DOCKERHUB_USERNAME }}
-          DOCKERHUB_REPOSITORY: ${{ env.DOCKERHUB_REPOSITORY }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          AI_PROVIDER: ${{ vars.AI_PROVIDER || 'gemini' }}
-          AI_MODEL: ${{ vars.AI_MODEL || 'gemini-2.5-flash' }}
+          DOCKERHUB_USERNAME:     ${{ env.DOCKERHUB_USERNAME }}
+          DOCKERHUB_REPOSITORY:   ${{ env.DOCKERHUB_REPOSITORY }}
+          GEMINI_API_KEY:         ${{ secrets.GEMINI_API_KEY }}
+          AI_PROVIDER:            ${{ vars.AI_PROVIDER || 'gemini' }}
+          AI_MODEL:               ${{ vars.AI_MODEL || 'gemini-2.5-flash' }}
         run: |
           test -f Dockerrun.aws.json || { echo "Missing Dockerrun.aws.json"; exit 1; }
           touch .ebignore
 
           python - <<'PY'
-          import json
-          import os
+          import json, os
           from pathlib import Path
 
           sha        = os.environ["GITHUB_SHA"]
@@ -378,11 +379,11 @@ jobs:
                   "MONITOR_TOKEN":    os.environ["MONITOR_TOKEN"],
                   "PYTHONPATH":       "/app",
                   "PROMETHEUS_URL":   "http://prometheus:9090/prometheus",
-                  
+                  # ── AI Agent Monitor ───────────────────────
                   "GEMINI_API_KEY":   os.environ.get("GEMINI_API_KEY", ""),
                   "GOOGLE_API_KEY":   os.environ.get("GEMINI_API_KEY", ""),
-                  "AI_PROVIDER":      os.environ.get("AI_PROVIDER", "gemini"),
-                  "AI_MODEL":         os.environ.get("AI_MODEL", "gemini-2.5-flash"),
+                  "AI_PROVIDER":      os.environ.get("AI_PROVIDER",    "gemini"),
+                  "AI_MODEL":         os.environ.get("AI_MODEL",        "gemini-2.5-flash"),
               },
               "grafana": {
                   "GF_SECURITY_ADMIN_USER":        "admin",
@@ -404,19 +405,16 @@ jobs:
 
           for container in manifest.get("containerDefinitions", []):
               name = container.get("name")
-
               if name in image_map:
                   old = container.get("image", "")
                   container["image"] = image_map[name]
                   print(f"  image [{name}]: {old!r} → {image_map[name]!r}")
-
               if name in env_map:
                   existing = {e["name"]: e for e in container.get("environment", [])}
                   for key, value in env_map[name].items():
                       existing[key] = {"name": key, "value": str(value)}
                   container["environment"] = list(existing.values())
                   print(f"  env   [{name}]: {list(env_map[name].keys())}")
-
               if name == "prometheus":
                   container["command"] = [
                       "--config.file=/etc/prometheus/prometheus.yml",
@@ -428,35 +426,31 @@ jobs:
           for volume in manifest.setdefault("volumes", []):
               if volume.get("name") == "nginx-conf":
                   volume["host"]["sourcePath"] = "/var/app/current/docker/nginx-ecs"
-                  print(f"  vol   [nginx-conf]: → /var/app/current/docker/nginx")
+                  print(f"  vol   [nginx-conf]: → /var/app/current/docker/nginx-ecs")
 
           path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
           print("\nDockerrun.aws.json rendered successfully.")
           PY
 
+          # ── FIX 2: Removed duplicate echo "" ─────────────────
           echo ""
-                    echo ""
-          echo "=== Final Dockerrun.aws.json ==="
+          echo "=== Final Dockerrun.aws.json (secrets masked) ==="
           python - <<'PY'
           import json
           from pathlib import Path
 
-          manifest = json.loads(Path("Dockerrun.aws.json").read_text(encoding="utf-8"))
-
+          manifest = json.loads(
+              Path("Dockerrun.aws.json").read_text(encoding="utf-8")
+          )
           secret_names = {
-              "GEMINI_API_KEY",
-              "GOOGLE_API_KEY",
-              "OPENAI_API_KEY",
-              "ANTHROPIC_API_KEY",
-              "GROQ_API_KEY",
-              "MISTRAL_API_KEY",
+              "GEMINI_API_KEY", "GOOGLE_API_KEY",
+              "OPENAI_API_KEY", "ANTHROPIC_API_KEY",
+              "GROQ_API_KEY",   "MISTRAL_API_KEY",
           }
-
           for container in manifest.get("containerDefinitions", []):
-              for env in container.get("environment", []):
-                  if env.get("name") in secret_names and env.get("value"):
-                      env["value"] = "***MASKED***"
-
+              for env_var in container.get("environment", []):
+                  if env_var.get("name") in secret_names and env_var.get("value"):
+                      env_var["value"] = "***MASKED***"
           print(json.dumps(manifest, indent=2))
           PY
 
@@ -489,7 +483,7 @@ jobs:
       - name: Initialize EB CLI and select environment
         run: |
           eb init "$AWS_APP_NAME" \
-            --region "$AWS_REGION" \
+            --region   "$AWS_REGION" \
             --platform "${{ steps.aws-host.outputs.platform }}"
           eb use "$AWS_ENV_NAME"
 
@@ -498,7 +492,7 @@ jobs:
           echo "Checking environment state before deploying..."
           for attempt in $(seq 1 20); do
             STATUS=$(aws elasticbeanstalk describe-environments \
-              --application-name "$AWS_APP_NAME" \
+              --application-name  "$AWS_APP_NAME" \
               --environment-names "$AWS_ENV_NAME" \
               --query 'Environments[0].Status' --output text)
             echo "Attempt $attempt/20 — Status: $STATUS"
@@ -516,18 +510,18 @@ jobs:
         continue-on-error: true
         run: |
           eb deploy "$AWS_ENV_NAME" \
-            --label "github-${GITHUB_SHA:0:12}" \
+            --label   "github-${GITHUB_SHA:0:12}" \
             --timeout 30
           aws elasticbeanstalk wait environment-updated \
-            --application-name "$AWS_APP_NAME" \
+            --application-name  "$AWS_APP_NAME" \
             --environment-names "$AWS_ENV_NAME"
           HEALTH=$(aws elasticbeanstalk describe-environments \
-            --application-name "$AWS_APP_NAME" \
+            --application-name  "$AWS_APP_NAME" \
             --environment-names "$AWS_ENV_NAME" \
             --query 'Environments[0].Health' --output text)
           echo "AWS health: $HEALTH"
           case "$HEALTH" in Green|Yellow|Ok) ;; *) exit 1 ;; esac
-
+          
       - name: Collect AWS logs before diagnosis
         if: ${{ steps.aws_deploy.outcome == 'failure' }}
         continue-on-error: true
