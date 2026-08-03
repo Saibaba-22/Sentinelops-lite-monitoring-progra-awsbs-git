@@ -664,6 +664,48 @@ def not_found(error):
 # Unchanged from your original app.py.
 # ══════════════════════════════════════════════════════════════
 
+
+
+
+
+
+@application.get("/debug/monitor")
+def debug_monitor():
+    files = _db.execute(
+        "SELECT file_path, file_name, is_ai_agent "
+        "FROM detected_files WHERE is_ai_agent=1",
+        fetch=True
+    )
+    metrics = _monitor.get_all_metrics()
+    
+    # Check DB directly for token records
+    tok_db = _db.execute(
+        "SELECT COUNT(*) as cnt, SUM(tokens_used) as total "
+        "FROM token_usage",
+        fetch=True
+    )
+    req_db = _db.execute(
+        "SELECT COUNT(*) as cnt FROM request_usage",
+        fetch=True
+    )
+    
+    return jsonify({
+        "monitoring_active":   _monitor.monitoring,
+        "ai_files_count":      len(files),
+        "tok_log_keys":        list(_monitor._tok_log.keys()),
+        "req_log_keys":        list(_monitor._req_log.keys()),
+        "tok_log_total_entries": sum(
+            len(v) for v in _monitor._tok_log.values()
+        ),
+        "tokens_in_db":        dict(tok_db[0]) if tok_db else {},
+        "requests_in_db":      dict(req_db[0]) if req_db else {},
+        "metrics_tokens":      metrics.get("tokens",   {}),
+        "metrics_requests":    metrics.get("requests", {}),
+        "system_ok":           bool(metrics.get("system",{})),
+    })
+
+
+
 if __name__ == "__main__":
     port  = int(os.environ.get("PORT", "5000"))
     debug = os.environ.get("FLASK_DEBUG") == "1"

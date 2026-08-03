@@ -546,16 +546,20 @@ class ResourceMonitor:
     def stop_monitoring(self):
         self.monitoring = False
 
-    def _loop(self):
-        while self.monitoring:
-            try:
-                self._sys()
-                self._proc()
-                self._rates()
-                self._sim()
-            except Exception as e:
-                print(f"[monitor] loop error: {e}")
-            time.sleep(5)
+def _loop(self):
+    """Main monitoring loop."""
+    while self.monitoring:
+        try:
+            self._sys()
+            self._proc()
+            self._rates()
+            self._sim()
+        except Exception as e:
+            print(f"[monitor] loop error: {e}")
+
+        # ── Run every 3 seconds instead of 5 ──────────────────
+        # Faster cycle = data appears sooner on dashboard
+        time.sleep(3)
 
     def _sys(self):
         cpu  = psutil.cpu_percent(interval=1)
@@ -616,56 +620,92 @@ class ResourceMonitor:
                 (fp, pid, cpu, mem, storage)
             )
 
-    def _rates(self):
-        now = time.time()
-        for fp, ent in list(self._tok_log.items()):
-            ent[:] = [(t, c) for t, c in ent if now - t < 86_400]
-            self.metrics['tokens'][fp] = {
-                'per_min':  sum(c for t,c in ent if now-t < 60),
-                'per_hour': sum(c for t,c in ent if now-t < 3_600),
-                'per_day':  sum(c for t,c in ent if now-t < 86_400),
-            }
-        for fp, ent in list(self._req_log.items()):
-            ent[:] = [(t, c) for t, c in ent if now - t < 86_400]
-            self.metrics['requests'][fp] = {
-                'per_min':  sum(c for t,c in ent if now-t < 60),
-                'per_hour': sum(c for t,c in ent if now-t < 3_600),
-                'per_day':  sum(c for t,c in ent if now-t < 86_400),
-            }
+def _rates(self):
+    """Calculate per-minute, per-hour, per-day rates from log."""
+    now = time.time()
 
-    def _sim(self):
-        """Simulate token/request usage for demo; replace with real hooks."""
-        rows = self.db.execute(
-            "SELECT file_path FROM detected_files WHERE is_ai_agent=1",
-            fetch=True
-        )
-        now = time.time()
-        for row in rows:
-            fp = row['file_path']
-            if random.random() < 0.3:
-                tok = random.randint(50, 2000)
-                self._tok_log[fp].append((now, tok))
-                self._req_log[fp].append((now, 1))
-                self.db.execute(
-                    "INSERT INTO token_usage (file_path,tokens_used,token_type) "
-                    "VALUES (?,?,?)",
-                    (fp, tok, 'total')
-                )
-                self.db.execute(
-                    "INSERT INTO request_usage "
-                    "(file_path,request_count,status_code) VALUES (?,?,?)",
-                    (fp, 1, 200)
-                )
+    for fp, ent in list(self._tok_log.items()):
+        # ── Clean entries older than 24 hours ─────────────────
+        ent[:] = [(t, c) for t, c in ent if now - t < 86_400]
 
-    def get_all_metrics(self):
-        """Return complete metrics snapshot."""
-        self._rates()
-        return {
-            'system':    self.metrics['system'],
-            'tokens':    dict(self.metrics['tokens']),
-            'requests':  dict(self.metrics['requests']),
-            'resources': self.metrics['resources'],
+        self.metrics['tokens'][fp] = {
+            'per_min':  sum(c for t, c in ent if now - t < 60),
+            'per_hour': sum(c for t, c in ent if now - t < 3_600),
+            'per_day':  sum(c for t, c in ent if now - t < 86_400),
         }
+
+    for fp, ent in list(self._req_log.items()):
+        # ── Clean entries older than 24 hours ─────────────────
+        ent[:] = [(t, c) for t, c in ent if now - t < 86_400]
+
+        self.metrics['requests'][fp] = {
+            'per_min':  sum(c for t, c in ent if now - t < 60),
+            'per_hour': sum(c for t, c in ent if now - t < 3_600),
+            'per_day':  sum(c for t, c in ent if now - t < 86_400),
+        }
+
+    # ── Debug log totals ───────────────────────────────────────
+    total_tok = sum(
+        v['per_day'] for v in self.metrics['tokens'].values()
+    )
+    total_req = sum(
+        v['per_day'] for v in self.metrics['requests'].values()
+    )
+    if total_tok > 0 or total_req > 0:
+        print(f"[rates] tok/day={total_tok:,} req/day={total_req:,}")
+
+def _sim(self):
+    """
+    Simulate token/request usage for detected AI agents.
+    Records EVERY cycle (not random) so dashboard always shows data.
+    Replace with real API call interception in production.
+    """
+    files = self.db.execute(
+        "SELECT file_path FROM detected_files WHERE is_ai_agent=1",
+        fetch=True
+    )
+
+    if not files:
+        print("[sim] ⚠ No AI agent files found in DB")
+        return
+
+    now = time.time()
+
+    for row in files:
+        fp  = row['file_path']
+
+        # ── Always record tokens every cycle ──────────────────
+        # This ensures per_min/hour/day always have data.
+        # In production replace with real API hook.
+        tok = random.randint(100, 2000)
+        req = random.randint(1, 3)
+
+        self._tok_log[fp].append((now, tok))
+        self._req_log[fp].append((now, req))
+
+        # ── Persist to DB ──────────────────────────────────────
+        self.db.execute(
+            "INSERT INTO token_usage "
+            "(file_path,tokens_used,token_type) VALUES (?,?,?)",
+            (fp, tok, 'total')
+        )
+        self.db.execute(
+            "INSERT INTO request_usage "
+            "(file_path,request_count,status_code) VALUES (?,?,?)",
+            (fp, req, 200)
+        )
+
+    print(f"[sim] ✅ Recorded tokens for {len(files)} AI files")
+
+def get_all_metrics(self):
+    """Return complete metrics snapshot."""
+    self._rates()   # ← recalculate before returning
+    return {
+        'system':    self.metrics['system'],
+        'tokens':    dict(self.metrics['tokens']),
+        'requests':  dict(self.metrics['requests']),
+        'resources': self.metrics['resources'],
+    }
 
 
 # ============================================================
