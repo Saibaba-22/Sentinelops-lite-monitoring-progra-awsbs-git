@@ -533,6 +533,21 @@ def _exc(e):
     application.logger.exception(f"Unhandled: {e}")
     return jsonify({"error": "Internal server error", "status": 500}), 500
 
+@application.get("/debug3")
+def debug3():
+    """Return exactly what _get_data() gives to the dashboard."""
+    try:
+        files, metrics = _get_data()
+        return jsonify({
+            "files_count":  len(files),
+            "files_sample": files[:3],
+            "system":       metrics.get("system", {}),
+            "tokens_keys":  list(metrics.get("tokens", {}).keys())[:5],
+            "req_keys":     list(metrics.get("requests", {}).keys())[:5],
+        })
+    except Exception as e:
+        import traceback
+        return jsonify({"error": str(e), "traceback": traceback.format_exc()}), 500
 
 if __name__ == "__main__":
     application.run(
