@@ -28,18 +28,349 @@ from urllib.parse import urlparse, parse_qs
 from collections import defaultdict
 import importlib.util
 
-# ============================================================
-# CONFIGURATION - SELECT YOUR AI MODEL
-# ============================================================
-SUPPORTED_MODELS = {
-    "1": {"name": "OpenAI GPT-4", "provider": "openai", "token_limit_per_min": 10000, "token_limit_per_hour": 300000, "token_limit_per_day": 5000000, "request_limit_per_min": 60, "request_limit_per_hour": 3500, "request_limit_per_day": 50000},
-    "2": {"name": "OpenAI GPT-3.5-Turbo", "provider": "openai", "token_limit_per_min": 60000, "token_limit_per_hour": 1800000, "token_limit_per_day": 30000000, "request_limit_per_min": 60, "request_limit_per_hour": 3500, "request_limit_per_day": 50000},
-    "3": {"name": "Anthropic Claude 3", "provider": "anthropic", "token_limit_per_min": 25000, "token_limit_per_hour": 750000, "token_limit_per_day": 12500000, "request_limit_per_min": 50, "request_limit_per_hour": 2000, "request_limit_per_day": 30000},
-    "4": {"name": "Google Gemini Pro", "provider": "google", "token_limit_per_min": 30000, "token_limit_per_hour": 900000, "token_limit_per_day": 15000000, "request_limit_per_min": 60, "request_limit_per_hour": 1500, "request_limit_per_day": 25000},
-    "5": {"name": "Ollama Local", "provider": "ollama", "token_limit_per_min": 100000, "token_limit_per_hour": 6000000, "token_limit_per_day": 100000000, "request_limit_per_min": 120, "request_limit_per_hour": 7200, "request_limit_per_day": 100000},
-    "6": {"name": "Custom / Other", "provider": "custom", "token_limit_per_min": 10000, "token_limit_per_hour": 600000, "token_limit_per_day": 10000000, "request_limit_per_min": 60, "request_limit_per_hour": 3600, "request_limit_per_day": 50000},
+# ══════════════════════════════════════════════════════════════
+# BLOCK 2 — ENVIRONMENT & MODEL CONFIGURATION
+# ──────────────────────────────────────────────────────────────
+# What  : Reads AI provider, model, and API key from environment
+#         variables injected by GitHub Actions pipeline.yml.
+#
+# Source in pipeline.yml:
+# ┌─────────────────────────────────────────────────────────────┐
+# │  env:                                                       │
+# │    GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}            │
+# │    AI_MODEL:       ${{ vars.AI_MODEL || 'gemini-2.5-flash'}}│
+# │    AI_PROVIDER:    ${{ vars.AI_PROVIDER || 'gemini' }}      │
+# └─────────────────────────────────────────────────────────────┘
+#
+# To change model or provider:
+#   GitHub → Settings → Secrets and Variables → Actions → Variables
+#   Edit AI_MODEL or AI_PROVIDER
+#
+# To change API key:
+#   GitHub → Settings → Secrets and Variables → Actions → Secrets
+#   Edit GEMINI_API_KEY
+#
+# DO NOT hardcode anything here.
+# DO NOT commit API keys to git.
+# ══════════════════════════════════════════════════════════════
+
+# ── Step 1: Read raw values from environment ──────────────────
+# These three variables are injected by GitHub Actions pipeline.
+# Fallback defaults match pipeline.yml defaults so local dev
+# works the same way as CI/CD.
+
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+AI_MODEL       = os.environ.get("AI_MODEL",       "gemini-2.5-flash")
+AI_PROVIDER    = os.environ.get("AI_PROVIDER",    "gemini")
+
+# ── Step 2: Normalise provider name ───────────────────────────
+# GitHub variable AI_PROVIDER is set to "gemini"
+# MODEL_REGISTRY below uses "google" as the key
+# because google is the official API provider for Gemini.
+# This mapping keeps both in sync automatically.
+#
+# ┌─────────────────┬──────────────────────────────────────────┐
+# │ AI_PROVIDER env │ ACTIVE_PROVIDER used in MODEL_REGISTRY   │
+# ├─────────────────┼──────────────────────────────────────────┤
+# │ gemini          │ google                                   │
+# │ google          │ google                                   │
+# │ openai          │ openai                                   │
+# │ anthropic       │ anthropic                                │
+# │ groq            │ groq                                     │
+# │ mistral         │ mistral                                  │
+# │ ollama          │ ollama                                   │
+# └─────────────────┴──────────────────────────────────────────┘
+
+_PROVIDER_MAP = {
+    "gemini":    "google",
+    "google":    "google",
+    "openai":    "openai",
+    "anthropic": "anthropic",
+    "groq":      "groq",
+    "mistral":   "mistral",
+    "ollama":    "ollama",
 }
 
+ACTIVE_PROVIDER = _PROVIDER_MAP.get(AI_PROVIDER.lower().strip(), AI_PROVIDER.lower().strip())
+ACTIVE_MODEL    = AI_MODEL.strip()
+API_KEY         = GEMINI_API_KEY
+
+# ── Step 3: API keys per provider ─────────────────────────────
+# Only GEMINI_API_KEY is set via GitHub secret right now.
+# If you add other providers later, add their secrets to
+# GitHub and read them here the same way.
+
+OPENAI_API_KEY    = os.environ.get("OPENAI_API_KEY",    "")
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+GOOGLE_API_KEY    = GEMINI_API_KEY   # Gemini secret → Google key
+GROQ_API_KEY      = os.environ.get("GROQ_API_KEY",      "")
+MISTRAL_API_KEY   = os.environ.get("MISTRAL_API_KEY",   "")
+OLLAMA_BASE_URL   = os.environ.get("OLLAMA_BASE_URL",   "http://localhost:11434")
+
+# ── Step 4: MODEL REGISTRY ────────────────────────────────────
+# Single source of truth for all model limits and costs.
+# Keys must match ACTIVE_PROVIDER value after Step 2 mapping.
+# ──────────────────────────────────────────────────────────────
+# Column guide:
+#   tpm_limit  → max tokens  per minute
+#   tph_limit  → max tokens  per hour
+#   tpd_limit  → max tokens  per day
+#   rpm_limit  → max requests per minute
+#   rph_limit  → max requests per hour
+#   rpd_limit  → max requests per day
+#   cost_input_per_1k   → USD cost per 1,000 input  tokens
+#   cost_output_per_1k  → USD cost per 1,000 output tokens
+#   context_window      → max tokens in one request
+# ──────────────────────────────────────────────────────────────
+
+MODEL_REGISTRY = {
+
+    # ── Google / Gemini ───────────────────────────────────────
+    # AI_PROVIDER="gemini" maps to this "google" key via Step 2
+    "google": {
+        "api_key":  GOOGLE_API_KEY,
+        "base_url": "https://generativelanguage.googleapis.com/v1beta",
+        "models": {
+
+            "gemini-2.5-flash": {
+                "tpm_limit":              1_000_000,
+                "tph_limit":             60_000_000,
+                "tpd_limit":          1_000_000_000,
+                "rpm_limit":                  10_000,
+                "rph_limit":                 600_000,
+                "rpd_limit":              10_000_000,
+                "cost_input_per_1k":         0.00015,
+                "cost_output_per_1k":        0.00060,
+                "context_window":          1_048_576,
+            },
+
+            "gemini-2.5-pro": {
+                "tpm_limit":                800_000,
+                "tph_limit":             48_000_000,
+                "tpd_limit":            800_000_000,
+                "rpm_limit":                   2_000,
+                "rph_limit":                 120_000,
+                "rpd_limit":               2_000_000,
+                "cost_input_per_1k":         0.00125,
+                "cost_output_per_1k":        0.01000,
+                "context_window":          1_048_576,
+            },
+
+            "gemini-1.5-flash": {
+                "tpm_limit":              1_000_000,
+                "tph_limit":             60_000_000,
+                "tpd_limit":          1_000_000_000,
+                "rpm_limit":                   2_000,
+                "rph_limit":                 120_000,
+                "rpd_limit":               2_000_000,
+                "cost_input_per_1k":        0.000075,
+                "cost_output_per_1k":       0.000300,
+                "context_window":          1_048_576,
+            },
+
+            "gemini-1.5-pro": {
+                "tpm_limit":                 32_000,
+                "tph_limit":              1_920_000,
+                "tpd_limit":             32_000_000,
+                "rpm_limit":                   1_000,
+                "rph_limit":                  60_000,
+                "rpd_limit":               1_000_000,
+                "cost_input_per_1k":         0.00125,
+                "cost_output_per_1k":        0.00375,
+                "context_window":          1_048_576,
+            },
+
+        },
+    },
+
+    # ── OpenAI ────────────────────────────────────────────────
+    # Not active now but ready if you switch.
+    "openai": {
+        "api_key":  OPENAI_API_KEY,
+        "base_url": "https://api.openai.com/v1",
+        "models": {
+            "gpt-4o": {
+                "tpm_limit":             30_000,
+                "tph_limit":          1_800_000,
+                "tpd_limit":         30_000_000,
+                "rpm_limit":                500,
+                "rph_limit":             30_000,
+                "rpd_limit":            500_000,
+                "cost_input_per_1k":      0.005,
+                "cost_output_per_1k":     0.015,
+                "context_window":       128_000,
+            },
+            "gpt-3.5-turbo": {
+                "tpm_limit":             90_000,
+                "tph_limit":          5_400_000,
+                "tpd_limit":         90_000_000,
+                "rpm_limit":              3_500,
+                "rph_limit":            210_000,
+                "rpd_limit":          3_500_000,
+                "cost_input_per_1k":     0.0005,
+                "cost_output_per_1k":    0.0015,
+                "context_window":        16_385,
+            },
+        },
+    },
+
+    # ── Anthropic ─────────────────────────────────────────────
+    "anthropic": {
+        "api_key":  ANTHROPIC_API_KEY,
+        "base_url": "https://api.anthropic.com",
+        "models": {
+            "claude-3-5-sonnet-20241022": {
+                "tpm_limit":             80_000,
+                "tph_limit":          4_800_000,
+                "tpd_limit":         80_000_000,
+                "rpm_limit":              4_000,
+                "rph_limit":            240_000,
+                "rpd_limit":          4_000_000,
+                "cost_input_per_1k":      0.003,
+                "cost_output_per_1k":     0.015,
+                "context_window":       200_000,
+            },
+        },
+    },
+
+    # ── Groq ──────────────────────────────────────────────────
+    "groq": {
+        "api_key":  GROQ_API_KEY,
+        "base_url": "https://api.groq.com/openai/v1",
+        "models": {
+            "llama3-70b-8192": {
+                "tpm_limit":              6_000,
+                "tph_limit":            360_000,
+                "tpd_limit":          6_000_000,
+                "rpm_limit":                 30,
+                "rph_limit":              1_800,
+                "rpd_limit":             30_000,
+                "cost_input_per_1k":    0.00059,
+                "cost_output_per_1k":   0.00079,
+                "context_window":         8_192,
+            },
+        },
+    },
+
+    # ── Mistral ───────────────────────────────────────────────
+    "mistral": {
+        "api_key":  MISTRAL_API_KEY,
+        "base_url": "https://api.mistral.ai/v1",
+        "models": {
+            "mistral-large-latest": {
+                "tpm_limit":            500_000,
+                "tph_limit":         30_000_000,
+                "tpd_limit":        500_000_000,
+                "rpm_limit":              1_000,
+                "rph_limit":             60_000,
+                "rpd_limit":          1_000_000,
+                "cost_input_per_1k":      0.003,
+                "cost_output_per_1k":     0.009,
+                "context_window":       128_000,
+            },
+        },
+    },
+
+    # ── Ollama (local) ────────────────────────────────────────
+    "ollama": {
+        "api_key":  "",
+        "base_url": OLLAMA_BASE_URL,
+        "models": {
+            "llama3": {
+                "tpm_limit":          9_999_999,
+                "tph_limit":        999_999_999,
+                "tpd_limit":      9_999_999_999,
+                "rpm_limit":             99_999,
+                "rph_limit":          5_999_999,
+                "rpd_limit":         99_999_999,
+                "cost_input_per_1k":        0.0,
+                "cost_output_per_1k":       0.0,
+                "context_window":         8_192,
+            },
+        },
+    },
+
+}
+
+# ── Step 5: Resolve ACTIVE_CONFIG from registry ───────────────
+# Reads ACTIVE_PROVIDER + ACTIVE_MODEL set in Steps 1 and 2,
+# looks them up in MODEL_REGISTRY, and builds one flat dict
+# that the rest of agent_monitor.py reads from.
+# You do NOT need to change anything below this line.
+
+def _resolve_active_config() -> dict:
+    """
+    Resolves the active provider + model from MODEL_REGISTRY.
+    Falls back to zero/empty values if provider or model not found.
+    Prints a startup line so you can confirm config in CI/CD logs.
+    """
+    provider_cfg = MODEL_REGISTRY.get(ACTIVE_PROVIDER, {})
+    models_cfg   = provider_cfg.get("models", {})
+    model_cfg    = models_cfg.get(ACTIVE_MODEL, {})
+
+    if not provider_cfg:
+        print(
+            f"[agent_monitor] ❌  Provider '{ACTIVE_PROVIDER}' not found "
+            f"in MODEL_REGISTRY. Check AI_PROVIDER variable in GitHub."
+        )
+
+    if not model_cfg:
+        print(
+            f"[agent_monitor] ❌  Model '{ACTIVE_MODEL}' not found under "
+            f"provider '{ACTIVE_PROVIDER}' in MODEL_REGISTRY. "
+            f"Check AI_MODEL variable in GitHub."
+        )
+        model_cfg = {
+            "tpm_limit":            0,
+            "tph_limit":            0,
+            "tpd_limit":            0,
+            "rpm_limit":            0,
+            "rph_limit":            0,
+            "rpd_limit":            0,
+            "cost_input_per_1k":  0.0,
+            "cost_output_per_1k": 0.0,
+            "context_window":       0,
+        }
+
+    config = {
+        # ── Identity ──────────────────────────────────────────
+        "provider":             ACTIVE_PROVIDER,
+        "model":                ACTIVE_MODEL,
+        "ai_provider_env":      AI_PROVIDER,       # raw value from GitHub var
+        # ── Auth ──────────────────────────────────────────────
+        "api_key":              provider_cfg.get("api_key",  ""),
+        "base_url":             provider_cfg.get("base_url", ""),
+        # ── Token limits ──────────────────────────────────────
+        "tpm_limit":            model_cfg.get("tpm_limit",   0),
+        "tph_limit":            model_cfg.get("tph_limit",   0),
+        "tpd_limit":            model_cfg.get("tpd_limit",   0),
+        # ── Request limits ────────────────────────────────────
+        "rpm_limit":            model_cfg.get("rpm_limit",   0),
+        "rph_limit":            model_cfg.get("rph_limit",   0),
+        "rpd_limit":            model_cfg.get("rpd_limit",   0),
+        # ── Cost ──────────────────────────────────────────────
+        "cost_input_per_1k":    model_cfg.get("cost_input_per_1k",  0.0),
+        "cost_output_per_1k":   model_cfg.get("cost_output_per_1k", 0.0),
+        # ── Context ───────────────────────────────────────────
+        "context_window":       model_cfg.get("context_window", 0),
+    }
+
+    # ── Startup confirmation line (visible in GitHub Actions logs)
+    key_status = "✅ SET" if config["api_key"] else "❌ MISSING"
+    print(
+        f"[agent_monitor] ✅  Provider : {AI_PROVIDER} → {ACTIVE_PROVIDER}\n"
+        f"[agent_monitor] ✅  Model    : {ACTIVE_MODEL}\n"
+        f"[agent_monitor] ✅  API Key  : {key_status}\n"
+        f"[agent_monitor] ✅  TPM      : {config['tpm_limit']:,}\n"
+        f"[agent_monitor] ✅  RPM      : {config['rpm_limit']:,}\n"
+        f"[agent_monitor] ✅  Context  : {config['context_window']:,} tokens"
+    )
+
+    return config
+
+
+# ── This is the single object the rest of the file reads ──────
+ACTIVE_CONFIG: dict = _resolve_active_config()
 # ============================================================
 # DATABASE FOR METRICS COLLECTION
 # ============================================================
