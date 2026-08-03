@@ -327,7 +327,7 @@ def _html(body):
     return Response(body, status=200, content_type="text/html; charset=utf-8")
 
 if _HTMLBuilder is not None:
-    @application.get("/dashboard")
+@application.get("/dashboard")
 def monitor_dashboard():
     """Full overview — files, system resources, token/request usage."""
     files, metrics = _get_data()
