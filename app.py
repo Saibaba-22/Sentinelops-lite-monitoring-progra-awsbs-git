@@ -328,46 +328,94 @@ def _html(body):
 
 if _HTMLBuilder is not None:
     @application.get("/dashboard")
-    def dashboard_page():
-        f, m = _get_data(); return _html(_HTMLBuilder.dashboard(f, m))
+def monitor_dashboard():
+    """Full overview — files, system resources, token/request usage."""
+    files, metrics = _get_data()
+    return Response(
+        HTMLBuilder.dashboard(files, metrics),
+        mimetype="text/html"
+    )
 
-    @application.get("/files")
-    def files_page():
-        f, _ = _get_data(); return _html(_HTMLBuilder.files(f))
+@application.get("/files")
+def files_page():
+    """All detected project files."""
+    files, _ = _get_data()
+    return Response(
+        HTMLBuilder.files(files),
+        mimetype="text/html"
+    )
 
-    @application.get("/agents")
-    def agents_page():
-        f, m = _get_data(); return _html(_HTMLBuilder.agents(f, m))
+@application.get("/agents")
+def agents_page():
+    """Per-agent token, request, and resource metrics."""
+    files, metrics = _get_data()
+    return Response(
+        HTMLBuilder.agents(files, metrics),
+        mimetype="text/html"
+    )
 
-    @application.get("/monitor")
-    def monitor_page():
-        _, m = _get_data(); return _html(_HTMLBuilder.monitor(m))
+@application.get("/monitor")
+def monitor_page():
+    """Token/request usage vs limits + estimated cost."""
+    _, metrics = _get_data()
+    return Response(
+        HTMLBuilder.monitor(metrics),
+        mimetype="text/html"
+    )
 
-    @application.get("/model")
-    def model_page():
-        return _html(_HTMLBuilder.model())
+@application.get("/model")
+def model_page():
+    """Active model config, rate limits, pricing."""
+    return Response(
+        HTMLBuilder.model(),
+        mimetype="text/html"
+    )
 
-    @application.get("/history")
-    def history_page():
-        return _html(_HTMLBuilder.history(_db))
+@application.get("/history")
+def history_page():
+    """Last 50 scan history records."""
+    return Response(
+        HTMLBuilder.history(_db),
+        mimetype="text/html"
+    )
 
-    @application.get("/scan")
-    def scan_page():
-        sp = request.args.get("path", _CFG["scan_path"] or str(BASE_DIR))
-        scanned = _scanner.scan_project(sp)
-        r = {
-            "total": len(scanned),
-            "ai":    sum(1 for f in scanned if f["is_ai_agent"]),
-            "sc":    sum(1 for f in scanned if f["is_script"]),
-            "mn":    sum(1 for f in scanned if f["is_main_file"]),
-        }
-        return _html(_HTMLBuilder.scan_done(r))
+@application.get("/scan")
+def scan_page():
+    """Trigger a fresh project scan."""
+    sp = request.args.get("path", SCAN_PATH)
+    scanned = _scanner.scan_project(sp)
+    result = {
+        "total": len(scanned),
+        "ai": sum(1 for f in scanned if f["is_ai_agent"]),
+        "sc": sum(1 for f in scanned if f["is_script"]),
+        "mn": sum(1 for f in scanned if f["is_main_file"]),
+    }
+    return Response(
+        HTMLBuilder.scan_done(result),
+        mimetype="text/html"
+    )
 
-    @application.get("/reset")
-    def reset_page():
-        for t in ("detected_files","token_usage","request_usage","resource_usage"):
-            _db.execute(f"DELETE FROM {t}")
-        return _html(_HTMLBuilder.reset_done())
+@application.get("/reset")
+def reset_page():
+    """Clear all DB tables and in-memory state."""
+    _db.execute("DELETE FROM detected_files")
+    _db.execute("DELETE FROM token_usage")
+    _db.execute("DELETE FROM request_usage")
+    _db.execute("DELETE FROM resource_usage")
+
+    _monitor.metrics = {
+        "tokens": defaultdict(lambda: {"per_min": 0, "per_hour": 0, "per_day": 0}),
+        "requests": defaultdict(lambda: {"per_min": 0, "per_hour": 0, "per_day": 0}),
+        "resources": {},
+        "system": {},
+    }
+    _monitor._tok_log.clear()
+    _monitor._req_log.clear()
+
+    return Response(
+        HTMLBuilder.reset_done(),
+        mimetype="text/html"
+    )
 
 # ══════════════════════════════════════════════════════════════
 # ERROR HANDLERS
