@@ -17,38 +17,44 @@ from unittest.mock import MagicMock
 # ══════════════════════════════════════════════════════════════
 
 def _stub_agent_monitor() -> None:
-    """Register a lightweight stub for agent_monitor."""
+    """Register a lightweight stub for agent_monitor with ALL required attributes."""
     if "agent_monitor" in sys.modules:
         return
     mod = types.ModuleType("agent_monitor")
-    mod.__file__ = "<test-stub>"
 
-    # Classes (app.py checks these with getattr — None is OK)
-    mod.MetricsDB       = None
-    mod.ProjectScanner  = None
-    mod.ResourceMonitor = None
-    mod.HTMLBuilder     = None
+    # Create proper mocks for all classes
+    mod.MetricsDB = MagicMock()
+    mod.ProjectScanner = MagicMock()
+    mod.ResourceMonitor = MagicMock()
 
-    # Constants
-    mod.ACTIVE_CONFIG   = {"name": "test-model", "provider": "test"}
-    mod.MODEL_REGISTRY  = {}
-    mod.ACTIVE_PROVIDER = "test"
-    mod.ACTIVE_MODEL    = "test-model"
-    mod.AI_PROVIDER     = "test"
-    mod.AI_MODEL        = "test-model"
+    # Create a proper HTMLBuilder mock
+    mod.HTMLBuilder = MagicMock()
 
-    # scanner_bp is optional; app.py only registers if it's a Blueprint
-    bp = MagicMock()
-    bp.name = "scanner"
-    mod.scanner_bp = bp
+    # Initialize ACTIVE_CONFIG with proper limits
+    mod.ACTIVE_CONFIG = {
+        "name": "gemini-2.5-flash",
+        "provider": "google",
+        "tpm": 1000000,  # Tokens per minute
+        "tph": 60000000, # Tokens per hour
+        "tpd": 1000000000, # Tokens per day
+        "rpm": 10000,    # Requests per minute
+        "rph": 600000,   # Requests per hour
+        "rpd": 10000000, # Requests per day
+        "cost_in": 0.00015,
+        "cost_out": 0.00060,
+        "ctx": 1048576
+    }
+
+    # Initialize other required variables
+    mod.MODEL_REGISTRY = {}
+    mod.ACTIVE_PROVIDER = "google"
+    mod.ACTIVE_MODEL = "gemini-2.5-flash"
+    mod.AI_PROVIDER = "google"
+    mod.AI_MODEL = "gemini-2.5-flash"
 
     sys.modules["agent_monitor"] = mod
 
-
-_stub_agent_monitor()
-
 from app import application  # noqa: E402  (import after stub)
-
 
 # ══════════════════════════════════════════════════════════════
 # HOME
@@ -235,6 +241,12 @@ def test_metrics_blocked_without_token():
 # MONITOR STATUS
 # ══════════════════════════════════════════════════════════════
 
+def setup_function(function):
+    """Ensure the ResourceMonitor is running before each test."""
+    from app import _monitor
+    if not _monitor.monitoring:
+        _monitor.start_monitoring()
+        
 def test_monitor_status_no_token_configured():
     """MONITOR_TOKEN empty → POST accepted."""
     import app as flask_app

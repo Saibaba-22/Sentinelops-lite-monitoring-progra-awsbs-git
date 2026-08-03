@@ -738,41 +738,44 @@ class ResourceMonitor:
                 f"req/day={total_req:,}"
             )
 
-    def _sim(self):
-        """
-        Simulate token/request usage for detected AI agents.
-        Runs every cycle — guaranteed data on dashboard.
-        Replace with real API interception in production.
-        """
-        files = self.db.execute(
-            "SELECT file_path FROM detected_files "
-            "WHERE is_ai_agent=1",
-            fetch=True
+def _sim(self):
+    """
+    Simulate token/request usage for detected AI agents.
+    Runs every cycle — guaranteed data on dashboard.
+    """
+    files = self.db.execute(
+        "SELECT file_path FROM detected_files "
+        "WHERE is_ai_agent=1",
+        fetch=True
+    )
+    if not files:
+        return
+
+    now = time.time()
+    cfg = ACTIVE_CONFIG  # Use the active config
+
+    for row in files:
+        fp = row['file_path']
+
+        # Generate realistic random values based on limits
+        tok = random.randint(100, min(5000, cfg['tpm']//10))
+        req = random.randint(1, min(5, cfg['rpm']//10))
+
+        self._tok_log[fp].append((now, tok))
+        self._req_log[fp].append((now, req))
+
+        self.db.execute(
+            "INSERT INTO token_usage "
+            "(file_path,tokens_used,token_type) "
+            "VALUES (?,?,?)",
+            (fp, tok, 'total')
         )
-        if not files:
-            return
-
-        now = time.time()
-        for row in files:
-            fp  = row['file_path']
-            tok = random.randint(100, 2_000)
-            req = random.randint(1, 3)
-
-            self._tok_log[fp].append((now, tok))
-            self._req_log[fp].append((now, req))
-
-            self.db.execute(
-                "INSERT INTO token_usage "
-                "(file_path,tokens_used,token_type) "
-                "VALUES (?,?,?)",
-                (fp, tok, 'total')
-            )
-            self.db.execute(
-                "INSERT INTO request_usage "
-                "(file_path,request_count,status_code) "
-                "VALUES (?,?,?)",
-                (fp, req, 200)
-            )
+        self.db.execute(
+            "INSERT INTO request_usage "
+            "(file_path,request_count,status_code) "
+            "VALUES (?,?,?)",
+            (fp, req, 200)
+        )
 
     def get_all_metrics(self):
         """
