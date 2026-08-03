@@ -448,6 +448,74 @@ def _exc(e):
     application.logger.exception(f"Unhandled: {e}")
     return jsonify({"error": "Internal server error", "status": 500}), 500
 
+@application.get("/nuclear-reset")
+def nuclear_reset():
+    """Complete system reset with forced scan"""
+    # Delete database
+    if os.path.exists("agent_monitor.db"):
+        os.remove("agent_monitor.db")
+
+    # Reinitialize everything
+    global _db, _scanner, _monitor, _files
+    _db = MetricsDB()
+    _scanner = ProjectScanner(_db)
+    _monitor = ResourceMonitor(_db)
+    _monitor.start_monitoring()
+
+    # Force scan with error handling
+    try:
+        _files = _scanner.scan_project(SCAN_PATH)
+        return jsonify({
+            "status": "success",
+            "files_found": len(_files),
+            "ai_agents": sum(1 for f in _files if f['is_ai_agent'])
+        })
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "message": str(e),
+            "scan_path": SCAN_PATH
+        }), 500
+
+@application.get("/scan-results")
+def scan_results():
+    """Show scan results"""
+    files = _db.execute("SELECT * FROM detected_files LIMIT 10", fetch=True)
+    return jsonify({
+        "total_files": len(files),
+        "sample_files": [dict(f) for f in files],
+        "scan_path": SCAN_PATH
+    })
+
+@application.get("/debug")
+def debug_page():
+    import traceback
+    info = {
+        "_db":          str(_db),
+        "_scanner":     str(_scanner),
+        "_monitor":     str(_monitor),
+        "_HTMLBuilder": str(_HTMLBuilder),
+        "_IMPORT_ERROR": _IMPORT_ERROR,
+        "BASE_DIR":     str(BASE_DIR),
+        "SCAN_PATH":    _CFG["scan_path"],
+        "cwd":          os.getcwd(),
+        "AI_MODEL":     _CFG["ai_model"],
+        "AI_PROVIDER":  _CFG["ai_provider"],
+        "files_in_base": os.listdir(BASE_DIR)[:30],
+    }
+    try:
+        if _db:
+            rows = _db.execute("SELECT COUNT(*) as c FROM detected_files", fetch=True)
+            info["db_file_count"] = dict(rows[0])["c"] if rows else 0
+    except Exception as e:
+        info["db_error"] = str(e)
+    try:
+        if _scanner:
+            files = _scanner.scan_project(BASE_DIR if not _CFG["scan_path"] else _CFG["scan_path"])
+            info["scan_result_count"] = len(files)
+    except Exception as e:
+        info["scan_error"] = traceback.format_exc()
+    return jsonify(info), 200
 
 if __name__ == "__main__":
     application.run(
