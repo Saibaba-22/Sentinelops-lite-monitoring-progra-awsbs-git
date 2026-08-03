@@ -1,7 +1,4 @@
-"""
-app.py — SentinelOps-Lite
-Merged dashboard + CI contract endpoints. Passes test_app.py.
-"""
+"""app.py — SentinelOps-Lite"""
 from __future__ import annotations
 
 import os
@@ -19,17 +16,12 @@ from prometheus_client import (
     Counter, Gauge, Histogram, REGISTRY,
 )
 
-# ══════════════════════════════════════════════════════════════
-# PATH
-# ══════════════════════════════════════════════════════════════
 BASE_DIR = Path(__file__).resolve().parent
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
-# ══════════════════════════════════════════════════════════════
-# _CFG — env read ONCE at import. Tests patch this dict.
-# ══════════════════════════════════════════════════════════════
 _START_TIME = time.time()
+_IMPORT_ERROR = None
 
 _CFG = {
     "app_version":   os.environ.get("APP_VERSION",   "1.0.0"),
@@ -46,14 +38,8 @@ _CFG = {
     "scan_path":     os.environ.get("SCAN_PATH",     ""),
 }
 
-# ══════════════════════════════════════════════════════════════
-# FLASK
-# ══════════════════════════════════════════════════════════════
 application = Flask(__name__)
 
-# ══════════════════════════════════════════════════════════════
-# OPTIONAL agent_monitor
-# ══════════════════════════════════════════════════════════════
 _MetricsDB = _ProjectScanner = _ResourceMonitor = None
 _HTMLBuilder = None
 _ACTIVE_CONFIG = {"name": _CFG["ai_model"], "provider": _CFG["ai_provider"]}
@@ -71,9 +57,10 @@ try:
     _bp = getattr(_am, "scanner_bp", None)
     if isinstance(_bp, Blueprint):
         application.register_blueprint(_bp)
-    print("[app] ✅ agent_monitor imported")
+    print("[app] agent_monitor imported")
 except Exception as e:
-    print(f"[app] ⚠ agent_monitor not fully available: {e}")
+    _IMPORT_ERROR = f"{type(e).__name__}: {e}"
+    print(f"[app] agent_monitor not fully available: {_IMPORT_ERROR}")
 
 if _MetricsDB and _ProjectScanner and _ResourceMonitor:
     try:
@@ -86,13 +73,11 @@ if _MetricsDB and _ProjectScanner and _ResourceMonitor:
             else str(BASE_DIR)
         )
         _scanner.scan_project(sp)
-        print(f"[app] ✅ Components ready — scan={sp}")
+        print(f"[app] components ready, scan={sp}")
     except Exception as e:
-        print(f"[app] ⚠ Component init failed: {e}")
+        print(f"[app] component init failed: {e}")
 
-# ══════════════════════════════════════════════════════════════
-# PROMETHEUS METRICS  (safe re-registration)
-# ══════════════════════════════════════════════════════════════
+
 def _safe(cls, name, desc, labels=None):
     try:
         return cls(name, desc, labels) if labels else cls(name, desc)
@@ -102,6 +87,7 @@ def _safe(cls, name, desc, labels=None):
                 return c
         raise
 
+
 app_requests_total = _safe(
     Counter, "app_requests_total",
     "Total HTTP requests", ["method", "endpoint", "status"]
@@ -110,29 +96,28 @@ app_request_duration_seconds = _safe(
     Histogram, "app_request_duration_seconds",
     "Request duration seconds", ["method", "endpoint"]
 )
-app_errors_total     = _safe(Counter, "app_errors_total",     "5xx errors")
+app_errors_total = _safe(Counter, "app_errors_total", "5xx errors")
 app_exceptions_total = _safe(Counter, "app_exceptions_total", "Unhandled excs")
 http_status_codes_total = _safe(
     Counter, "http_status_codes_total", "HTTP status counts", ["code"]
 )
-
 python_process_cpu_percent = _safe(
     Gauge, "python_process_cpu_percent", "Process CPU %"
 )
 python_process_memory_mb = _safe(
     Gauge, "python_process_memory_mb", "Process memory MB"
 )
-
-agent_status         = _safe(Gauge, "agent_status",         "1=up 0=down")
+agent_status = _safe(Gauge, "agent_status", "1=up 0=down")
 agent_uptime_seconds = _safe(Gauge, "agent_uptime_seconds", "Uptime s")
-agent_cpu_percent    = _safe(Gauge, "agent_cpu_percent",    "Agent CPU %")
-agent_memory_mb      = _safe(Gauge, "agent_memory_mb",      "Agent mem MB")
+agent_cpu_percent = _safe(Gauge, "agent_cpu_percent", "Agent CPU %")
+agent_memory_mb = _safe(Gauge, "agent_memory_mb", "Agent mem MB")
 
 APP_STATS = {
     "total_requests": 0, "success_requests": 0, "failed_requests": 0,
     "total_request_time": 0.0, "exceptions": 0,
 }
 APP_STATS_LOCK = threading.Lock()
+
 
 def _update_process_metrics():
     try:
@@ -148,20 +133,21 @@ def _update_process_metrics():
     except Exception:
         pass
 
+
 def _metrics_loop(interval=15):
     while True:
         _update_process_metrics()
         time.sleep(interval)
 
+
 _update_process_metrics()
 threading.Thread(target=_metrics_loop, args=(15,), daemon=True).start()
 
-# ══════════════════════════════════════════════════════════════
-# HOOKS
-# ══════════════════════════════════════════════════════════════
+
 @application.before_request
 def _t_start():
     request._start_time = time.time()
+
 
 @application.after_request
 def _t_end(resp):
@@ -187,20 +173,19 @@ def _t_end(resp):
         pass
     return resp
 
-# ══════════════════════════════════════════════════════════════
-# HELPERS
-# ══════════════════════════════════════════════════════════════
+
 def _uptime():
     return max(0.0, time.time() - _START_TIME)
+
 
 def _system_dict():
     try:
         vm = psutil.virtual_memory()
-        p  = psutil.Process(os.getpid())
+        p = psutil.Process(os.getpid())
         return {
             "cpu_usage_percent":   psutil.cpu_percent(interval=None),
             "memory_total_mb":     round(vm.total / 1048576, 2),
-            "memory_used_mb":      round(vm.used  / 1048576, 2),
+            "memory_used_mb":      round(vm.used / 1048576, 2),
             "memory_percent":      vm.percent,
             "process_cpu_percent": p.cpu_percent(interval=None),
             "process_memory_mb":   round(p.memory_info().rss / 1048576, 2),
@@ -213,30 +198,30 @@ def _system_dict():
             "error": str(e),
         }
 
+
 def _check_bearer(cfg_token):
     if not cfg_token:
         return True
     auth = request.headers.get("Authorization", "")
     return auth.startswith("Bearer ") and auth[7:].strip() == cfg_token
 
+
 def _check_monitor_header(cfg_token):
     if not cfg_token:
         return True
     return request.headers.get("X-Monitor-Token", "") == cfg_token
 
-# ══════════════════════════════════════════════════════════════
-# CORE ROUTES
-# ══════════════════════════════════════════════════════════════
+
 @application.get("/")
 def home():
     try:
         return render_template("index.html")
     except Exception:
         return Response(
-            "<html><body><h1>SentinelOps-Lite</h1>"
-            "<p>Dashboard active.</p></body></html>",
+            "<html><body><h1>SentinelOps-Lite</h1></body></html>",
             content_type="text/html; charset=utf-8"
         )
+
 
 @application.get("/health")
 def health():
@@ -256,6 +241,7 @@ def health():
         "version":        _CFG["app_version"],
     }), http
 
+
 @application.get("/api")
 def api_root():
     return jsonify({
@@ -265,11 +251,12 @@ def api_root():
         "build":   _CFG["build_number"],
     }), 200
 
+
 @application.get("/api/status")
 def api_status():
     return jsonify({
         "application": {
-            "name":   "SentinelOps-Lite",
+            "name": "SentinelOps-Lite",
             "status": "running",
             "uptime": _uptime(),
         },
@@ -288,6 +275,7 @@ def api_status():
         },
     }), 200
 
+
 @application.get("/agent/status")
 def agent_status_route():
     return jsonify({
@@ -297,12 +285,14 @@ def agent_status_route():
         "uptime_seconds": _uptime(),
     }), 200
 
+
 @application.get("/metrics", endpoint="app_prometheus_metrics")
 def prom_metrics():
     if _CFG["metrics_token"] and not _check_bearer(_CFG["metrics_token"]):
         return Response("Unauthorized", status=401, content_type="text/plain")
     _update_process_metrics()
     return Response(generate_latest(), content_type=CONTENT_TYPE_LATEST)
+
 
 @application.post("/monitor/status")
 def monitor_status():
@@ -311,118 +301,141 @@ def monitor_status():
     _ = request.get_json(silent=True) or {}
     return jsonify({"ok": True, "timestamp": time.time()}), 200
 
-# ══════════════════════════════════════════════════════════════
-# DASHBOARD ROUTES (only when real agent_monitor available)
-# ══════════════════════════════════════════════════════════════
+
 def _get_data():
     if _db and _monitor:
-        rows = _db.execute(
-            "SELECT * FROM detected_files ORDER BY is_ai_agent DESC, "
-            "is_script DESC, is_main_file DESC, file_name", fetch=True
-        )
-        return [dict(r) for r in rows], _monitor.get_all_metrics()
+        try:
+            rows = _db.execute(
+                "SELECT * FROM detected_files ORDER BY is_ai_agent DESC, "
+                "is_script DESC, is_main_file DESC, file_name", fetch=True
+            )
+            return [dict(r) for r in rows], _monitor.get_all_metrics()
+        except Exception as e:
+            print(f"[app] _get_data error: {e}")
     return [], {"system": {}, "tokens": {}, "requests": {}, "resources": {}}
+
 
 def _html(body):
     return Response(body, status=200, content_type="text/html; charset=utf-8")
 
-if _HTMLBuilder is not None:
-@application.get("/dashboard")
-def monitor_dashboard():
-    """Full overview — files, system resources, token/request usage."""
-    files, metrics = _get_data()
-    return Response(
-        HTMLBuilder.dashboard(files, metrics),
-        mimetype="text/html"
+
+def _err_page(page, extra=""):
+    return _html(
+        "<html><body style='font-family:sans-serif;padding:40px;"
+        "background:#0f172a;color:#e2e8f0'>"
+        f"<h1>{page} unavailable</h1>"
+        f"<pre style='background:#1e293b;padding:16px;color:#f87171'>"
+        f"_HTMLBuilder = {_HTMLBuilder}\n"
+        f"_db          = {_db}\n"
+        f"_scanner     = {_scanner}\n"
+        f"_monitor     = {_monitor}\n"
+        f"import error: {_IMPORT_ERROR}\n"
+        f"{extra}"
+        "</pre>"
+        "<p><a href='/' style='color:#60a5fa'>Home</a></p>"
+        "</body></html>"
     )
+
+
+@application.get("/dashboard")
+def dashboard_page():
+    if _HTMLBuilder is None:
+        return _err_page("Dashboard")
+    try:
+        f, m = _get_data()
+        return _html(_HTMLBuilder.dashboard(f, m))
+    except Exception as e:
+        return _err_page("Dashboard", f"Runtime: {e}")
+
 
 @application.get("/files")
 def files_page():
-    """All detected project files."""
-    files, _ = _get_data()
-    return Response(
-        HTMLBuilder.files(files),
-        mimetype="text/html"
-    )
+    if _HTMLBuilder is None:
+        return _err_page("Files")
+    try:
+        f, _ = _get_data()
+        return _html(_HTMLBuilder.files(f))
+    except Exception as e:
+        return _err_page("Files", f"Runtime: {e}")
+
 
 @application.get("/agents")
 def agents_page():
-    """Per-agent token, request, and resource metrics."""
-    files, metrics = _get_data()
-    return Response(
-        HTMLBuilder.agents(files, metrics),
-        mimetype="text/html"
-    )
+    if _HTMLBuilder is None:
+        return _err_page("Agents")
+    try:
+        f, m = _get_data()
+        return _html(_HTMLBuilder.agents(f, m))
+    except Exception as e:
+        return _err_page("Agents", f"Runtime: {e}")
+
 
 @application.get("/monitor")
 def monitor_page():
-    """Token/request usage vs limits + estimated cost."""
-    _, metrics = _get_data()
-    return Response(
-        HTMLBuilder.monitor(metrics),
-        mimetype="text/html"
-    )
+    if _HTMLBuilder is None:
+        return _err_page("Monitor")
+    try:
+        _, m = _get_data()
+        return _html(_HTMLBuilder.monitor(m))
+    except Exception as e:
+        return _err_page("Monitor", f"Runtime: {e}")
+
 
 @application.get("/model")
 def model_page():
-    """Active model config, rate limits, pricing."""
-    return Response(
-        HTMLBuilder.model(),
-        mimetype="text/html"
-    )
+    if _HTMLBuilder is None:
+        return _err_page("Model")
+    try:
+        return _html(_HTMLBuilder.model())
+    except Exception as e:
+        return _err_page("Model", f"Runtime: {e}")
+
 
 @application.get("/history")
 def history_page():
-    """Last 50 scan history records."""
-    return Response(
-        HTMLBuilder.history(_db),
-        mimetype="text/html"
-    )
+    if _HTMLBuilder is None or _db is None:
+        return _err_page("History")
+    try:
+        return _html(_HTMLBuilder.history(_db))
+    except Exception as e:
+        return _err_page("History", f"Runtime: {e}")
+
 
 @application.get("/scan")
 def scan_page():
-    """Trigger a fresh project scan."""
-    sp = request.args.get("path", SCAN_PATH)
-    scanned = _scanner.scan_project(sp)
-    result = {
-        "total": len(scanned),
-        "ai": sum(1 for f in scanned if f["is_ai_agent"]),
-        "sc": sum(1 for f in scanned if f["is_script"]),
-        "mn": sum(1 for f in scanned if f["is_main_file"]),
-    }
-    return Response(
-        HTMLBuilder.scan_done(result),
-        mimetype="text/html"
-    )
+    if _HTMLBuilder is None or _scanner is None:
+        return _err_page("Scan")
+    try:
+        sp = request.args.get("path", _CFG["scan_path"] or str(BASE_DIR))
+        scanned = _scanner.scan_project(sp)
+        r = {
+            "total": len(scanned),
+            "ai":    sum(1 for f in scanned if f["is_ai_agent"]),
+            "sc":    sum(1 for f in scanned if f["is_script"]),
+            "mn":    sum(1 for f in scanned if f["is_main_file"]),
+        }
+        return _html(_HTMLBuilder.scan_done(r))
+    except Exception as e:
+        return _err_page("Scan", f"Runtime: {e}")
+
 
 @application.get("/reset")
 def reset_page():
-    """Clear all DB tables and in-memory state."""
-    _db.execute("DELETE FROM detected_files")
-    _db.execute("DELETE FROM token_usage")
-    _db.execute("DELETE FROM request_usage")
-    _db.execute("DELETE FROM resource_usage")
+    if _HTMLBuilder is None or _db is None:
+        return _err_page("Reset")
+    try:
+        for t in ("detected_files", "token_usage",
+                  "request_usage", "resource_usage"):
+            _db.execute(f"DELETE FROM {t}")
+        return _html(_HTMLBuilder.reset_done())
+    except Exception as e:
+        return _err_page("Reset", f"Runtime: {e}")
 
-    _monitor.metrics = {
-        "tokens": defaultdict(lambda: {"per_min": 0, "per_hour": 0, "per_day": 0}),
-        "requests": defaultdict(lambda: {"per_min": 0, "per_hour": 0, "per_day": 0}),
-        "resources": {},
-        "system": {},
-    }
-    _monitor._tok_log.clear()
-    _monitor._req_log.clear()
 
-    return Response(
-        HTMLBuilder.reset_done(),
-        mimetype="text/html"
-    )
-
-# ══════════════════════════════════════════════════════════════
-# ERROR HANDLERS
-# ══════════════════════════════════════════════════════════════
 @application.errorhandler(404)
 def _404(e):
     return jsonify({"error": "Not found", "status": 404}), 404
+
 
 @application.errorhandler(Exception)
 def _exc(e):
@@ -435,9 +448,7 @@ def _exc(e):
     application.logger.exception(f"Unhandled: {e}")
     return jsonify({"error": "Internal server error", "status": 500}), 500
 
-# ══════════════════════════════════════════════════════════════
-# ENTRY
-# ══════════════════════════════════════════════════════════════
+
 if __name__ == "__main__":
     application.run(
         host="0.0.0.0",
