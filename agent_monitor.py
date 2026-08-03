@@ -275,10 +275,17 @@ ACTIVE_CONFIG: dict = _build_active_config()
 # DATABASE
 # ============================================================
 class MetricsDB:
-    def __init__(self, db_path="agent_monitor.db"):
-        self.db_path = db_path
-        self.lock    = threading.Lock()
-        self._init_db()
+def __init__(self, db_path=None):
+    if db_path is None:
+        # Absolute path — same file for all workers
+        db_path = os.environ.get(
+            "METRICS_DB_PATH",
+            "/tmp/agent_monitor.db"
+        )
+    self.db_path = db_path
+    print(f"[MetricsDB] using {self.db_path}")
+    self.lock    = threading.Lock()
+    self._init_db()
 
     def _conn(self):
         c = sqlite3.connect(self.db_path, check_same_thread=False)
