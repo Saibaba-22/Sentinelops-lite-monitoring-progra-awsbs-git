@@ -89,6 +89,7 @@ from agent_monitor import (
     ResourceMonitor,
     HTMLBuilder,
     ACTIVE_CONFIG,
+    MODEL_REGISTRY,
 )
 
 # ── Initialise components ─────────────────────────────────────
@@ -394,6 +395,11 @@ def reset_page():
 # Unchanged from your original app.py — only the scanner
 # source changed (now uses _db + _monitor instead of old scanner).
 # ══════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════
+# BLOCK 12 — AGENT MONITOR API ROUTES  (JSON)
+# ──────────────────────────────────────────────────────────────
+# All return JSON for frontend / external API consumers.
+# ══════════════════════════════════════════════════════════════
 
 # ── /api/metrics/system ──────────────────────────────────────
 @application.route("/api/metrics/system", methods=["GET"])
@@ -432,7 +438,9 @@ def get_request_metrics():
         rph  = sum(v.get("per_hour", 0) for v in reqs.values())
         rpd  = sum(v.get("per_day",  0) for v in reqs.values())
         return jsonify({
-            "rpm": rpm, "rph": rph, "rpd": rpd,
+            "rpm":       rpm,
+            "rph":       rph,
+            "rpd":       rpd,
             "timestamp": time.time()
         }), 200
     except Exception as e:
@@ -483,8 +491,8 @@ def get_agent(agent_id):
 def get_requests():
     """Recent request_usage rows, paginated by ?limit=."""
     try:
-        limit = request.args.get("limit", 20, type=int)
-        rows  = _db.execute(
+        limit            = request.args.get("limit", 20, type=int)
+        rows             = _db.execute(
             "SELECT * FROM request_usage "
             "ORDER BY timestamp DESC LIMIT ?",
             (limit,), fetch=True
@@ -502,13 +510,16 @@ def get_requests():
 
 
 # ── /api/providers ───────────────────────────────────────────
+# FIX: MODEL_REGISTRY imported at top — not inside function
 @application.route("/api/providers", methods=["GET"])
 def get_providers():
-    """Provider list built from ACTIVE_CONFIG."""
+    """Provider list built from MODEL_REGISTRY."""
     try:
-        from agent_monitor import MODEL_REGISTRY
         providers = [
-            {"name": p, "models": list(cfg["models"].keys())}
+            {
+                "name":   p,
+                "models": list(cfg["models"].keys())
+            }
             for p, cfg in MODEL_REGISTRY.items()
         ]
         return jsonify({
@@ -549,7 +560,8 @@ def get_report():
 @application.route("/api/status", methods=["GET"])
 def get_status():
     """
-    Lightweight running summary — matches original JSON output:
+    Lightweight running summary.
+    Original JSON shape:
     {"active_agents":0,"agents_count":0,"status":"running",
      "timestamp":...,"total_requests":0}
     """
@@ -577,17 +589,19 @@ def get_status():
 # ── /api/refresh  (POST) ─────────────────────────────────────
 @application.route("/api/refresh", methods=["POST"])
 def refresh_metrics():
-    """Re-read metrics and return snapshot."""
+    """
+    Re-read metrics and return snapshot.
+    FIX: Returns empty data instead of 400 when no agents found.
+    """
     try:
         files, metrics = _get_data()
-        ai_files = [f for f in files if f.get("is_ai_agent")]
-        if not ai_files:
-            return jsonify({"error": "No agents to refresh"}), 400
+        ai_files       = [f for f in files if f.get("is_ai_agent")]
         return jsonify({
             "success":        True,
-            "system_metrics": metrics.get("system",    {}),
-            "token_metrics":  metrics.get("tokens",    {}),
-            "req_metrics":    metrics.get("requests",  {}),
+            "agents_found":   len(ai_files),
+            "system_metrics": metrics.get("system",   {}),
+            "token_metrics":  metrics.get("tokens",   {}),
+            "req_metrics":    metrics.get("requests", {}),
             "timestamp":      time.time()
         }), 200
     except Exception as e:
@@ -601,10 +615,10 @@ def refresh_metrics():
 def clear_data():
     """
     Wipes all DB tables and in-memory monitor state.
-    Same as /reset but returns JSON (for API consumers).
+    Same as /reset but returns JSON for API consumers.
+    FIX: defaultdict imported at top of file — not inside function.
     """
     try:
-        from collections import defaultdict
         with _SCANNER_LOCK:
             _db.execute("DELETE FROM detected_files")
             _db.execute("DELETE FROM token_usage")
@@ -634,9 +648,7 @@ def clear_data():
 
 
 # ══════════════════════════════════════════════════════════════
-# BLOCK 11 — ERROR HANDLERS
-# ──────────────────────────────────────────────────────────────
-# Unchanged from your original app.py.
+# BLOCK 13 — ERROR HANDLERS
 # ══════════════════════════════════════════════════════════════
 
 @application.errorhandler(Exception)
@@ -659,52 +671,11 @@ def not_found(error):
 
 
 # ══════════════════════════════════════════════════════════════
-# BLOCK 12 — WSGI / __main__ ENTRY POINT
+# BLOCK 14 — WSGI / __main__ ENTRY POINT
 # ──────────────────────────────────────────────────────────────
-# Unchanged from your original app.py.
+# Gunicorn imports `application` directly in production.
+# This block only runs for local dev: python app.py
 # ══════════════════════════════════════════════════════════════
-
-
-
-
-
-
-@application.get("/debug/monitor")
-def debug_monitor():
-    files = _db.execute(
-        "SELECT file_path, file_name, is_ai_agent "
-        "FROM detected_files WHERE is_ai_agent=1",
-        fetch=True
-    )
-    metrics = _monitor.get_all_metrics()
-    
-    # Check DB directly for token records
-    tok_db = _db.execute(
-        "SELECT COUNT(*) as cnt, SUM(tokens_used) as total "
-        "FROM token_usage",
-        fetch=True
-    )
-    req_db = _db.execute(
-        "SELECT COUNT(*) as cnt FROM request_usage",
-        fetch=True
-    )
-    
-    return jsonify({
-        "monitoring_active":   _monitor.monitoring,
-        "ai_files_count":      len(files),
-        "tok_log_keys":        list(_monitor._tok_log.keys()),
-        "req_log_keys":        list(_monitor._req_log.keys()),
-        "tok_log_total_entries": sum(
-            len(v) for v in _monitor._tok_log.values()
-        ),
-        "tokens_in_db":        dict(tok_db[0]) if tok_db else {},
-        "requests_in_db":      dict(req_db[0]) if req_db else {},
-        "metrics_tokens":      metrics.get("tokens",   {}),
-        "metrics_requests":    metrics.get("requests", {}),
-        "system_ok":           bool(metrics.get("system",{})),
-    })
-
-
 
 if __name__ == "__main__":
     port  = int(os.environ.get("PORT", "5000"))
