@@ -2,10 +2,11 @@
 """
 agent_monitor.py
 =================
-Pure classes only — no HTTP server, no Flask.
-Imported by app.py which owns all routing.
+Pure classes only — no Flask, no Prometheus, no HTTP server.
+Imported by app.py which owns all routing and Prometheus metrics.
 """
 from __future__ import annotations
+
 import os
 import sys
 import time
@@ -18,25 +19,11 @@ import datetime
 import random
 from pathlib import Path
 from collections import defaultdict
-from prometheus_client import Gauge, Counter, Histogram
-import requests
 
 
 # ══════════════════════════════════════════════════════════════
 # ENVIRONMENT & MODEL CONFIGURATION
-# ──────────────────────────────────────────────────────────────
-# All values read directly from environment variables.
-# Set these in:
-#   GitHub → Settings → Secrets and Variables → Actions
-#
-# Secrets  : GEMINI_API_KEY, OPENAI_API_KEY, etc.
-# Variables: AI_MODEL, AI_PROVIDER
-#
-# These flow to Beanstalk via pipeline.yml env_map in
-# the "Render AWS ECS Dockerrun manifest" step.
 # ══════════════════════════════════════════════════════════════
-
-# ── API Keys (from GitHub Secrets) ───────────────────────────
 GEMINI_API_KEY    = os.environ.get("GEMINI_API_KEY",    "")
 GOOGLE_API_KEY    = os.environ.get("GOOGLE_API_KEY",    "") or GEMINI_API_KEY
 OPENAI_API_KEY    = os.environ.get("OPENAI_API_KEY",    "")
@@ -45,12 +32,9 @@ GROQ_API_KEY      = os.environ.get("GROQ_API_KEY",      "")
 MISTRAL_API_KEY   = os.environ.get("MISTRAL_API_KEY",   "")
 OLLAMA_BASE_URL   = os.environ.get("OLLAMA_BASE_URL",   "http://localhost:11434")
 
-# ── AI Model & Provider (from GitHub Variables) ───────────────
 AI_MODEL    = os.environ.get("AI_MODEL",    "gemini-2.5-flash")
 AI_PROVIDER = os.environ.get("AI_PROVIDER", "gemini")
 
-# ── Provider name normalisation ───────────────────────────────
-# Maps "gemini" → "google" etc. for MODEL_REGISTRY lookup
 _PROVIDER_MAP = {
     "gemini":    "google",
     "google":    "google",
@@ -67,8 +51,6 @@ ACTIVE_PROVIDER = _PROVIDER_MAP.get(
 )
 ACTIVE_MODEL = AI_MODEL.strip()
 
-# ── API key lookup by provider ────────────────────────────────
-# Maps each provider to its key from environment
 _PROVIDER_KEYS = {
     "google":    GOOGLE_API_KEY,
     "openai":    OPENAI_API_KEY,
@@ -78,67 +60,56 @@ _PROVIDER_KEYS = {
     "ollama":    "local",
 }
 
-# Active API key for the current provider
 ACTIVE_API_KEY = _PROVIDER_KEYS.get(ACTIVE_PROVIDER, "")
 
-# ── Startup log ───────────────────────────────────────────────
-_key_status = "✅ SET" if ACTIVE_API_KEY and ACTIVE_API_KEY != "local" else "❌ MISSING"
-print(f"[monitor] Provider : {AI_PROVIDER} → {ACTIVE_PROVIDER}")
+_key_status = "SET" if ACTIVE_API_KEY and ACTIVE_API_KEY != "local" else "MISSING"
+print(f"[monitor] Provider : {AI_PROVIDER} -> {ACTIVE_PROVIDER}")
 print(f"[monitor] Model    : {ACTIVE_MODEL}")
 print(f"[monitor] API Key  : {_key_status}")
 
 
 # ══════════════════════════════════════════════════════════════
 # MODEL REGISTRY
-# ──────────────────────────────────────────────────────────────
-# Single source of truth for all model limits and costs.
-# api_key is stored per provider using the env var values above.
 # ══════════════════════════════════════════════════════════════
-
 MODEL_REGISTRY = {
     "google": {
         "api_key":  GOOGLE_API_KEY,
         "base_url": "https://generativelanguage.googleapis.com/v1beta",
         "models": {
             "gemini-2.5-flash": {
-                "tpm_limit": 1_000_000,     "tph_limit": 60_000_000,
+                "tpm_limit": 1_000_000, "tph_limit": 60_000_000,
                 "tpd_limit": 1_000_000_000, "rpm_limit": 10_000,
-                "rph_limit": 600_000,       "rpd_limit": 10_000_000,
-                "cost_input_per_1k":  0.00015,
-                "cost_output_per_1k": 0.00060,
-                "context_window":     1_048_576,
+                "rph_limit": 600_000, "rpd_limit": 10_000_000,
+                "cost_input_per_1k": 0.00015, "cost_output_per_1k": 0.00060,
+                "context_window": 1_048_576,
             },
             "gemini-2.5-pro": {
-                "tpm_limit": 800_000,       "tph_limit": 48_000_000,
-                "tpd_limit": 800_000_000,   "rpm_limit": 2_000,
-                "rph_limit": 120_000,       "rpd_limit": 2_000_000,
-                "cost_input_per_1k":  0.00125,
-                "cost_output_per_1k": 0.01000,
-                "context_window":     1_048_576,
+                "tpm_limit": 800_000, "tph_limit": 48_000_000,
+                "tpd_limit": 800_000_000, "rpm_limit": 2_000,
+                "rph_limit": 120_000, "rpd_limit": 2_000_000,
+                "cost_input_per_1k": 0.00125, "cost_output_per_1k": 0.01000,
+                "context_window": 1_048_576,
             },
             "gemini-1.5-flash": {
-                "tpm_limit": 1_000_000,     "tph_limit": 60_000_000,
+                "tpm_limit": 1_000_000, "tph_limit": 60_000_000,
                 "tpd_limit": 1_000_000_000, "rpm_limit": 2_000,
-                "rph_limit": 120_000,       "rpd_limit": 2_000_000,
-                "cost_input_per_1k":  0.000075,
-                "cost_output_per_1k": 0.000300,
-                "context_window":     1_048_576,
+                "rph_limit": 120_000, "rpd_limit": 2_000_000,
+                "cost_input_per_1k": 0.000075, "cost_output_per_1k": 0.000300,
+                "context_window": 1_048_576,
             },
             "gemini-1.5-pro": {
-                "tpm_limit": 32_000,        "tph_limit": 1_920_000,
-                "tpd_limit": 32_000_000,    "rpm_limit": 1_000,
-                "rph_limit": 60_000,        "rpd_limit": 1_000_000,
-                "cost_input_per_1k":  0.00125,
-                "cost_output_per_1k": 0.00375,
-                "context_window":     1_048_576,
+                "tpm_limit": 32_000, "tph_limit": 1_920_000,
+                "tpd_limit": 32_000_000, "rpm_limit": 1_000,
+                "rph_limit": 60_000, "rpd_limit": 1_000_000,
+                "cost_input_per_1k": 0.00125, "cost_output_per_1k": 0.00375,
+                "context_window": 1_048_576,
             },
             "gemini-3.5-flash": {
-                "tpm_limit": 1_000_000,     "tph_limit": 60_000_000,
+                "tpm_limit": 1_000_000, "tph_limit": 60_000_000,
                 "tpd_limit": 1_000_000_000, "rpm_limit": 10_000,
-                "rph_limit": 600_000,       "rpd_limit": 10_000_000,
-                "cost_input_per_1k":  0.00015,
-                "cost_output_per_1k": 0.00060,
-                "context_window":     1_048_576,
+                "rph_limit": 600_000, "rpd_limit": 10_000_000,
+                "cost_input_per_1k": 0.00015, "cost_output_per_1k": 0.00060,
+                "context_window": 1_048_576,
             },
         },
     },
@@ -147,20 +118,18 @@ MODEL_REGISTRY = {
         "base_url": "https://api.openai.com/v1",
         "models": {
             "gpt-4o": {
-                "tpm_limit": 30_000,        "tph_limit": 1_800_000,
-                "tpd_limit": 30_000_000,    "rpm_limit": 500,
-                "rph_limit": 30_000,        "rpd_limit": 500_000,
-                "cost_input_per_1k":  0.005,
-                "cost_output_per_1k": 0.015,
-                "context_window":     128_000,
+                "tpm_limit": 30_000, "tph_limit": 1_800_000,
+                "tpd_limit": 30_000_000, "rpm_limit": 500,
+                "rph_limit": 30_000, "rpd_limit": 500_000,
+                "cost_input_per_1k": 0.005, "cost_output_per_1k": 0.015,
+                "context_window": 128_000,
             },
             "gpt-3.5-turbo": {
-                "tpm_limit": 90_000,        "tph_limit": 5_400_000,
-                "tpd_limit": 90_000_000,    "rpm_limit": 3_500,
-                "rph_limit": 210_000,       "rpd_limit": 3_500_000,
-                "cost_input_per_1k":  0.0005,
-                "cost_output_per_1k": 0.0015,
-                "context_window":     16_385,
+                "tpm_limit": 90_000, "tph_limit": 5_400_000,
+                "tpd_limit": 90_000_000, "rpm_limit": 3_500,
+                "rph_limit": 210_000, "rpd_limit": 3_500_000,
+                "cost_input_per_1k": 0.0005, "cost_output_per_1k": 0.0015,
+                "context_window": 16_385,
             },
         },
     },
@@ -169,12 +138,11 @@ MODEL_REGISTRY = {
         "base_url": "https://api.anthropic.com",
         "models": {
             "claude-3-5-sonnet-20241022": {
-                "tpm_limit": 80_000,        "tph_limit": 4_800_000,
-                "tpd_limit": 80_000_000,    "rpm_limit": 4_000,
-                "rph_limit": 240_000,       "rpd_limit": 4_000_000,
-                "cost_input_per_1k":  0.003,
-                "cost_output_per_1k": 0.015,
-                "context_window":     200_000,
+                "tpm_limit": 80_000, "tph_limit": 4_800_000,
+                "tpd_limit": 80_000_000, "rpm_limit": 4_000,
+                "rph_limit": 240_000, "rpd_limit": 4_000_000,
+                "cost_input_per_1k": 0.003, "cost_output_per_1k": 0.015,
+                "context_window": 200_000,
             },
         },
     },
@@ -183,12 +151,11 @@ MODEL_REGISTRY = {
         "base_url": "https://api.groq.com/openai/v1",
         "models": {
             "llama3-70b-8192": {
-                "tpm_limit": 6_000,         "tph_limit": 360_000,
-                "tpd_limit": 6_000_000,     "rpm_limit": 30,
-                "rph_limit": 1_800,         "rpd_limit": 30_000,
-                "cost_input_per_1k":  0.00059,
-                "cost_output_per_1k": 0.00079,
-                "context_window":     8_192,
+                "tpm_limit": 6_000, "tph_limit": 360_000,
+                "tpd_limit": 6_000_000, "rpm_limit": 30,
+                "rph_limit": 1_800, "rpd_limit": 30_000,
+                "cost_input_per_1k": 0.00059, "cost_output_per_1k": 0.00079,
+                "context_window": 8_192,
             },
         },
     },
@@ -197,12 +164,11 @@ MODEL_REGISTRY = {
         "base_url": "https://api.mistral.ai/v1",
         "models": {
             "mistral-large-latest": {
-                "tpm_limit": 500_000,       "tph_limit": 30_000_000,
-                "tpd_limit": 500_000_000,   "rpm_limit": 1_000,
-                "rph_limit": 60_000,        "rpd_limit": 1_000_000,
-                "cost_input_per_1k":  0.003,
-                "cost_output_per_1k": 0.009,
-                "context_window":     128_000,
+                "tpm_limit": 500_000, "tph_limit": 30_000_000,
+                "tpd_limit": 500_000_000, "rpm_limit": 1_000,
+                "rph_limit": 60_000, "rpd_limit": 1_000_000,
+                "cost_input_per_1k": 0.003, "cost_output_per_1k": 0.009,
+                "context_window": 128_000,
             },
         },
     },
@@ -211,257 +177,65 @@ MODEL_REGISTRY = {
         "base_url": OLLAMA_BASE_URL,
         "models": {
             "llama3": {
-                "tpm_limit": 9_999_999,     "tph_limit": 999_999_999,
+                "tpm_limit": 9_999_999, "tph_limit": 999_999_999,
                 "tpd_limit": 9_999_999_999, "rpm_limit": 99_999,
-                "rph_limit": 5_999_999,     "rpd_limit": 99_999_999,
-                "cost_input_per_1k":  0.0,
-                "cost_output_per_1k": 0.0,
-                "context_window":     8_192,
+                "rph_limit": 5_999_999, "rpd_limit": 99_999_999,
+                "cost_input_per_1k": 0.0, "cost_output_per_1k": 0.0,
+                "context_window": 8_192,
             },
         },
     },
 }
 
-# ─────────────────────────────────────────────
-#  Agent Metrics with correct labels
-# ─────────────────────────────────────────────
-
-# State: idle | running | error
-agent_state = Gauge(
-    'agent_state',
-    '1 when agent is in this state, 0 otherwise',
-    ['agent_name', 'state']
-)
-
-# Last run timestamp
-agent_last_run = Gauge(
-    'agent_last_run_timestamp_seconds',
-    'Unix timestamp of most recent report',
-    ['agent_name']
-)
-
-# Token metrics
-agent_prompt_tokens = Counter(
-    'agent_prompt_tokens_total',
-    'Prompt tokens consumed',
-    ['agent_name']
-)
-
-agent_completion_tokens = Counter(
-    'agent_completion_tokens_total',
-    'Completion tokens generated',
-    ['agent_name']
-)
-
-agent_token_usage = Counter(
-    'agent_token_usage_total',
-    'Total tokens (prompt + completion)',
-    ['agent_name']
-)
-
-# API calls with status label
-agent_api_calls = Counter(
-    'agent_api_calls_total',
-    'API calls made by an agent',
-    ['agent_name', 'status']   # status = success | failed
-)
-
-# Tasks with result label
-agent_tasks = Counter(
-    'agent_tasks_total',
-    'Tasks executed',
-    ['agent_name', 'result']   # result = success | failed
-)
-
-# API response time histogram
-agent_api_response_time = Histogram(
-    'agent_api_response_time_seconds',
-    'API response time',
-    ['agent_name'],
-    buckets=[0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0]
-)
-
-# Execution duration histogram
-agent_execution_duration = Histogram(
-    'agent_execution_duration_seconds',
-    'Total agent execution duration',
-    ['agent_name'],
-    buckets=[0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0]
-)
-
-# Latest execution time gauge
-agent_execution_time = Gauge(
-    'agent_execution_time_seconds',
-    'Latest execution time reported',
-    ['agent_name']
-)
-
-# Last decision
-agent_last_decision = Gauge(
-    'agent_last_decision',
-    '1 for the most recent decision, 0 for old ones',
-    ['agent_name', 'decision']
-)
-
-# API key count
-agent_api_key_count = Gauge(
-    'agent_api_key_count',
-    'Number of API keys configured',
-    ['agent_name']
-)
-
-
-# ─────────────────────────────────────────────
-#  Helper: Initialize Agent
-# ─────────────────────────────────────────────
-
-def init_agent(agent_name: str, api_key_count: int = 1):
-    """
-    Call this once when your agent starts.
-    Sets initial state so Grafana shows data immediately.
-    """
-    # Initialize all states to 0 first
-    for state in ['idle', 'running', 'error']:
-        agent_state.labels(agent_name=agent_name, state=state).set(0)
-
-    # Set idle as default
-    agent_state.labels(agent_name=agent_name, state='idle').set(1)
-
-    # Set last run to now
-    agent_last_run.labels(agent_name=agent_name).set(time.time())
-
-    # Set API key count
-    agent_api_key_count.labels(agent_name=agent_name).set(api_key_count)
-
-    print(f"✅ Metrics initialized for agent: {agent_name}")
-
-
-# ─────────────────────────────────────────────
-#  Helper: Set Agent State
-# ─────────────────────────────────────────────
-
-def set_agent_state(agent_name: str, new_state: str):
-    """
-    Switch agent state.
-    new_state: 'idle' | 'running' | 'error'
-    """
-    for state in ['idle', 'running', 'error']:
-        agent_state.labels(agent_name=agent_name, state=state).set(
-            1 if state == new_state else 0
-        )
-
-
-# ─────────────────────────────────────────────
-#  Helper: Record Agent Run
-# ─────────────────────────────────────────────
-
-def record_agent_run(
-    agent_name: str,
-    prompt_tokens: int,
-    completion_tokens: int,
-    api_success: bool,
-    task_success: bool,
-    api_duration: float,
-    execution_duration: float,
-    decision: str = "respond"
-):
-    """
-    Call this after every agent execution to update all metrics.
-    """
-    status = "success" if api_success else "failed"
-    result = "success" if task_success else "failed"
-
-    # Token tracking
-    agent_prompt_tokens.labels(agent_name=agent_name).inc(prompt_tokens)
-    agent_completion_tokens.labels(agent_name=agent_name).inc(completion_tokens)
-    agent_token_usage.labels(agent_name=agent_name).inc(
-        prompt_tokens + completion_tokens
-    )
-
-    # API call tracking
-    agent_api_calls.labels(agent_name=agent_name, status=status).inc()
-
-    # Task tracking
-    agent_tasks.labels(agent_name=agent_name, result=result).inc()
-
-    # Timing
-    agent_api_response_time.labels(agent_name=agent_name).observe(api_duration)
-    agent_execution_duration.labels(agent_name=agent_name).observe(execution_duration)
-    agent_execution_time.labels(agent_name=agent_name).set(execution_duration)
-
-    # Decision
-    agent_last_decision.labels(agent_name=agent_name, decision=decision).set(1)
-
-    # Timestamp
-    agent_last_run.labels(agent_name=agent_name).set(time.time())
 
 # ══════════════════════════════════════════════════════════════
 # ACTIVE CONFIG
-# ──────────────────────────────────────────────────────────────
-# Flat dict built from MODEL_REGISTRY using ACTIVE_PROVIDER
-# and ACTIVE_MODEL. Used everywhere in the app.
 # ══════════════════════════════════════════════════════════════
-
 def _build_active_config() -> dict:
-    """
-    Build flat ACTIVE_CONFIG from MODEL_REGISTRY.
-    Uses ACTIVE_PROVIDER and ACTIVE_MODEL set from env vars above.
-    """
     pcfg = MODEL_REGISTRY.get(ACTIVE_PROVIDER, {})
     mcfg = pcfg.get("models", {}).get(ACTIVE_MODEL, {})
 
     if not pcfg:
-        print(f"[monitor] ❌ Provider '{ACTIVE_PROVIDER}' not in registry")
+        print(f"[monitor] Provider '{ACTIVE_PROVIDER}' not in registry")
 
     if not mcfg:
-        # Fallback to first available model of this provider
         fallback_name = next(iter(pcfg.get("models", {})), None)
         if fallback_name:
             mcfg = pcfg["models"][fallback_name]
-            print(
-                f"[monitor] ⚠ '{ACTIVE_MODEL}' not in registry, "
-                f"using limits from '{fallback_name}'"
-            )
+            print(f"[monitor] '{ACTIVE_MODEL}' not in registry, "
+                  f"using limits from '{fallback_name}'")
         else:
-            print(f"[monitor] ❌ No fallback for '{ACTIVE_PROVIDER}'")
+            print(f"[monitor] No fallback for '{ACTIVE_PROVIDER}'")
             mcfg = {
                 "tpm_limit": 0, "tph_limit": 0, "tpd_limit": 0,
                 "rpm_limit": 0, "rph_limit": 0, "rpd_limit": 0,
-                "cost_input_per_1k":  0.0,
-                "cost_output_per_1k": 0.0,
-                "context_window":     0,
+                "cost_input_per_1k": 0.0, "cost_output_per_1k": 0.0,
+                "context_window": 0,
             }
 
     return {
-        # ── Identity ──────────────────────────────────────────
         "name":     ACTIVE_MODEL,
         "provider": ACTIVE_PROVIDER,
-        # ── Auth ──────────────────────────────────────────────
         "api_key":  ACTIVE_API_KEY,
         "base_url": pcfg.get("base_url", ""),
-        # ── Token limits ──────────────────────────────────────
         "tpm": mcfg["tpm_limit"],
         "tph": mcfg["tph_limit"],
         "tpd": mcfg["tpd_limit"],
-        # ── Request limits ────────────────────────────────────
         "rpm": mcfg["rpm_limit"],
         "rph": mcfg["rph_limit"],
         "rpd": mcfg["rpd_limit"],
-        # ── Cost ──────────────────────────────────────────────
         "cost_in":  mcfg["cost_input_per_1k"],
         "cost_out": mcfg["cost_output_per_1k"],
-        # ── Context ───────────────────────────────────────────
         "ctx":      mcfg["context_window"],
     }
 
 
-# ── Single config object used everywhere ──────────────────────
 ACTIVE_CONFIG: dict = _build_active_config()
 
 
-# ============================================================
+# ══════════════════════════════════════════════════════════════
 # DATABASE
-# ============================================================
+# ══════════════════════════════════════════════════════════════
 class MetricsDB:
     def __init__(self, db_path="agent_monitor.db"):
         self.db_path = db_path
@@ -472,7 +246,7 @@ class MetricsDB:
         c = sqlite3.connect(self.db_path, check_same_thread=False)
         c.row_factory = sqlite3.Row
         return c
-        
+
     def _init_db(self):
         c = self._conn()
         c.executescript("""
@@ -546,9 +320,9 @@ class MetricsDB:
             c.close()
 
 
-# ============================================================
+# ══════════════════════════════════════════════════════════════
 # PROJECT SCANNER
-# ============================================================
+# ══════════════════════════════════════════════════════════════
 class ProjectScanner:
     AI_KW = [
         'openai','anthropic','langchain','llama','transformers','torch',
@@ -773,13 +547,9 @@ class ProjectScanner:
                 f['is_main_file'] = 1
 
 
-# ============================================================
+# ══════════════════════════════════════════════════════════════
 # RESOURCE MONITOR
-# ──────────────────────────────────────────────────────────────
-# FIX: ALL methods are properly indented INSIDE the class.
-# Previously _loop/_rates/_sim/get_all_metrics were at module
-# level — monitor thread never ran → tokens always zero.
-# ============================================================
+# ══════════════════════════════════════════════════════════════
 class ResourceMonitor:
 
     def __init__(self, db: MetricsDB):
@@ -799,23 +569,14 @@ class ResourceMonitor:
         self._req_log = defaultdict(list)
 
     def start_monitoring(self):
-        """Start background monitoring thread."""
         self.monitoring = True
-        threading.Thread(
-            target=self._loop, daemon=True
-        ).start()
-        print("[monitor] ✅ Background thread started")
+        threading.Thread(target=self._loop, daemon=True).start()
+        print("[monitor] background thread started")
 
     def stop_monitoring(self):
-        """Stop background monitoring thread."""
         self.monitoring = False
 
     def _loop(self):
-        """
-        Main monitoring loop — runs every 3 seconds.
-        Collects system metrics, process metrics,
-        calculates rates and simulates token usage.
-        """
         while self.monitoring:
             try:
                 self._sys()
@@ -827,7 +588,6 @@ class ResourceMonitor:
             time.sleep(3)
 
     def _sys(self):
-        """Collect system-wide CPU / memory / disk metrics."""
         cpu  = psutil.cpu_percent(interval=1)
         mem  = psutil.virtual_memory()
         disk = psutil.disk_usage('/')
@@ -843,7 +603,6 @@ class ResourceMonitor:
         }
 
     def _proc(self):
-        """Collect per-file CPU / memory / storage metrics."""
         rows = self.db.execute(
             "SELECT file_path, file_name FROM detected_files "
             "WHERE is_ai_agent=1 OR is_script=1",
@@ -855,33 +614,29 @@ class ResourceMonitor:
             cpu = mem = storage = 0.0
             pid = 0
             try:
-                p = fp if os.path.exists(fp) \
-                       else os.path.join('.', fp)
+                p = fp if os.path.exists(fp) else os.path.join('.', fp)
                 if os.path.exists(p):
                     storage = os.path.getsize(p) / (1024 * 1024)
                 for proc in psutil.process_iter(
                     ['pid', 'cmdline', 'cpu_percent', 'memory_info']
                 ):
                     try:
-                        cmd = ' '.join(
-                            proc.info.get('cmdline') or []
-                        )
+                        cmd = ' '.join(proc.info.get('cmdline') or [])
                         if fn in cmd or fp in cmd:
                             cpu += proc.info.get('cpu_percent', 0) or 0
                             mi   = proc.info.get('memory_info')
                             if mi:
                                 mem += mi.rss / (1024 * 1024)
                             pid = proc.info['pid']
-                    except (psutil.NoSuchProcess,
-                            psutil.AccessDenied):
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
                         pass
             except Exception:
                 pass
 
             self.metrics['resources'][fp] = {
                 'pid':   pid,
-                'cpu':   round(cpu,     2),
-                'mem':   round(mem,     2),
+                'cpu':   round(cpu, 2),
+                'mem':   round(mem, 2),
                 'store': round(storage, 4),
             }
             self.db.execute(
@@ -892,10 +647,6 @@ class ResourceMonitor:
             )
 
     def _rates(self):
-        """
-        Calculate per-minute / per-hour / per-day token
-        and request rates from in-memory timestamped logs.
-        """
         now = time.time()
 
         for fp, ent in list(self._tok_log.items()):
@@ -914,63 +665,44 @@ class ResourceMonitor:
                 'per_day':  sum(c for t, c in ent if now-t < 86_400),
             }
 
-        total_tok = sum(
-            v['per_day'] for v in self.metrics['tokens'].values()
-        )
-        total_req = sum(
-            v['per_day'] for v in self.metrics['requests'].values()
-        )
+        total_tok = sum(v['per_day'] for v in self.metrics['tokens'].values())
+        total_req = sum(v['per_day'] for v in self.metrics['requests'].values())
         if total_tok > 0 or total_req > 0:
-            print(
-                f"[rates] tok/day={total_tok:,} "
-                f"req/day={total_req:,}"
-            )
+            print(f"[rates] tok/day={total_tok:,} req/day={total_req:,}")
 
     def _sim(self):
-        """
-        Simulate token/request usage for detected AI agents.
-        Runs every cycle — guaranteed data on dashboard.
-        """
         files = self.db.execute(
-            "SELECT file_path FROM detected_files "
-            "WHERE is_ai_agent=1",
+            "SELECT file_path FROM detected_files WHERE is_ai_agent=1",
             fetch=True
         )
         if not files:
             return
 
         now = time.time()
-        cfg = ACTIVE_CONFIG  # Use the active config
+        cfg = ACTIVE_CONFIG
+        tpm = max(cfg.get('tpm', 0) or 10_000, 10_000)
+        rpm = max(cfg.get('rpm', 0) or 10, 10)
 
         for row in files:
             fp = row['file_path']
-
-            # Generate realistic random values based on limits
-            tok = random.randint(100, min(5000, cfg['tpm']//10))
-            req = random.randint(1, min(5, cfg['rpm']//10))
+            tok = random.randint(100, min(5000, tpm // 10))
+            req = random.randint(1, min(5, max(rpm // 10, 1)))
 
             self._tok_log[fp].append((now, tok))
             self._req_log[fp].append((now, req))
 
             self.db.execute(
                 "INSERT INTO token_usage "
-                "(file_path,tokens_used,token_type) "
-                "VALUES (?,?,?)",
+                "(file_path,tokens_used,token_type) VALUES (?,?,?)",
                 (fp, tok, 'total')
             )
             self.db.execute(
                 "INSERT INTO request_usage "
-                "(file_path,request_count,status_code) "
-                "VALUES (?,?,?)",
+                "(file_path,request_count,status_code) VALUES (?,?,?)",
                 (fp, req, 200)
             )
 
     def get_all_metrics(self):
-        """
-        Return complete metrics snapshot.
-        Recalculates rates before returning so
-        caller always gets fresh data.
-        """
         self._rates()
         return {
             'system':    self.metrics['system'],
@@ -980,11 +712,9 @@ class ResourceMonitor:
         }
 
 
-# ============================================================
+# ══════════════════════════════════════════════════════════════
 # HTML BUILDER
-# ──────────────────────────────────────────────────────────────
-# All HTML rendering. app.py calls these static methods.
-# ============================================================
+# ══════════════════════════════════════════════════════════════
 class HTMLBuilder:
 
     NAV_ITEMS = [
@@ -1006,10 +736,7 @@ class HTMLBuilder:
             extra = ""
             if key == "reset": extra = " danger"
             if key == "scan":  extra = " success"
-            cls = (
-                f"nav-btn{extra}"
-                f"{' active' if key == active else ''}"
-            )
+            cls = f"nav-btn{extra}{' active' if key == active else ''}"
             btns += f'<a href="{href}" class="{cls}">{label}</a>\n'
         return btns
 
@@ -1039,8 +766,7 @@ body{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;
      padding:10px 24px;display:flex;gap:8px;flex-wrap:wrap;overflow-x:auto}
 .nav-btn{padding:8px 18px;border-radius:8px;font-size:12px;font-weight:600;
   text-decoration:none;background:#111827;color:#94a3b8;
-  border:1px solid #1e293b;transition:all .2s;white-space:nowrap;
-  display:inline-block}
+  border:1px solid #1e293b;transition:all .2s;white-space:nowrap;display:inline-block}
 .nav-btn:hover{background:#1e293b;color:#e2e8f0;
   transform:translateY(-1px);box-shadow:0 4px 12px rgba(0,0,0,.3)}
 .nav-btn.active{background:#312e81;color:#a5b4fc;border-color:#4f46e5}
@@ -1229,8 +955,7 @@ tr:hover td{background:#0d1628}
   <div style="flex:1">
     <div class="ulbl">{label}</div>
     <div class="ubar">
-      <div class="ufill"
-           style="width:{p}%;background:{c}"></div>
+      <div class="ufill" style="width:{p}%;background:{c}"></div>
     </div>
   </div>
   <div>
@@ -1262,52 +987,35 @@ tr:hover td{background:#0d1628}
         if b > 1024:      return f"{b/1024:.1f} KB"
         return f"{b} B"
 
-    # ═══════════════════════════════════════════════════════════
-    # PAGE BUILDERS
-    # ═══════════════════════════════════════════════════════════
-
     @staticmethod
     def home(files, metrics):
         sys_m = metrics.get('system', {})
         ai  = sum(1 for f in files if f.get('is_ai_agent'))
         sc  = sum(1 for f in files if f.get('is_script'))
         mn  = sum(1 for f in files if f.get('is_main_file'))
-        tok = sum(
-            v.get('per_day', 0)
-            for v in metrics.get('tokens', {}).values()
-        )
-        req = sum(
-            v.get('per_day', 0)
-            for v in metrics.get('requests', {}).values()
-        )
+        tok = sum(v.get('per_day', 0) for v in metrics.get('tokens', {}).values())
+        req = sum(v.get('per_day', 0) for v in metrics.get('requests', {}).values())
         body = f"""
 <div class="hero">
   <h2>AI Agent Monitor</h2>
-  <p>Real-time monitoring for AI agents, scripts,
-     tokens, requests and system resources.</p>
+  <p>Real-time monitoring for AI agents, scripts, tokens, requests and system resources.</p>
   <div class="hcards">
-    <div class="hcard">
-      <div class="icon">📂</div>
+    <div class="hcard"><div class="icon">📂</div>
       <div class="hval" style="color:#3b82f6">{len(files)}</div>
       <div class="hlbl">Total Files</div></div>
-    <div class="hcard">
-      <div class="icon">🤖</div>
+    <div class="hcard"><div class="icon">🤖</div>
       <div class="hval" style="color:#a78bfa">{ai}</div>
       <div class="hlbl">AI Agents</div></div>
-    <div class="hcard">
-      <div class="icon">⚡</div>
+    <div class="hcard"><div class="icon">⚡</div>
       <div class="hval" style="color:#22c55e">{sc}</div>
       <div class="hlbl">Scripts</div></div>
-    <div class="hcard">
-      <div class="icon">★</div>
+    <div class="hcard"><div class="icon">★</div>
       <div class="hval" style="color:#f59e0b">{mn}</div>
       <div class="hlbl">Main Files</div></div>
-    <div class="hcard">
-      <div class="icon">🪙</div>
+    <div class="hcard"><div class="icon">🪙</div>
       <div class="hval" style="color:#06b6d4">{tok:,}</div>
       <div class="hlbl">Tokens Today</div></div>
-    <div class="hcard">
-      <div class="icon">📡</div>
+    <div class="hcard"><div class="icon">📡</div>
       <div class="hval" style="color:#ef4444">{req:,}</div>
       <div class="hlbl">Requests Today</div></div>
   </div>
@@ -1348,30 +1056,18 @@ tr:hover td{background:#0d1628}
   </div>
   <div class="sec"><h2>💻 System Status</h2></div>
   <div class="grid g3">
-    <div class="card dark">
-      <div class="lbl">🔲 CPU</div>
-      {HTMLBuilder._pbar(
-          sys_m.get('cpu_pct', 0),
-          HTMLBuilder._bc(sys_m.get('cpu_pct', 0))
-      )}
+    <div class="card dark"><div class="lbl">🔲 CPU</div>
+      {HTMLBuilder._pbar(sys_m.get('cpu_pct', 0), HTMLBuilder._bc(sys_m.get('cpu_pct', 0)))}
     </div>
-    <div class="card dark">
-      <div class="lbl">🧠 Memory</div>
-      {HTMLBuilder._pbar(
-          sys_m.get('mem_pct', 0),
-          HTMLBuilder._bc(sys_m.get('mem_pct', 0))
-      )}
+    <div class="card dark"><div class="lbl">🧠 Memory</div>
+      {HTMLBuilder._pbar(sys_m.get('mem_pct', 0), HTMLBuilder._bc(sys_m.get('mem_pct', 0)))}
       <div class="pbar-detail">
         <span>{sys_m.get('mem_used', 0)} GB</span>
         <span>{sys_m.get('mem_total', 0)} GB</span>
       </div>
     </div>
-    <div class="card dark">
-      <div class="lbl">💾 Disk</div>
-      {HTMLBuilder._pbar(
-          sys_m.get('disk_pct', 0),
-          HTMLBuilder._bc(sys_m.get('disk_pct', 0))
-      )}
+    <div class="card dark"><div class="lbl">💾 Disk</div>
+      {HTMLBuilder._pbar(sys_m.get('disk_pct', 0), HTMLBuilder._bc(sys_m.get('disk_pct', 0)))}
       <div class="pbar-detail">
         <span>{sys_m.get('disk_used', 0)} GB</span>
         <span>{sys_m.get('disk_total', 0)} GB</span>
@@ -1400,63 +1096,31 @@ tr:hover td{background:#0d1628}
 
         body = f"""
 <div class="container">
-  <div class="sec">
-    <h2>📊 Overview</h2>
-    <span class="badge">Live</span>
-  </div>
+  <div class="sec"><h2>📊 Overview</h2><span class="badge">Live</span></div>
   <div class="grid g6">
-    <div class="card blue">
-      <div class="lbl">Total Files</div>
-      <div class="val">{len(files)}</div></div>
-    <div class="card purple">
-      <div class="lbl">AI Agents</div>
-      <div class="val">{ai}</div></div>
-    <div class="card green">
-      <div class="lbl">Scripts</div>
-      <div class="val">{sc}</div></div>
-    <div class="card orange">
-      <div class="lbl">Main Files</div>
-      <div class="val">{mn}</div></div>
-    <div class="card cyan">
-      <div class="lbl">Tokens/Day</div>
-      <div class="val">{td:,}</div></div>
-    <div class="card red">
-      <div class="lbl">Requests/Day</div>
-      <div class="val">{rd:,}</div></div>
+    <div class="card blue"><div class="lbl">Total Files</div><div class="val">{len(files)}</div></div>
+    <div class="card purple"><div class="lbl">AI Agents</div><div class="val">{ai}</div></div>
+    <div class="card green"><div class="lbl">Scripts</div><div class="val">{sc}</div></div>
+    <div class="card orange"><div class="lbl">Main Files</div><div class="val">{mn}</div></div>
+    <div class="card cyan"><div class="lbl">Tokens/Day</div><div class="val">{td:,}</div></div>
+    <div class="card red"><div class="lbl">Requests/Day</div><div class="val">{rd:,}</div></div>
   </div>
-  <div class="sec">
-    <h2>💻 System Resources</h2>
-    <span class="badge">{sys_m.get('ts', '')[:19]}</span>
-  </div>
+  <div class="sec"><h2>💻 System Resources</h2>
+    <span class="badge">{sys_m.get('ts', '')[:19]}</span></div>
   <div class="grid g3">
-    <div class="card dark">
-      <div class="lbl">🔲 CPU</div>
-      {HTMLBuilder._pbar(
-          sys_m.get('cpu_pct', 0),
-          HTMLBuilder._bc(sys_m.get('cpu_pct', 0))
-      )}
-      <div class="pbar-detail">
-        <span>Processor</span>
-        <span>{sys_m.get('cpu_pct', 0):.1f}%</span>
-      </div>
+    <div class="card dark"><div class="lbl">🔲 CPU</div>
+      {HTMLBuilder._pbar(sys_m.get('cpu_pct', 0), HTMLBuilder._bc(sys_m.get('cpu_pct', 0)))}
+      <div class="pbar-detail"><span>Processor</span><span>{sys_m.get('cpu_pct', 0):.1f}%</span></div>
     </div>
-    <div class="card dark">
-      <div class="lbl">🧠 Memory</div>
-      {HTMLBuilder._pbar(
-          sys_m.get('mem_pct', 0),
-          HTMLBuilder._bc(sys_m.get('mem_pct', 0))
-      )}
+    <div class="card dark"><div class="lbl">🧠 Memory</div>
+      {HTMLBuilder._pbar(sys_m.get('mem_pct', 0), HTMLBuilder._bc(sys_m.get('mem_pct', 0)))}
       <div class="pbar-detail">
         <span>{sys_m.get('mem_used', 0)} GB</span>
         <span>/ {sys_m.get('mem_total', 0)} GB</span>
       </div>
     </div>
-    <div class="card dark">
-      <div class="lbl">💾 Disk</div>
-      {HTMLBuilder._pbar(
-          sys_m.get('disk_pct', 0),
-          HTMLBuilder._bc(sys_m.get('disk_pct', 0))
-      )}
+    <div class="card dark"><div class="lbl">💾 Disk</div>
+      {HTMLBuilder._pbar(sys_m.get('disk_pct', 0), HTMLBuilder._bc(sys_m.get('disk_pct', 0)))}
       <div class="pbar-detail">
         <span>{sys_m.get('disk_used', 0)} GB</span>
         <span>/ {sys_m.get('disk_total', 0)} GB</span>
@@ -1467,16 +1131,14 @@ tr:hover td{background:#0d1628}
   <div class="grid g2">
     <div class="card dark" style="padding:24px">
       <h3 style="font-size:14px;color:#e2e8f0;margin-bottom:16px;
-          border-bottom:1px solid #1e293b;padding-bottom:10px">
-        🪙 Tokens</h3>
+          border-bottom:1px solid #1e293b;padding-bottom:10px">🪙 Tokens</h3>
       {HTMLBuilder._urow('Per Minute', tm, cfg['tpm'], '#3b82f6')}
       {HTMLBuilder._urow('Per Hour',   th, cfg['tph'], '#8b5cf6')}
       {HTMLBuilder._urow('Per Day',    td, cfg['tpd'], '#06b6d4')}
     </div>
     <div class="card dark" style="padding:24px">
       <h3 style="font-size:14px;color:#e2e8f0;margin-bottom:16px;
-          border-bottom:1px solid #1e293b;padding-bottom:10px">
-        📡 Requests</h3>
+          border-bottom:1px solid #1e293b;padding-bottom:10px">📡 Requests</h3>
       {HTMLBuilder._urow('Per Minute', rm, cfg['rpm'], '#22c55e')}
       {HTMLBuilder._urow('Per Hour',   rh, cfg['rph'], '#f59e0b')}
       {HTMLBuilder._urow('Per Day',    rd, cfg['rpd'], '#ef4444')}
@@ -1494,40 +1156,27 @@ tr:hover td{background:#0d1628}
             elif f.get('is_script'):
                 tag = '<span class="tag t-sc">⚡ Script</span>'
             else:
-                tag = (
-                    f'<span class="tag t-fl">'
-                    f'{f.get("file_type", "")}</span>'
-                )
+                tag = f'<span class="tag t-fl">{f.get("file_type", "")}</span>'
             flags = ""
-            if f.get('is_main_file'):
-                flags += '<span class="tag t-mn">★</span> '
-            if f.get('is_ai_agent'):
-                flags += '<span class="tag t-ai">AI</span> '
-            if f.get('is_script'):
-                flags += '<span class="tag t-sc">Sc</span>'
+            if f.get('is_main_file'): flags += '<span class="tag t-mn">★</span> '
+            if f.get('is_ai_agent'):  flags += '<span class="tag t-ai">AI</span> '
+            if f.get('is_script'):    flags += '<span class="tag t-sc">Sc</span>'
             desc = (f.get('description', '') or '')[:150]
             sz   = HTMLBuilder._fmt_size(f.get('size_bytes', 0))
             rows += f"""<tr>
               <td>{tag}</td>
-              <td><strong style="color:#e2e8f0">
-                {f['file_name']}</strong></td>
+              <td><strong style="color:#e2e8f0">{f['file_name']}</strong></td>
               <td><code class="path">{f['file_path']}</code></td>
-              <td><span class="purp">
-                {f.get('purpose', '-')}</span></td>
+              <td><span class="purp">{f.get('purpose', '-')}</span></td>
               <td><span class="desc">{desc}</span></td>
               <td><span class="sz">{sz}</span></td>
               <td>{flags}</td></tr>"""
         if not rows:
-            rows = (
-                '<tr><td colspan="7" class="empty">'
-                'No files. Click 🔍 Scan</td></tr>'
-            )
+            rows = '<tr><td colspan="7" class="empty">No files. Click 🔍 Scan</td></tr>'
         body = f"""
 <div class="container">
-  <div class="sec">
-    <h2>📂 Detected Files</h2>
-    <span class="badge">{len(files)} files</span>
-  </div>
+  <div class="sec"><h2>📂 Detected Files</h2>
+    <span class="badge">{len(files)} files</span></div>
   <div class="tw"><div class="ts"><table>
     <thead><tr>
       <th>Type</th><th>Name</th><th>Path</th><th>Purpose</th>
@@ -1544,10 +1193,7 @@ tr:hover td{background:#0d1628}
         reqs   = metrics.get('requests', {})
         res    = metrics.get('resources',{})
         cfg    = ACTIVE_CONFIG
-        active = [
-            f for f in files
-            if f.get('is_ai_agent') or f.get('is_script')
-        ]
+        active = [f for f in files if f.get('is_ai_agent') or f.get('is_script')]
         rows = ""
         for a in active:
             fp  = a['file_path']
@@ -1563,50 +1209,29 @@ tr:hover td{background:#0d1628}
             rows += f"""<tr>
               <td><strong style="color:#60a5fa">{sn}</strong></td>
               <td style="color:#94a3b8">{a['file_name']}</td>
-              <td><span class="purp">
-                {a.get('purpose', '-')}</span></td>
+              <td><span class="purp">{a.get('purpose', '-')}</span></td>
               <td><span class="desc">{sd}</span></td>
-              <td style="color:{_c(tok['per_min'],cfg['tpm'])};
-                  font-family:monospace">{tok['per_min']:,}
-                <small style="color:#334155">
-                  /{cfg['tpm']:,}</small></td>
-              <td style="color:{_c(tok['per_hour'],cfg['tph'])};
-                  font-family:monospace">{tok['per_hour']:,}
-                <small style="color:#334155">
-                  /{cfg['tph']:,}</small></td>
-              <td style="color:{_c(tok['per_day'],cfg['tpd'])};
-                  font-family:monospace">{tok['per_day']:,}
-                <small style="color:#334155">
-                  /{cfg['tpd']:,}</small></td>
-              <td style="color:{_c(rq['per_min'],cfg['rpm'])};
-                  font-family:monospace">{rq['per_min']:,}
-                <small style="color:#334155">
-                  /{cfg['rpm']:,}</small></td>
-              <td style="color:{_c(rq['per_hour'],cfg['rph'])};
-                  font-family:monospace">{rq['per_hour']:,}
-                <small style="color:#334155">
-                  /{cfg['rph']:,}</small></td>
-              <td style="color:{_c(rq['per_day'],cfg['rpd'])};
-                  font-family:monospace">{rq['per_day']:,}
-                <small style="color:#334155">
-                  /{cfg['rpd']:,}</small></td>
-              <td style="color:{HTMLBuilder._mc(rc.get('cpu',0))}">
-                {rc.get('cpu',0):.1f}%</td>
-              <td style="color:#a78bfa">
-                {rc.get('mem',0):.1f}</td>
-              <td style="color:#64748b">
-                {rc.get('store',0):.3f}</td></tr>"""
+              <td style="color:{_c(tok['per_min'],cfg['tpm'])};font-family:monospace">
+                {tok['per_min']:,} <small style="color:#334155">/{cfg['tpm']:,}</small></td>
+              <td style="color:{_c(tok['per_hour'],cfg['tph'])};font-family:monospace">
+                {tok['per_hour']:,} <small style="color:#334155">/{cfg['tph']:,}</small></td>
+              <td style="color:{_c(tok['per_day'],cfg['tpd'])};font-family:monospace">
+                {tok['per_day']:,} <small style="color:#334155">/{cfg['tpd']:,}</small></td>
+              <td style="color:{_c(rq['per_min'],cfg['rpm'])};font-family:monospace">
+                {rq['per_min']:,} <small style="color:#334155">/{cfg['rpm']:,}</small></td>
+              <td style="color:{_c(rq['per_hour'],cfg['rph'])};font-family:monospace">
+                {rq['per_hour']:,} <small style="color:#334155">/{cfg['rph']:,}</small></td>
+              <td style="color:{_c(rq['per_day'],cfg['rpd'])};font-family:monospace">
+                {rq['per_day']:,} <small style="color:#334155">/{cfg['rpd']:,}</small></td>
+              <td style="color:{HTMLBuilder._mc(rc.get('cpu',0))}">{rc.get('cpu',0):.1f}%</td>
+              <td style="color:#a78bfa">{rc.get('mem',0):.1f}</td>
+              <td style="color:#64748b">{rc.get('store',0):.3f}</td></tr>"""
         if not rows:
-            rows = (
-                '<tr><td colspan="13" class="empty">'
-                'No agents/scripts detected</td></tr>'
-            )
+            rows = '<tr><td colspan="13" class="empty">No agents/scripts detected</td></tr>'
         body = f"""
 <div class="container">
-  <div class="sec">
-    <h2>🤖 Agent & Script Metrics</h2>
-    <span class="badge">{len(active)} active</span>
-  </div>
+  <div class="sec"><h2>🤖 Agent & Script Metrics</h2>
+    <span class="badge">{len(active)} active</span></div>
   <div class="tw"><div class="ts"><table>
     <thead><tr>
       <th>Script</th><th>File</th><th>Purpose</th><th>Desc</th>
@@ -1637,50 +1262,34 @@ tr:hover td{background:#0d1628}
 
         body = f"""
 <div class="container">
-  <div class="sec">
-    <h2>📈 Live Metrics</h2>
-    <span class="badge">Auto-refresh 10s</span>
-  </div>
+  <div class="sec"><h2>📈 Live Metrics</h2>
+    <span class="badge">Auto-refresh 10s</span></div>
   <div class="grid g6">
-    <div class="card blue">
-      <div class="lbl">Tok/Min</div>
-      <div class="val">{tm:,}</div>
-      <div class="sub">/{cfg['tpm']:,}</div></div>
-    <div class="card purple">
-      <div class="lbl">Tok/Hour</div>
-      <div class="val">{th:,}</div>
-      <div class="sub">/{cfg['tph']:,}</div></div>
-    <div class="card cyan">
-      <div class="lbl">Tok/Day</div>
-      <div class="val">{td:,}</div>
-      <div class="sub">/{cfg['tpd']:,}</div></div>
-    <div class="card green">
-      <div class="lbl">Req/Min</div>
-      <div class="val">{rm:,}</div>
-      <div class="sub">/{cfg['rpm']:,}</div></div>
-    <div class="card orange">
-      <div class="lbl">Req/Hour</div>
-      <div class="val">{rh:,}</div>
-      <div class="sub">/{cfg['rph']:,}</div></div>
-    <div class="card red">
-      <div class="lbl">Req/Day</div>
-      <div class="val">{rd:,}</div>
-      <div class="sub">/{cfg['rpd']:,}</div></div>
+    <div class="card blue"><div class="lbl">Tok/Min</div>
+      <div class="val">{tm:,}</div><div class="sub">/{cfg['tpm']:,}</div></div>
+    <div class="card purple"><div class="lbl">Tok/Hour</div>
+      <div class="val">{th:,}</div><div class="sub">/{cfg['tph']:,}</div></div>
+    <div class="card cyan"><div class="lbl">Tok/Day</div>
+      <div class="val">{td:,}</div><div class="sub">/{cfg['tpd']:,}</div></div>
+    <div class="card green"><div class="lbl">Req/Min</div>
+      <div class="val">{rm:,}</div><div class="sub">/{cfg['rpm']:,}</div></div>
+    <div class="card orange"><div class="lbl">Req/Hour</div>
+      <div class="val">{rh:,}</div><div class="sub">/{cfg['rph']:,}</div></div>
+    <div class="card red"><div class="lbl">Req/Day</div>
+      <div class="val">{rd:,}</div><div class="sub">/{cfg['rpd']:,}</div></div>
   </div>
   <div class="sec"><h2>📊 Usage Bars</h2></div>
   <div class="grid g2">
     <div class="card dark" style="padding:24px">
       <h3 style="font-size:14px;color:#e2e8f0;margin-bottom:16px;
-          border-bottom:1px solid #1e293b;padding-bottom:10px">
-        🪙 Tokens</h3>
+          border-bottom:1px solid #1e293b;padding-bottom:10px">🪙 Tokens</h3>
       {HTMLBuilder._urow('Per Minute', tm, cfg['tpm'], '#3b82f6')}
       {HTMLBuilder._urow('Per Hour',   th, cfg['tph'], '#8b5cf6')}
       {HTMLBuilder._urow('Per Day',    td, cfg['tpd'], '#06b6d4')}
     </div>
     <div class="card dark" style="padding:24px">
       <h3 style="font-size:14px;color:#e2e8f0;margin-bottom:16px;
-          border-bottom:1px solid #1e293b;padding-bottom:10px">
-        📡 Requests</h3>
+          border-bottom:1px solid #1e293b;padding-bottom:10px">📡 Requests</h3>
       {HTMLBuilder._urow('Per Minute', rm, cfg['rpm'], '#22c55e')}
       {HTMLBuilder._urow('Per Hour',   rh, cfg['rph'], '#f59e0b')}
       {HTMLBuilder._urow('Per Day',    rd, cfg['rpd'], '#ef4444')}
@@ -1688,18 +1297,12 @@ tr:hover td{background:#0d1628}
   </div>
   <div class="sec"><h2>💰 Estimated Cost Today</h2></div>
   <div class="grid g3">
-    <div class="card green">
-      <div class="lbl">Input Cost</div>
-      <div style="font-size:24px;font-weight:700;
-          color:#22c55e;margin-top:8px">${ci:.4f}</div></div>
-    <div class="card orange">
-      <div class="lbl">Output Cost</div>
-      <div style="font-size:24px;font-weight:700;
-          color:#f59e0b;margin-top:8px">${co:.4f}</div></div>
-    <div class="card red">
-      <div class="lbl">Total Est.</div>
-      <div style="font-size:24px;font-weight:700;
-          color:#ef4444;margin-top:8px">${ci + co:.4f}</div></div>
+    <div class="card green"><div class="lbl">Input Cost</div>
+      <div style="font-size:24px;font-weight:700;color:#22c55e;margin-top:8px">${ci:.4f}</div></div>
+    <div class="card orange"><div class="lbl">Output Cost</div>
+      <div style="font-size:24px;font-weight:700;color:#f59e0b;margin-top:8px">${co:.4f}</div></div>
+    <div class="card red"><div class="lbl">Total Est.</div>
+      <div style="font-size:24px;font-weight:700;color:#ef4444;margin-top:8px">${ci + co:.4f}</div></div>
   </div>
 </div>"""
         return HTMLBuilder.page("Metrics", "monitor", body, refresh=10)
@@ -1707,8 +1310,6 @@ tr:hover td{background:#0d1628}
     @staticmethod
     def model():
         cfg = ACTIVE_CONFIG
-
-        # ── Check API key live from env ────────────────────────
         _live_keys = {
             "google":    os.environ.get("GEMINI_API_KEY",
                          os.environ.get("GOOGLE_API_KEY", "")),
@@ -1726,98 +1327,59 @@ tr:hover td{background:#0d1628}
         rows = ""
         for prov, pcfg in MODEL_REGISTRY.items():
             for mname, mcfg in pcfg['models'].items():
-                is_active = (
-                    prov  == cfg['provider'] and
-                    mname == cfg['name']
-                )
+                is_active = (prov == cfg['provider'] and mname == cfg['name'])
                 hl  = ("color:#22c55e;font-weight:700"
                        if is_active else "color:#475569")
                 txt = "✅ ACTIVE" if is_active else ""
                 rows += f"""<tr>
                   <td style="color:#a5b4fc">{prov.upper()}</td>
-                  <td><strong style="color:#e2e8f0">
-                    {mname}</strong></td>
-                  <td style="font-family:monospace">
-                    {mcfg['tpm_limit']:,}</td>
-                  <td style="font-family:monospace">
-                    {mcfg['rpm_limit']:,}</td>
-                  <td style="font-family:monospace">
-                    {mcfg['context_window']:,}</td>
-                  <td style="font-family:monospace">
-                    ${mcfg['cost_input_per_1k']:.5f}</td>
-                  <td style="font-family:monospace">
-                    ${mcfg['cost_output_per_1k']:.5f}</td>
+                  <td><strong style="color:#e2e8f0">{mname}</strong></td>
+                  <td style="font-family:monospace">{mcfg['tpm_limit']:,}</td>
+                  <td style="font-family:monospace">{mcfg['rpm_limit']:,}</td>
+                  <td style="font-family:monospace">{mcfg['context_window']:,}</td>
+                  <td style="font-family:monospace">${mcfg['cost_input_per_1k']:.5f}</td>
+                  <td style="font-family:monospace">${mcfg['cost_output_per_1k']:.5f}</td>
                   <td style="{hl}">{txt}</td></tr>"""
 
         body = f"""
 <div class="container">
-  <div class="sec">
-    <h2>🧠 Model Configuration</h2>
-    <span class="badge">
-      {cfg['provider'].upper()} → {cfg['name']}</span>
-  </div>
+  <div class="sec"><h2>🧠 Model Configuration</h2>
+    <span class="badge">{cfg['provider'].upper()} → {cfg['name']}</span></div>
   <div class="alert {kc}">{ks}</div>
   <div class="grid g4">
-    <div class="mi">
-      <div class="mi-l">Provider</div>
+    <div class="mi"><div class="mi-l">Provider</div>
       <div class="mi-v">{cfg['provider'].upper()}</div></div>
-    <div class="mi">
-      <div class="mi-l">Model</div>
+    <div class="mi"><div class="mi-l">Model</div>
       <div class="mi-v">{cfg['name']}</div></div>
-    <div class="mi">
-      <div class="mi-l">Context Window</div>
+    <div class="mi"><div class="mi-l">Context Window</div>
       <div class="mi-v">{cfg['ctx']:,} tokens</div></div>
-    <div class="mi">
-      <div class="mi-l">Base URL</div>
-      <div class="mi-v" style="font-size:11px">
-        {cfg['base_url']}</div></div>
+    <div class="mi"><div class="mi-l">Base URL</div>
+      <div class="mi-v" style="font-size:11px">{cfg['base_url']}</div></div>
   </div>
   <div class="sec"><h2>🔒 Rate Limits</h2></div>
   <div class="grid g3">
-    <div class="card blue">
-      <div class="lbl">Tokens / Min</div>
-      <div class="val">{cfg['tpm']:,}</div></div>
-    <div class="card purple">
-      <div class="lbl">Tokens / Hour</div>
-      <div class="val">{cfg['tph']:,}</div></div>
-    <div class="card cyan">
-      <div class="lbl">Tokens / Day</div>
-      <div class="val">{cfg['tpd']:,}</div></div>
-    <div class="card green">
-      <div class="lbl">Requests / Min</div>
-      <div class="val">{cfg['rpm']:,}</div></div>
-    <div class="card orange">
-      <div class="lbl">Requests / Hour</div>
-      <div class="val">{cfg['rph']:,}</div></div>
-    <div class="card red">
-      <div class="lbl">Requests / Day</div>
-      <div class="val">{cfg['rpd']:,}</div></div>
+    <div class="card blue"><div class="lbl">Tokens / Min</div><div class="val">{cfg['tpm']:,}</div></div>
+    <div class="card purple"><div class="lbl">Tokens / Hour</div><div class="val">{cfg['tph']:,}</div></div>
+    <div class="card cyan"><div class="lbl">Tokens / Day</div><div class="val">{cfg['tpd']:,}</div></div>
+    <div class="card green"><div class="lbl">Requests / Min</div><div class="val">{cfg['rpm']:,}</div></div>
+    <div class="card orange"><div class="lbl">Requests / Hour</div><div class="val">{cfg['rph']:,}</div></div>
+    <div class="card red"><div class="lbl">Requests / Day</div><div class="val">{cfg['rpd']:,}</div></div>
   </div>
   <div class="sec"><h2>💰 Pricing</h2></div>
   <div class="grid g3">
-    <div class="card dark">
-      <div class="mi-l">Input / 1K tokens</div>
-      <div style="font-size:22px;font-weight:700;
-          color:#22c55e;margin-top:8px">
-        ${cfg['cost_in']:.5f}</div></div>
-    <div class="card dark">
-      <div class="mi-l">Output / 1K tokens</div>
-      <div style="font-size:22px;font-weight:700;
-          color:#f59e0b;margin-top:8px">
-        ${cfg['cost_out']:.5f}</div></div>
-    <div class="card dark">
-      <div class="mi-l">Env Variables</div>
-      <div style="font-size:12px;color:#94a3b8;
-          margin-top:8px;font-family:monospace">
-        AI_PROVIDER={AI_PROVIDER}<br>
-        AI_MODEL={AI_MODEL}</div></div>
+    <div class="card dark"><div class="mi-l">Input / 1K tokens</div>
+      <div style="font-size:22px;font-weight:700;color:#22c55e;margin-top:8px">${cfg['cost_in']:.5f}</div></div>
+    <div class="card dark"><div class="mi-l">Output / 1K tokens</div>
+      <div style="font-size:22px;font-weight:700;color:#f59e0b;margin-top:8px">${cfg['cost_out']:.5f}</div></div>
+    <div class="card dark"><div class="mi-l">Env Variables</div>
+      <div style="font-size:12px;color:#94a3b8;margin-top:8px;font-family:monospace">
+        AI_PROVIDER={AI_PROVIDER}<br>AI_MODEL={AI_MODEL}</div></div>
   </div>
   <div class="sec"><h2>📋 All Models</h2></div>
   <div class="tw"><div class="ts"><table>
     <thead><tr>
       <th>Provider</th><th>Model</th><th>TPM</th><th>RPM</th>
-      <th>Context</th><th>In $/1K</th><th>Out $/1K</th>
-      <th>Status</th>
+      <th>Context</th><th>In $/1K</th><th>Out $/1K</th><th>Status</th>
     </tr></thead>
     <tbody>{rows}</tbody>
   </table></div></div>
@@ -1827,37 +1389,26 @@ tr:hover td{background:#0d1628}
     @staticmethod
     def history(db):
         hist = db.execute(
-            "SELECT * FROM scan_history "
-            "ORDER BY timestamp DESC LIMIT 50",
+            "SELECT * FROM scan_history ORDER BY timestamp DESC LIMIT 50",
             fetch=True
         )
         rows = ""
         for h in hist:
             h = dict(h)
             rows += f"""<tr>
-              <td style="color:#64748b;font-family:monospace;
-                  font-size:12px">{h.get('timestamp', '')}</td>
-              <td><code class="path">
-                {h.get('scan_path', '')}</code></td>
-              <td style="color:#3b82f6;font-weight:600">
-                {h.get('total_files', 0)}</td>
-              <td style="color:#a78bfa;font-weight:600">
-                {h.get('ai_agents', 0)}</td>
-              <td style="color:#22c55e;font-weight:600">
-                {h.get('scripts', 0)}</td>
-              <td style="color:#f59e0b;font-weight:600">
-                {h.get('main_files', 0)}</td></tr>"""
+              <td style="color:#64748b;font-family:monospace;font-size:12px">
+                {h.get('timestamp', '')}</td>
+              <td><code class="path">{h.get('scan_path', '')}</code></td>
+              <td style="color:#3b82f6;font-weight:600">{h.get('total_files', 0)}</td>
+              <td style="color:#a78bfa;font-weight:600">{h.get('ai_agents', 0)}</td>
+              <td style="color:#22c55e;font-weight:600">{h.get('scripts', 0)}</td>
+              <td style="color:#f59e0b;font-weight:600">{h.get('main_files', 0)}</td></tr>"""
         if not rows:
-            rows = (
-                '<tr><td colspan="6" class="empty">'
-                'No history. Click 🔍 Scan</td></tr>'
-            )
+            rows = '<tr><td colspan="6" class="empty">No history. Click 🔍 Scan</td></tr>'
         body = f"""
 <div class="container">
-  <div class="sec">
-    <h2>📜 Scan History</h2>
-    <span class="badge">{len(hist)} scans</span>
-  </div>
+  <div class="sec"><h2>📜 Scan History</h2>
+    <span class="badge">{len(hist)} scans</span></div>
   <div class="tw"><div class="ts"><table>
     <thead><tr>
       <th>Timestamp</th><th>Path</th><th>Total</th>
@@ -1872,29 +1423,18 @@ tr:hover td{background:#0d1628}
     def scan_done(result):
         body = f"""
 <div class="container">
-  <div class="alert a-ok" style="margin-top:24px">
-    ✅ Scan complete!</div>
+  <div class="alert a-ok" style="margin-top:24px">✅ Scan complete!</div>
   <div class="grid g4" style="margin-top:16px">
-    <div class="card blue">
-      <div class="lbl">Total</div>
-      <div class="val">{result['total']}</div></div>
-    <div class="card purple">
-      <div class="lbl">AI Agents</div>
-      <div class="val">{result['ai']}</div></div>
-    <div class="card green">
-      <div class="lbl">Scripts</div>
-      <div class="val">{result['sc']}</div></div>
-    <div class="card orange">
-      <div class="lbl">Main Files</div>
-      <div class="val">{result['mn']}</div></div>
+    <div class="card blue"><div class="lbl">Total</div><div class="val">{result['total']}</div></div>
+    <div class="card purple"><div class="lbl">AI Agents</div><div class="val">{result['ai']}</div></div>
+    <div class="card green"><div class="lbl">Scripts</div><div class="val">{result['sc']}</div></div>
+    <div class="card orange"><div class="lbl">Main Files</div><div class="val">{result['mn']}</div></div>
   </div>
   <div style="text-align:center;margin-top:32px">
     <a href="/dashboard" class="nav-btn active"
-       style="font-size:15px;padding:12px 32px">
-      📊 Go to Dashboard</a>
+       style="font-size:15px;padding:12px 32px">📊 Go to Dashboard</a>
     <a href="/files" class="nav-btn"
-       style="font-size:15px;padding:12px 32px;margin-left:12px">
-      📂 View Files</a>
+       style="font-size:15px;padding:12px 32px;margin-left:12px">📂 View Files</a>
   </div>
 </div>"""
         return HTMLBuilder.page("Scan Done", "scan", body)
@@ -1903,15 +1443,12 @@ tr:hover td{background:#0d1628}
     def reset_done():
         body = """
 <div class="container">
-  <div class="alert a-warn" style="margin-top:24px">
-    🗑️ All data reset.</div>
+  <div class="alert a-warn" style="margin-top:24px">🗑️ All data reset.</div>
   <div style="text-align:center;margin-top:32px">
     <a href="/" class="nav-btn"
-       style="font-size:15px;padding:12px 32px">
-      🏠 Home</a>
+       style="font-size:15px;padding:12px 32px">🏠 Home</a>
     <a href="/scan" class="nav-btn success"
-       style="font-size:15px;padding:12px 32px;margin-left:12px">
-      🔍 Scan Again</a>
+       style="font-size:15px;padding:12px 32px;margin-left:12px">🔍 Scan Again</a>
   </div>
 </div>"""
         return HTMLBuilder.page("Reset", "reset", body)
