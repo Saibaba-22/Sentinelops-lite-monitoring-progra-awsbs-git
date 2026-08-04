@@ -1,4 +1,7 @@
-"""app.py — SentinelOps-Lite"""
+# ══════════════════════════════════════════════════════════════════════
+# BLOCK 1 — IMPORTS
+# ══════════════════════════════════════════════════════════════════════
+"""app.py — SentinelOps-Lite (final)"""
 from __future__ import annotations
 
 import os
@@ -16,17 +19,17 @@ from prometheus_client import (
     Counter, Gauge, Histogram, REGISTRY,
 )
 
-# ══════════════════════════════════════════════════════════════
-# PATHS + DB LOCATION
-# ══════════════════════════════════════════════════════════════
+
+# ══════════════════════════════════════════════════════════════════════
+# BLOCK 2 — PATHS, CONFIG, FLASK APP
+# ══════════════════════════════════════════════════════════════════════
 BASE_DIR = Path(__file__).resolve().parent
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
-# Force absolute DB path so all workers/threads share the same file
 os.environ.setdefault("METRICS_DB_PATH", "/tmp/agent_monitor.db")
 
-_START_TIME = time.time()
+_START_TIME   = time.time()
 _IMPORT_ERROR = None
 
 _CFG = {
@@ -47,12 +50,13 @@ _CFG = {
 
 application = Flask(__name__)
 
-# ══════════════════════════════════════════════════════════════
-# IMPORT agent_monitor
-# ══════════════════════════════════════════════════════════════
+
+# ══════════════════════════════════════════════════════════════════════
+# BLOCK 3 — AGENT_MONITOR IMPORT + COMPONENT INIT
+# ══════════════════════════════════════════════════════════════════════
 _MetricsDB = _ProjectScanner = _ResourceMonitor = None
-_HTMLBuilder = None
-_ACTIVE_CONFIG = {"name": _CFG["ai_model"], "provider": _CFG["ai_provider"]}
+_HTMLBuilder    = None
+_ACTIVE_CONFIG  = {"name": _CFG["ai_model"], "provider": _CFG["ai_provider"]}
 _MODEL_REGISTRY = {}
 _db = _scanner = _monitor = None
 
@@ -74,16 +78,13 @@ except Exception as e:
 
 
 def _init_components():
-    """Called on startup AND lazily if worker has None components."""
     global _db, _scanner, _monitor
     if not (_MetricsDB and _ProjectScanner and _ResourceMonitor):
         return False
     try:
-        # Force absolute DB path so every worker shares the same file
         try:
             _db = _MetricsDB(db_path=_CFG["db_path"])
         except TypeError:
-            # Older MetricsDB signature — patch afterwards
             _db = _MetricsDB()
             _db.db_path = _CFG["db_path"]
         _scanner = _ProjectScanner(_db)
@@ -104,9 +105,10 @@ def _init_components():
 
 _init_components()
 
-# ══════════════════════════════════════════════════════════════
-# PROMETHEUS METRICS
-# ══════════════════════════════════════════════════════════════
+
+# ══════════════════════════════════════════════════════════════════════
+# BLOCK 4 — PROMETHEUS METRICS (all metrics for all 4 dashboards)
+# ══════════════════════════════════════════════════════════════════════
 def _safe(cls, name, desc, labels=None):
     try:
         return cls(name, desc, labels) if labels else cls(name, desc)
@@ -117,6 +119,7 @@ def _safe(cls, name, desc, labels=None):
         raise
 
 
+# ── Request lifecycle ─────────────────────────────────────────────
 app_requests_total = _safe(
     Counter, "app_requests_total",
     "Total HTTP requests", ["method", "endpoint", "status"]
@@ -125,21 +128,101 @@ app_request_duration_seconds = _safe(
     Histogram, "app_request_duration_seconds",
     "Request duration seconds", ["method", "endpoint"]
 )
-app_errors_total = _safe(Counter, "app_errors_total", "5xx errors")
-app_exceptions_total = _safe(Counter, "app_exceptions_total", "Unhandled excs")
+app_errors_total        = _safe(Counter, "app_errors_total",        "5xx errors")
+app_exceptions_total    = _safe(Counter, "app_exceptions_total",    "Unhandled excs")
 http_status_codes_total = _safe(
     Counter, "http_status_codes_total", "HTTP status counts", ["code"]
 )
-python_process_cpu_percent = _safe(
-    Gauge, "python_process_cpu_percent", "Process CPU %"
+
+# ── Process / Python ──────────────────────────────────────────────
+python_process_cpu_percent           = _safe(Gauge, "python_process_cpu_percent",           "Process CPU %")
+python_process_memory_mb             = _safe(Gauge, "python_process_memory_mb",             "Process memory MB")
+python_process_resident_memory_bytes = _safe(Gauge, "python_process_resident_memory_bytes", "Process RSS bytes")
+python_thread_count                  = _safe(Gauge, "python_thread_count",                  "Live thread count")
+
+# ── App-level / Infra panels ──────────────────────────────────────
+app_active_sessions = _safe(Gauge,   "app_active_sessions", "Active sessions (5-min window)")
+app_active_users    = _safe(Gauge,   "app_active_users",    "Distinct user IPs (5-min window)")
+app_restart_total   = _safe(Counter, "app_restart_total",   "Number of process restarts")
+app_uptime_seconds  = _safe(Gauge,   "app_uptime_seconds",  "App uptime seconds")
+
+agent_status         = _safe(Gauge, "agent_status",         "1=up 0=down")
+agent_uptime_seconds = _safe(Gauge, "agent_uptime_seconds", "Uptime seconds")
+agent_cpu_percent    = _safe(Gauge, "agent_cpu_percent",    "Agent CPU %")
+agent_memory_mb      = _safe(Gauge, "agent_memory_mb",      "Agent memory MB")
+
+# ── Deployment panels ─────────────────────────────────────────────
+deployment_info = _safe(
+    Gauge, "deployment_info",
+    "Deployment metadata (always 1, labels carry info)",
+    ["version", "build", "environment", "cloud", "region", "provider", "model"]
 )
-python_process_memory_mb = _safe(
-    Gauge, "python_process_memory_mb", "Process memory MB"
+deployment_restart_total  = _safe(Counter, "deployment_restart_total",  "Process restarts")
+deployment_uptime_seconds = _safe(Gauge,   "deployment_uptime_seconds", "Deployment uptime seconds")
+container_status          = _safe(Gauge,   "container_status",          "1=healthy 0=unhealthy")
+
+# ── AI Agents panels ──────────────────────────────────────────────
+agent_state = _safe(
+    Gauge, "agent_state",
+    "1 when agent is in this state, 0 otherwise",
+    ["agent_name", "stage", "cloud", "state"]
 )
-agent_status = _safe(Gauge, "agent_status", "1=up 0=down")
-agent_uptime_seconds = _safe(Gauge, "agent_uptime_seconds", "Uptime s")
-agent_cpu_percent = _safe(Gauge, "agent_cpu_percent", "Agent CPU %")
-agent_memory_mb = _safe(Gauge, "agent_memory_mb", "Agent mem MB")
+agent_last_run_timestamp_seconds = _safe(
+    Gauge, "agent_last_run_timestamp_seconds",
+    "Unix timestamp of most recent report",
+    ["agent_name", "stage", "cloud"]
+)
+agent_prompt_tokens_total = _safe(
+    Counter, "agent_prompt_tokens_total",
+    "Prompt tokens consumed",
+    ["agent_name", "stage", "cloud", "provider", "model"]
+)
+agent_completion_tokens_total = _safe(
+    Counter, "agent_completion_tokens_total",
+    "Completion tokens generated",
+    ["agent_name", "stage", "cloud", "provider", "model"]
+)
+agent_token_usage_total = _safe(
+    Counter, "agent_token_usage_total",
+    "Total tokens (prompt + completion)",
+    ["agent_name", "stage", "cloud", "provider", "model"]
+)
+agent_api_calls_total = _safe(
+    Counter, "agent_api_calls_total",
+    "API calls made by an agent",
+    ["agent_name", "stage", "cloud", "provider", "model", "status"]
+)
+agent_tasks_total = _safe(
+    Counter, "agent_tasks_total",
+    "Tasks executed",
+    ["agent_name", "stage", "cloud", "result"]
+)
+agent_api_response_time_seconds = _safe(
+    Histogram, "agent_api_response_time_seconds",
+    "API response time",
+    ["agent_name", "stage", "cloud", "provider", "model"]
+)
+agent_execution_duration_seconds = _safe(
+    Histogram, "agent_execution_duration_seconds",
+    "Total agent execution duration",
+    ["agent_name", "stage", "cloud"]
+)
+agent_execution_time_seconds = _safe(
+    Gauge, "agent_execution_time_seconds",
+    "Latest execution time reported",
+    ["agent_name", "stage", "cloud"]
+)
+agent_last_decision = _safe(
+    Gauge, "agent_last_decision",
+    "1 for the most recent decision, 0 for old ones",
+    ["agent_name", "stage", "cloud", "decision"]
+)
+agent_api_key_count = _safe(
+    Gauge, "agent_api_key_count",
+    "Number of API keys configured",
+    ["agent_name"]
+)
+
 
 APP_STATS = {
     "total_requests": 0, "success_requests": 0, "failed_requests": 0,
@@ -150,17 +233,28 @@ APP_STATS_LOCK = threading.Lock()
 
 def _update_process_metrics():
     try:
-        p = psutil.Process(os.getpid())
-        cpu = p.cpu_percent(interval=None)
-        mem_mb = p.memory_info().rss / (1024 * 1024)
+        p       = psutil.Process(os.getpid())
+        cpu     = p.cpu_percent(interval=None)
+        mem_rss = p.memory_info().rss
+        mem_mb  = mem_rss / (1024 * 1024)
+        threads = threading.active_count()
+        uptime  = time.time() - _START_TIME
+
         python_process_cpu_percent.set(cpu)
         python_process_memory_mb.set(mem_mb)
+        python_process_resident_memory_bytes.set(mem_rss)
+        python_thread_count.set(threads)
+
         agent_cpu_percent.set(cpu)
         agent_memory_mb.set(mem_mb)
         agent_status.set(1)
-        agent_uptime_seconds.set(time.time() - _START_TIME)
+        agent_uptime_seconds.set(uptime)
+
+        app_uptime_seconds.set(uptime)
+        deployment_uptime_seconds.set(uptime)
+        container_status.set(1)
     except Exception:
-        pass
+        container_status.set(0)
 
 
 def _metrics_loop(interval=15):
@@ -169,17 +263,57 @@ def _metrics_loop(interval=15):
         time.sleep(interval)
 
 
+# One-shot boot init
+try:
+    deployment_info.labels(
+        version=_CFG["app_version"], build=_CFG["build_number"],
+        environment=_CFG["environment"], cloud=_CFG["target_cloud"],
+        region=_CFG["aws_region"], provider=_CFG["ai_provider"],
+        model=_CFG["ai_model"],
+    ).set(1)
+    deployment_restart_total.inc()
+    app_restart_total.inc()
+    container_status.set(1)
+except Exception as e:
+    print(f"[app] deployment metric init failed: {e}")
+
+
 _update_process_metrics()
 threading.Thread(target=_metrics_loop, args=(15,), daemon=True).start()
 
 
-# ══════════════════════════════════════════════════════════════
-# REQUEST HOOKS
-# ══════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════
+# BLOCK 5 — REQUEST HOOKS + HELPERS (incl. session tracking)
+# ══════════════════════════════════════════════════════════════════════
+_SESSION_TTL = 300
+_sessions    = {}
+_users       = {}
+_sess_lock   = threading.Lock()
+
+
+def _touch_session():
+    try:
+        now = time.time()
+        ip  = request.headers.get("X-Forwarded-For", request.remote_addr) or "unknown"
+        sid = (request.cookies.get("session")
+               or request.headers.get("X-Session-Id") or ip)
+        with _sess_lock:
+            _sessions[sid] = now
+            _users[ip]     = now
+            cutoff = now - _SESSION_TTL
+            for d in (_sessions, _users):
+                for k in [k for k, v in d.items() if v < cutoff]:
+                    del d[k]
+            app_active_sessions.set(len(_sessions))
+            app_active_users.set(len(_users))
+    except Exception:
+        pass
+
+
 @application.before_request
 def _t_start():
     request._start_time = time.time()
-    # Lazy init: if this worker has no components yet, init them
+    _touch_session()
     if _db is None or _scanner is None or _monitor is None:
         if _MetricsDB and _ProjectScanner and _ResourceMonitor:
             _init_components()
@@ -210,9 +344,6 @@ def _t_end(resp):
     return resp
 
 
-# ══════════════════════════════════════════════════════════════
-# HELPERS
-# ══════════════════════════════════════════════════════════════
 def _uptime():
     return max(0.0, time.time() - _START_TIME)
 
@@ -220,11 +351,11 @@ def _uptime():
 def _system_dict():
     try:
         vm = psutil.virtual_memory()
-        p = psutil.Process(os.getpid())
+        p  = psutil.Process(os.getpid())
         return {
             "cpu_usage_percent":   psutil.cpu_percent(interval=None),
             "memory_total_mb":     round(vm.total / 1048576, 2),
-            "memory_used_mb":      round(vm.used / 1048576, 2),
+            "memory_used_mb":      round(vm.used  / 1048576, 2),
             "memory_percent":      vm.percent,
             "process_cpu_percent": p.cpu_percent(interval=None),
             "process_memory_mb":   round(p.memory_info().rss / 1048576, 2),
@@ -251,9 +382,9 @@ def _check_monitor_header(cfg_token):
     return request.headers.get("X-Monitor-Token", "") == cfg_token
 
 
-# ══════════════════════════════════════════════════════════════
-# CORE ROUTES
-# ══════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════
+# BLOCK 6 — CORE ROUTES
+# ══════════════════════════════════════════════════════════════════════
 @application.get("/")
 def home():
     try:
@@ -276,6 +407,7 @@ def health():
     except Exception as e:
         checks["database"] = f"error: {e}"
         status_str, http = "degraded", 503
+    container_status.set(1 if status_str == "healthy" else 0)
     return jsonify({
         "status":         status_str,
         "checks":         checks,
@@ -297,17 +429,11 @@ def api_root():
 @application.get("/api/status")
 def api_status():
     return jsonify({
-        "application": {
-            "name": "SentinelOps-Lite",
-            "status": "running",
-            "uptime": _uptime(),
-        },
+        "application": {"name": "SentinelOps-Lite",
+                        "status": "running", "uptime": _uptime()},
         "system": _system_dict(),
-        "agent": {
-            "provider": _CFG["ai_provider"],
-            "model":    _CFG["ai_model"],
-            "status":   "running",
-        },
+        "agent": {"provider": _CFG["ai_provider"],
+                  "model": _CFG["ai_model"], "status": "running"},
         "deployment": {
             "version":     _CFG["app_version"],
             "build":       _CFG["build_number"],
@@ -328,182 +454,9 @@ def agent_status_route():
     }), 200
 
 
-# ══════════════════════════════════════════════════════════════
-# DEBUG ROUTES
-# ══════════════════════════════════════════════════════════════
-@application.get("/debug")
-def debug_page():
-    import traceback
-    info = {
-        "pid":           os.getpid(),
-        "_db":           str(_db),
-        "_db_path":      _db.db_path if _db else None,
-        "_scanner":      str(_scanner),
-        "_monitor":      str(_monitor),
-        "_HTMLBuilder":  str(_HTMLBuilder),
-        "_IMPORT_ERROR": _IMPORT_ERROR,
-        "BASE_DIR":      str(BASE_DIR),
-        "SCAN_PATH":     _CFG["scan_path"],
-        "cwd":           os.getcwd(),
-        "AI_MODEL":      _CFG["ai_model"],
-        "AI_PROVIDER":   _CFG["ai_provider"],
-    }
-    try:
-        if _db:
-            rows = _db.execute(
-                "SELECT COUNT(*) as c FROM detected_files", fetch=True
-            )
-            info["db_file_count"] = dict(rows[0])["c"] if rows else 0
-    except Exception as e:
-        info["db_error"] = str(e)
-    try:
-        info["files_in_base"] = os.listdir(str(BASE_DIR))[:30]
-    except Exception as e:
-        info["files_in_base_error"] = str(e)
-    return jsonify(info), 200
-
-
-@application.get("/debug2")
-def debug2():
-    try:
-        rows = _db.execute(
-            "SELECT * FROM detected_files LIMIT 5", fetch=True
-        )
-        return jsonify({
-            "pid":    os.getpid(),
-            "count":  len(rows) if rows else 0,
-            "sample": [dict(r) for r in (rows or [])],
-        })
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-@application.get("/debug3")
-def debug3():
-    """Return exactly what _get_data() gives to the dashboard."""
-    try:
-        files, metrics = _get_data()
-        return jsonify({
-            "pid":          os.getpid(),
-            "files_count":  len(files),
-            "files_sample": files[:3],
-            "system":       metrics.get("system", {}),
-            "tokens_keys":  list(metrics.get("tokens", {}).keys())[:5],
-            "req_keys":     list(metrics.get("requests", {}).keys())[:5],
-        })
-    except Exception as e:
-        import traceback
-        return jsonify(
-            {"error": str(e), "traceback": traceback.format_exc()}
-        ), 500
-
-
-@application.get("/debug4")
-def debug4():
-    return jsonify({
-        "pid":         os.getpid(),
-        "db_id":       id(_db) if _db else None,
-        "db_path":     _db.db_path if _db else None,
-        "scanner_id":  id(_scanner) if _scanner else None,
-        "monitor_id":  id(_monitor) if _monitor else None,
-    })
-
-@application.get("/debug5")
-def debug5():
-    """Test the exact SQL from _get_data() step by step."""
-    try:
-        # Test 1: basic select (should work — same as debug2)
-        r1 = _db.execute("SELECT * FROM detected_files", fetch=True)
-
-        # Test 2: with ORDER BY
-        r2 = _db.execute(
-            "SELECT * FROM detected_files ORDER BY file_name", fetch=True
-        )
-
-        # Test 3: the exact query from _get_data
-        r3 = _db.execute(
-            "SELECT * FROM detected_files ORDER BY is_ai_agent DESC, "
-            "is_script DESC, is_main_file DESC, file_name", fetch=True
-        )
-
-        return jsonify({
-            "test1_basic":      len(r1) if r1 else 0,
-            "test2_order":      len(r2) if r2 else 0,
-            "test3_full_order": len(r3) if r3 else 0,
-            "r1_type":          str(type(r1)),
-            "r3_type":          str(type(r3)),
-            "r3_is_none":       r3 is None,
-        })
-    except Exception as e:
-        import traceback
-        return jsonify(
-            {"error": str(e), "traceback": traceback.format_exc()}
-        ), 500
-
-
-@application.get("/debug6")
-def debug6():
-    """Call _get_data() and dump every intermediate value."""
-    import traceback
-    info = {
-        "_db_is_None":      _db is None,
-        "_monitor_is_None": _monitor is None,
-        "_scanner_is_None": _scanner is None,
-    }
-    try:
-        rows = _db.execute(
-            "SELECT * FROM detected_files ORDER BY is_ai_agent DESC, "
-            "is_script DESC, is_main_file DESC, file_name", fetch=True
-        )
-        info["raw_rows_type"] = str(type(rows))
-        info["raw_rows_len"]  = len(rows) if rows is not None else "None"
-        info["raw_rows_bool"] = bool(rows)
-
-        # This is the exact line _get_data uses
-        result = [dict(r) for r in (rows or [])]
-        info["result_len"] = len(result)
-        info["first_row"]  = result[0] if result else None
-
-        m = _monitor.get_all_metrics()
-        info["metrics_keys"]      = list(m.keys())
-        info["metrics_system"]    = m.get("system", {})
-    except Exception as e:
-        info["error"]     = str(e)
-        info["traceback"] = traceback.format_exc()
-    return jsonify(info), 200
-
-@application.get("/debug7")
-def debug7():
-    return jsonify({
-        "monitoring_flag": getattr(_monitor, "monitoring", None),
-        "tok_log_keys":    list(getattr(_monitor, "_tok_log", {}).keys()),
-        "req_log_keys":    list(getattr(_monitor, "_req_log", {}).keys()),
-        "tok_log_sample":  {
-            k: len(v) for k, v in
-            list(getattr(_monitor, "_tok_log", {}).items())[:5]
-        },
-        "metrics_tokens":  dict(_monitor.metrics.get("tokens", {})),
-        "metrics_system":  _monitor.metrics.get("system", {}),
-    })
-
-    
-@application.get("/rescan")
-def rescan():
-    try:
-        target = _CFG["scan_path"] or str(BASE_DIR)
-        files = _scanner.scan_project(target)
-        return jsonify({
-            "pid":     os.getpid(),
-            "scanned": len(files),
-            "path":    target,
-            "ai":      sum(1 for f in files if f.get("is_ai_agent")),
-            "sc":      sum(1 for f in files if f.get("is_script")),
-            "mn":      sum(1 for f in files if f.get("is_main_file")),
-        })
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
+# ══════════════════════════════════════════════════════════════════════
+# BLOCK 7 — PROMETHEUS + CI-AGENT INGEST
+# ══════════════════════════════════════════════════════════════════════
 @application.get("/metrics", endpoint="app_prometheus_metrics")
 def prom_metrics():
     if _CFG["metrics_token"] and not _check_bearer(_CFG["metrics_token"]):
@@ -512,17 +465,124 @@ def prom_metrics():
     return Response(generate_latest(), content_type=CONTENT_TYPE_LATEST)
 
 
+_agent_state_cache    = {}
+_agent_decision_cache = {}
+
+
 @application.post("/monitor/status")
 def monitor_status():
+    """
+    Ingest CI-agent events. Expected payload:
+    {
+      "agent_name": "pre_check_agent" | "during_check_agent" | "post_check_agent",
+      "stage":      "pre_deploy" | "during_deploy" | "post_deploy",
+      "cloud":      "aws",
+      "provider":   "gemini",
+      "model":      "gemini-2.5-flash",
+      "state":      "running" | "approved" | "rejected",
+      "decision":   "pass" | "fail" | "skip",
+      "status":     "success" | "failed",
+      "prompt_tokens":     123,
+      "completion_tokens": 45,
+      "total_tokens":      168,
+      "api_calls":         3,
+      "task_result":       "pass",
+      "task_count":        1,
+      "execution_time_seconds":    1.42,
+      "api_response_time_seconds": 0.31,
+      "api_key_count":     1
+    }
+    """
     if _CFG["monitor_token"] and not _check_monitor_header(_CFG["monitor_token"]):
         return jsonify({"ok": False, "error": "unauthorized"}), 401
-    _ = request.get_json(silent=True) or {}
+
+    p = request.get_json(silent=True) or {}
+    agent    = str(p.get("agent_name", "unknown"))
+    stage    = str(p.get("stage",      "unknown"))
+    cloud    = str(p.get("cloud",      "aws"))
+    provider = str(p.get("provider",   _CFG["ai_provider"]))
+    model    = str(p.get("model",      _CFG["ai_model"]))
+
+    try:
+        new_state = str(p.get("state", "running"))
+        key = (agent, stage, cloud)
+        old = _agent_state_cache.get(key)
+        if old and old != new_state:
+            agent_state.labels(agent_name=agent, stage=stage,
+                               cloud=cloud, state=old).set(0)
+        agent_state.labels(agent_name=agent, stage=stage,
+                           cloud=cloud, state=new_state).set(1)
+        _agent_state_cache[key] = new_state
+
+        agent_last_run_timestamp_seconds.labels(
+            agent_name=agent, stage=stage, cloud=cloud
+        ).set(time.time())
+
+        pt = int(p.get("prompt_tokens",     0) or 0)
+        ct = int(p.get("completion_tokens", 0) or 0)
+        tt = int(p.get("total_tokens",      pt + ct) or 0)
+        common = dict(agent_name=agent, stage=stage, cloud=cloud,
+                      provider=provider, model=model)
+        if pt > 0: agent_prompt_tokens_total.labels(**common).inc(pt)
+        if ct > 0: agent_completion_tokens_total.labels(**common).inc(ct)
+        if tt > 0: agent_token_usage_total.labels(**common).inc(tt)
+
+        api_status = str(p.get("status", "success")).lower()
+        api_status = "success" if api_status in (
+            "success", "ok", "pass", "approved") else "failed"
+        api_calls = int(p.get("api_calls", 1) or 0)
+        if api_calls > 0:
+            agent_api_calls_total.labels(
+                agent_name=agent, stage=stage, cloud=cloud,
+                provider=provider, model=model, status=api_status,
+            ).inc(api_calls)
+
+        task_count  = int(p.get("task_count", 1) or 0)
+        task_result = str(p.get("task_result", api_status))
+        if task_count > 0:
+            agent_tasks_total.labels(
+                agent_name=agent, stage=stage,
+                cloud=cloud, result=task_result,
+            ).inc(task_count)
+
+        api_s = float(p.get("api_response_time_seconds", 0) or 0)
+        ex_s  = float(p.get("execution_time_seconds",    0) or 0)
+        if api_s > 0:
+            agent_api_response_time_seconds.labels(**common).observe(api_s)
+        if ex_s > 0:
+            agent_execution_duration_seconds.labels(
+                agent_name=agent, stage=stage, cloud=cloud
+            ).observe(ex_s)
+            agent_execution_time_seconds.labels(
+                agent_name=agent, stage=stage, cloud=cloud
+            ).set(ex_s)
+
+        decision = p.get("decision")
+        if decision:
+            decision = str(decision)
+            old_dec = _agent_decision_cache.get(key)
+            if old_dec and old_dec != decision:
+                agent_last_decision.labels(
+                    agent_name=agent, stage=stage,
+                    cloud=cloud, decision=old_dec).set(0)
+            agent_last_decision.labels(
+                agent_name=agent, stage=stage,
+                cloud=cloud, decision=decision).set(1)
+            _agent_decision_cache[key] = decision
+
+        key_cnt = int(p.get("api_key_count", 0) or 0)
+        if key_cnt > 0:
+            agent_api_key_count.labels(agent_name=agent).set(key_cnt)
+
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"metric error: {e}"}), 500
+
     return jsonify({"ok": True, "timestamp": time.time()}), 200
 
 
-# ══════════════════════════════════════════════════════════════
-# DASHBOARD DATA — auto-scans if DB empty, works cross-worker
-# ══════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════
+# BLOCK 8 — DASHBOARD ROUTES (agent_monitor UI)
+# ══════════════════════════════════════════════════════════════════════
 def _get_data():
     if _db is None or _monitor is None:
         return [], {"system": {}, "tokens": {}, "requests": {}, "resources": {}}
@@ -550,91 +610,67 @@ def _err_page(page, extra=""):
         "background:#0f172a;color:#e2e8f0'>"
         f"<h1>{page} unavailable</h1>"
         f"<pre style='background:#1e293b;padding:16px;color:#f87171'>"
-        f"pid          = {os.getpid()}\n"
-        f"_HTMLBuilder = {_HTMLBuilder}\n"
-        f"_db          = {_db}\n"
-        f"_scanner     = {_scanner}\n"
-        f"_monitor     = {_monitor}\n"
-        f"import error: {_IMPORT_ERROR}\n"
-        f"{extra}"
-        "</pre>"
-        "<p><a href='/' style='color:#60a5fa'>Home</a></p>"
+        f"pid={os.getpid()} _HTMLBuilder={_HTMLBuilder} _db={_db}\n"
+        f"_scanner={_scanner} _monitor={_monitor}\n"
+        f"import error: {_IMPORT_ERROR}\n{extra}"
+        "</pre><p><a href='/' style='color:#60a5fa'>Home</a></p>"
         "</body></html>"
     )
 
 
 @application.get("/dashboard")
 def dashboard_page():
-    if _HTMLBuilder is None:
-        return _err_page("Dashboard")
+    if _HTMLBuilder is None: return _err_page("Dashboard")
     try:
-        f, m = _get_data()
-        return _html(_HTMLBuilder.dashboard(f, m))
-    except Exception as e:
-        return _err_page("Dashboard", f"Runtime: {e}")
+        f, m = _get_data();  return _html(_HTMLBuilder.dashboard(f, m))
+    except Exception as e:   return _err_page("Dashboard", f"Runtime: {e}")
 
 
 @application.get("/files")
 def files_page():
-    if _HTMLBuilder is None:
-        return _err_page("Files")
+    if _HTMLBuilder is None: return _err_page("Files")
     try:
-        f, _ = _get_data()
-        return _html(_HTMLBuilder.files(f))
-    except Exception as e:
-        return _err_page("Files", f"Runtime: {e}")
+        f, _ = _get_data();  return _html(_HTMLBuilder.files(f))
+    except Exception as e:   return _err_page("Files", f"Runtime: {e}")
 
 
 @application.get("/agents")
 def agents_page():
-    if _HTMLBuilder is None:
-        return _err_page("Agents")
+    if _HTMLBuilder is None: return _err_page("Agents")
     try:
-        f, m = _get_data()
-        return _html(_HTMLBuilder.agents(f, m))
-    except Exception as e:
-        return _err_page("Agents", f"Runtime: {e}")
+        f, m = _get_data();  return _html(_HTMLBuilder.agents(f, m))
+    except Exception as e:   return _err_page("Agents", f"Runtime: {e}")
 
 
 @application.get("/monitor")
 def monitor_page():
-    if _HTMLBuilder is None:
-        return _err_page("Monitor")
+    if _HTMLBuilder is None: return _err_page("Monitor")
     try:
-        _, m = _get_data()
-        return _html(_HTMLBuilder.monitor(m))
-    except Exception as e:
-        return _err_page("Monitor", f"Runtime: {e}")
+        _, m = _get_data();  return _html(_HTMLBuilder.monitor(m))
+    except Exception as e:   return _err_page("Monitor", f"Runtime: {e}")
 
 
 @application.get("/model")
 def model_page():
-    if _HTMLBuilder is None:
-        return _err_page("Model")
+    if _HTMLBuilder is None: return _err_page("Model")
     try:
         return _html(_HTMLBuilder.model())
-    except Exception as e:
-        return _err_page("Model", f"Runtime: {e}")
+    except Exception as e:   return _err_page("Model", f"Runtime: {e}")
 
 
 @application.get("/history")
 def history_page():
-    if _HTMLBuilder is None or _db is None:
-        return _err_page("History")
+    if _HTMLBuilder is None or _db is None: return _err_page("History")
     try:
         return _html(_HTMLBuilder.history(_db))
-    except Exception as e:
-        return _err_page("History", f"Runtime: {e}")
+    except Exception as e:   return _err_page("History", f"Runtime: {e}")
 
 
 @application.get("/scan")
 def scan_page():
-    if _HTMLBuilder is None or _scanner is None:
-        return _err_page("Scan")
+    if _HTMLBuilder is None or _scanner is None: return _err_page("Scan")
     try:
-        sp = request.args.get(
-            "path", _CFG["scan_path"] or str(BASE_DIR)
-        )
+        sp = request.args.get("path", _CFG["scan_path"] or str(BASE_DIR))
         scanned = _scanner.scan_project(sp)
         r = {
             "total": len(scanned),
@@ -643,26 +679,22 @@ def scan_page():
             "mn":    sum(1 for f in scanned if f["is_main_file"]),
         }
         return _html(_HTMLBuilder.scan_done(r))
-    except Exception as e:
-        return _err_page("Scan", f"Runtime: {e}")
+    except Exception as e:   return _err_page("Scan", f"Runtime: {e}")
 
 
 @application.get("/reset")
 def reset_page():
-    if _HTMLBuilder is None or _db is None:
-        return _err_page("Reset")
+    if _HTMLBuilder is None or _db is None: return _err_page("Reset")
     try:
-        for t in ("detected_files", "token_usage",
-                  "request_usage", "resource_usage"):
+        for t in ("detected_files","token_usage","request_usage","resource_usage"):
             _db.execute(f"DELETE FROM {t}")
         return _html(_HTMLBuilder.reset_done())
-    except Exception as e:
-        return _err_page("Reset", f"Runtime: {e}")
+    except Exception as e:   return _err_page("Reset", f"Runtime: {e}")
 
 
-# ══════════════════════════════════════════════════════════════
-# ERROR HANDLERS
-# ══════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════
+# BLOCK 9 — ERROR HANDLERS
+# ══════════════════════════════════════════════════════════════════════
 @application.errorhandler(404)
 def _404(e):
     return jsonify({"error": "Not found", "status": 404}), 404
@@ -680,6 +712,20 @@ def _exc(e):
     return jsonify({"error": "Internal server error", "status": 500}), 500
 
 
+# ══════════════════════════════════════════════════════════════════════
+# BLOCK 10 — OPTIONAL DEBUG BLUEPRINT
+# ══════════════════════════════════════════════════════════════════════
+try:
+    from debug_routes import debug_bp
+    application.register_blueprint(debug_bp)
+    print("[app] debug_routes registered at /debug/*")
+except Exception:
+    pass
+
+
+# ══════════════════════════════════════════════════════════════════════
+# BLOCK 11 — ENTRY
+# ══════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
     application.run(
         host="0.0.0.0",

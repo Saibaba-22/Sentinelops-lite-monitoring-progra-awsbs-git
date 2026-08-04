@@ -1,69 +1,274 @@
 {
-  "annotations": { "list": [] },
+  "annotations": {"list": []},
   "editable": true,
-  "graphTooltip": 0,
+  "graphTooltip": 1,
   "schemaVersion": 39,
   "tags": ["sentinelops-lite", "deployment"],
-  "templating": { "list": [] },
-  "time": { "from": "now-1h", "to": "now" },
+  "templating": {"list": []},
+  "time": {"from": "now-6h", "to": "now"},
   "timezone": "",
   "title": "Deployment",
   "uid": "deployment",
-  "version": 1,
+  "version": 2,
+  "refresh": "30s",
   "panels": [
     {
       "id": 1,
       "type": "table",
       "title": "Deployment Metadata",
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
-      "fieldConfig": { "defaults": { "custom": { "align": "auto", "cellOptions": { "type": "auto" }, "inspect": false } }, "overrides": [] },
-      "options": { "showHeader": true, "sortBy": [] },
-      "targets": [ { "refId": "A", "expr": "deployment_info", "legendFormat": "{{version}}" } ]
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+      "fieldConfig": {
+        "defaults": {
+          "custom": {"align": "auto", "cellOptions": {"type": "auto"}, "inspect": false}
+        },
+        "overrides": []
+      },
+      "options": {"showHeader": true, "sortBy": []},
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "deployment_info",
+          "instant": true,
+          "format": "table"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "__name__": true,
+              "Value": true,
+              "job": true,
+              "instance": true
+            },
+            "indexByName": {
+              "version": 0,
+              "build": 1,
+              "environment": 2,
+              "cloud": 3,
+              "region": 4,
+              "provider": 5,
+              "model": 6
+            },
+            "renameByName": {
+              "version":     "Version",
+              "build":       "Build",
+              "environment": "Environment",
+              "cloud":       "Cloud",
+              "region":      "Region",
+              "provider":    "AI Provider",
+              "model":       "AI Model"
+            }
+          }
+        }
+      ]
     },
     {
       "id": 2,
       "type": "stat",
       "title": "Container Status",
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 0 },
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": {"h": 8, "w": 6, "x": 12, "y": 0},
       "fieldConfig": {
         "defaults": {
           "unit": "short",
-          "custom": {},
-          "thresholds": { "mode": "categorical", "steps": [ { "color": "red", "value": 0 }, { "color": "green", "value": 1 } ] },
-          "mappings": [ { "type": "value", "options": { "0": { "text": "Unhealthy" }, "1": { "text": "Healthy" } } } ]
+          "mappings": [
+            {"type": "value", "options": {"0": {"text": "Unhealthy", "color": "red"}}},
+            {"type": "value", "options": {"1": {"text": "Healthy",   "color": "green"}}}
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "red",   "value": null},
+              {"color": "green", "value": 1}
+            ]
+          }
         },
         "overrides": []
       },
-      "targets": [ { "refId": "A", "expr": "container_status", "legendFormat": "status" } ]
+      "targets": [{"refId": "A", "expr": "container_status", "legendFormat": "status"}]
     },
     {
       "id": 3,
       "type": "stat",
       "title": "Restart Count",
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 0 },
-      "fieldConfig": { "defaults": { "unit": "short", "custom": {} }, "overrides": [] },
-      "targets": [ { "refId": "A", "expr": "deployment_restart_total" } ]
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": {"h": 8, "w": 6, "x": 18, "y": 0},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "yellow", "value": 3},
+              {"color": "red", "value": 10}
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [{"refId": "A", "expr": "deployment_restart_total"}]
     },
     {
       "id": 4,
       "type": "timeseries",
       "title": "Deployment Uptime",
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
-      "fieldConfig": { "defaults": { "unit": "dthms", "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "showPoints": "never" } }, "overrides": [] },
-      "targets": [ { "refId": "A", "expr": "deployment_uptime_seconds", "legendFormat": "uptime" } ]
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "dtdurations",
+          "custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "showPoints": "never"}
+        },
+        "overrides": []
+      },
+      "targets": [{"refId": "A", "expr": "deployment_uptime_seconds", "legendFormat": "uptime"}]
     },
     {
       "id": 5,
       "type": "timeseries",
-      "title": "Container Health",
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
-      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10, "showPoints": "never" } }, "overrides": [] },
-      "targets": [ { "refId": "A", "expr": "container_status", "legendFormat": "healthy" } ]
+      "title": "Container Health Over Time",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "max": 1,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 20,
+            "showPoints": "never",
+            "spanNulls": true
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {"refId": "A", "expr": "container_status", "legendFormat": "healthy"},
+        {"refId": "B", "expr": "agent_status",     "legendFormat": "agent"}
+      ]
+    },
+    {
+      "id": 6,
+      "type": "stat",
+      "title": "Current Version",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": {"h": 4, "w": 6, "x": 0, "y": 16},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "string",
+          "custom": {},
+          "color": {"mode": "fixed", "fixedColor": "blue"}
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "/^version$/", "values": false},
+        "textMode": "value",
+        "colorMode": "value",
+        "graphMode": "none"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "deployment_info",
+          "instant": true,
+          "format": "table"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "stat",
+      "title": "Environment",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": {"h": 4, "w": 6, "x": 6, "y": 16},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "string",
+          "custom": {},
+          "color": {"mode": "fixed", "fixedColor": "purple"}
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "/^environment$/", "values": false},
+        "textMode": "value",
+        "colorMode": "value",
+        "graphMode": "none"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "deployment_info",
+          "instant": true,
+          "format": "table"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "type": "stat",
+      "title": "Cloud / Region",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": {"h": 4, "w": 6, "x": 12, "y": 16},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "string",
+          "custom": {},
+          "color": {"mode": "fixed", "fixedColor": "orange"}
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "/^region$/", "values": false},
+        "textMode": "value",
+        "colorMode": "value",
+        "graphMode": "none"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "deployment_info",
+          "instant": true,
+          "format": "table"
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "type": "stat",
+      "title": "AI Model",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": {"h": 4, "w": 6, "x": 18, "y": 16},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "string",
+          "custom": {},
+          "color": {"mode": "fixed", "fixedColor": "green"}
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "/^model$/", "values": false},
+        "textMode": "value",
+        "colorMode": "value",
+        "graphMode": "none"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "deployment_info",
+          "instant": true,
+          "format": "table"
+        }
+      ]
     }
   ]
 }
