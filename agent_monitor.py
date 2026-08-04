@@ -5,7 +5,7 @@ agent_monitor.py
 Pure classes only — no HTTP server, no Flask.
 Imported by app.py which owns all routing.
 """
-
+from __future__ import annotations
 import os
 import sys
 import time
@@ -19,7 +19,6 @@ import random
 from pathlib import Path
 from collections import defaultdict
 from prometheus_client import Gauge, Counter, Histogram
-from __future__ import annotations
 import requests
 
 
