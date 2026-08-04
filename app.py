@@ -1,7 +1,7 @@
 # ══════════════════════════════════════════════════════════════════════
 # BLOCK 1 — IMPORTS
 # ══════════════════════════════════════════════════════════════════════
-"""app.py — SentinelOps-Lite (final)"""
+"""app.py — SentinelOps-Lite (final, clean)"""
 from __future__ import annotations
 
 import os
@@ -11,18 +11,13 @@ import threading
 from pathlib import Path
 
 import psutil
-
-from agent_metrics import init_agent, set_agent_state, record_agent_run
-import time
-
-# ── Initialize your 3 agents on startup ─────────────────────
-# These match your dashboard panel names exactly!
-from flask import ( Flask, Blueprint, render_template, Response, request, jsonify )
-from prometheus_client import ( CONTENT_TYPE_LATEST, generate_latest, Counter, Gauge, Histogram, REGISTRY )
-
-init_agent("test_agent",  api_key_count=1)
-init_agent("errors",      api_key_count=1)
-init_agent("final_agent", api_key_count=1)
+from flask import (
+    Flask, Blueprint, render_template, Response, request, jsonify,
+)
+from prometheus_client import (
+    CONTENT_TYPE_LATEST, generate_latest,
+    Counter, Gauge, Histogram, REGISTRY,
+)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -124,7 +119,7 @@ def _safe(cls, name, desc, labels=None):
         raise
 
 
-# ── Request lifecycle ─────────────────────────────────────────────
+# Request lifecycle
 app_requests_total = _safe(
     Counter, "app_requests_total",
     "Total HTTP requests", ["method", "endpoint", "status"]
@@ -139,13 +134,13 @@ http_status_codes_total = _safe(
     Counter, "http_status_codes_total", "HTTP status counts", ["code"]
 )
 
-# ── Process / Python ──────────────────────────────────────────────
+# Process / Python
 python_process_cpu_percent           = _safe(Gauge, "python_process_cpu_percent",           "Process CPU %")
 python_process_memory_mb             = _safe(Gauge, "python_process_memory_mb",             "Process memory MB")
 python_process_resident_memory_bytes = _safe(Gauge, "python_process_resident_memory_bytes", "Process RSS bytes")
 python_thread_count                  = _safe(Gauge, "python_thread_count",                  "Live thread count")
 
-# ── App-level / Infra panels ──────────────────────────────────────
+# App-level / Infra
 app_active_sessions = _safe(Gauge,   "app_active_sessions", "Active sessions (5-min window)")
 app_active_users    = _safe(Gauge,   "app_active_users",    "Distinct user IPs (5-min window)")
 app_restart_total   = _safe(Counter, "app_restart_total",   "Number of process restarts")
@@ -156,7 +151,7 @@ agent_uptime_seconds = _safe(Gauge, "agent_uptime_seconds", "Uptime seconds")
 agent_cpu_percent    = _safe(Gauge, "agent_cpu_percent",    "Agent CPU %")
 agent_memory_mb      = _safe(Gauge, "agent_memory_mb",      "Agent memory MB")
 
-# ── Deployment panels ─────────────────────────────────────────────
+# Deployment
 deployment_info = _safe(
     Gauge, "deployment_info",
     "Deployment metadata (always 1, labels carry info)",
@@ -166,7 +161,7 @@ deployment_restart_total  = _safe(Counter, "deployment_restart_total",  "Process
 deployment_uptime_seconds = _safe(Gauge,   "deployment_uptime_seconds", "Deployment uptime seconds")
 container_status          = _safe(Gauge,   "container_status",          "1=healthy 0=unhealthy")
 
-# ── AI Agents panels ──────────────────────────────────────────────
+# AI Agents
 agent_state = _safe(
     Gauge, "agent_state",
     "1 when agent is in this state, 0 otherwise",
@@ -228,56 +223,6 @@ agent_api_key_count = _safe(
     ["agent_name"]
 )
 
-# ── Example: Wrap your Gemini API call ──────────────────────
-def run_agent(agent_name: str, prompt: str):
-    
-    exec_start = time.time()
-    set_agent_state(agent_name, "running")
-
-    prompt_tokens = 0
-    completion_tokens = 0
-    api_success = False
-    task_success = False
-    api_duration = 0.0
-
-    try:
-        api_start = time.time()
-
-        # ── Your actual Gemini call here ─────────────────
-        response = your_gemini_client.generate_content(prompt)
-        # ─────────────────────────────────────────────────
-
-        api_duration = time.time() - api_start
-        api_success = True
-        task_success = True
-
-        # Extract token counts from Gemini response
-        prompt_tokens     = response.usage_metadata.prompt_token_count
-        completion_tokens = response.usage_metadata.candidates_token_count
-
-    except Exception as e:
-        api_duration = time.time() - api_start
-        set_agent_state(agent_name, "error")
-        print(f"❌ Agent {agent_name} error: {e}")
-
-    finally:
-        exec_duration = time.time() - exec_start
-
-        # ── Record all metrics ───────────────────────────
-        record_agent_run(
-            agent_name        = agent_name,
-            prompt_tokens     = prompt_tokens,
-            completion_tokens = completion_tokens,
-            api_success       = api_success,
-            task_success      = task_success,
-            api_duration      = api_duration,
-            execution_duration= exec_duration,
-            decision          = "respond"
-        )
-
-        # Back to idle if no error
-        if api_success:
-            set_agent_state(agent_name, "idle")
 
 APP_STATS = {
     "total_requests": 0, "success_requests": 0, "failed_requests": 0,
@@ -329,6 +274,11 @@ try:
     deployment_restart_total.inc()
     app_restart_total.inc()
     container_status.set(1)
+
+    # Register each of the 3 pipeline agents so their gauges exist
+    # BEFORE they POST for the first time.
+    for _agent_name in ("test_agent", "errors", "final_agent"):
+        agent_api_key_count.labels(agent_name=_agent_name).set(1)
 except Exception as e:
     print(f"[app] deployment metric init failed: {e}")
 
@@ -338,7 +288,7 @@ threading.Thread(target=_metrics_loop, args=(15,), daemon=True).start()
 
 
 # ══════════════════════════════════════════════════════════════════════
-# BLOCK 5 — REQUEST HOOKS + HELPERS (incl. session tracking)
+# BLOCK 5 — REQUEST HOOKS + HELPERS
 # ══════════════════════════════════════════════════════════════════════
 _SESSION_TTL = 300
 _sessions    = {}
@@ -438,13 +388,7 @@ def _check_monitor_header(cfg_token):
 
 
 # ══════════════════════════════════════════════════════════════════════
-# BLOCK 6 — CORE ROUTES
-# ══════════════════════════════════════════════════════════════════════
-
-# ══════════════════════════════════════════════════════════════════════
-# BLOCK 6b — HEALTH-CHECK ALIASES
-# Prevents 404s from external probes (/healthz, /ready, /ping, etc.)
-# All return the same lightweight OK payload.
+# BLOCK 6 — CORE ROUTES (+ probe aliases)
 # ══════════════════════════════════════════════════════════════════════
 @application.get("/healthz")
 @application.get("/ready")
@@ -458,6 +402,7 @@ def _probe_alias():
         "uptime_seconds": _uptime(),
         "version":        _CFG["app_version"],
     }), 200
+
 
 @application.get("/")
 def home():
@@ -545,28 +490,6 @@ _agent_decision_cache = {}
 
 @application.post("/monitor/status")
 def monitor_status():
-    """
-    Ingest CI-agent events. Expected payload:
-    {
-      "agent_name": "pre_check_agent" | "during_check_agent" | "post_check_agent",
-      "stage":      "pre_deploy" | "during_deploy" | "post_deploy",
-      "cloud":      "aws",
-      "provider":   "gemini",
-      "model":      "gemini-2.5-flash",
-      "state":      "running" | "approved" | "rejected",
-      "decision":   "pass" | "fail" | "skip",
-      "status":     "success" | "failed",
-      "prompt_tokens":     123,
-      "completion_tokens": 45,
-      "total_tokens":      168,
-      "api_calls":         3,
-      "task_result":       "pass",
-      "task_count":        1,
-      "execution_time_seconds":    1.42,
-      "api_response_time_seconds": 0.31,
-      "api_key_count":     1
-    }
-    """
     if _CFG["monitor_token"] and not _check_monitor_header(_CFG["monitor_token"]):
         return jsonify({"ok": False, "error": "unauthorized"}), 401
 

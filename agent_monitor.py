@@ -19,6 +19,9 @@ import random
 from pathlib import Path
 from collections import defaultdict
 from prometheus_client import Gauge, Counter, Histogram
+from __future__ import annotations
+import requests
+
 
 # ══════════════════════════════════════════════════════════════
 # ENVIRONMENT & MODEL CONFIGURATION

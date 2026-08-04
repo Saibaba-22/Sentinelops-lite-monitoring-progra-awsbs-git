@@ -14,10 +14,15 @@ import py_compile
 from pathlib import Path
 
 try:
-    from monitor_client import send_agent_status
+    from agent.monitor_client import report as send_agent_status
 except ImportError:
-    def send_agent_status(*a, **k):
-        pass
+    try:
+        from monitor_client import report as send_agent_status
+    except ImportError:
+        def send_agent_status(*a, **k):
+            print(f"[test_agent] ⚠ monitor_client NOT FOUND — args={k}",
+                  flush=True)
+            return False
 
 MODEL    = os.getenv("AI_MODEL", "gemini-2.5-flash")
 PROVIDER = os.getenv("AI_PROVIDER", "gemini")
@@ -67,7 +72,6 @@ def ask_ai(prompt):
         return (resp.text or "").strip()
     except Exception as e:
         return f"AI unavailable: {e}"
-
 
 def _send(start, status, decision, error=""):
     try:
