@@ -308,6 +308,11 @@ jobs:
               "GEMINI_API_KEY": os.environ["GEMINI_API_KEY"],
               "AI_PROVIDER":    os.environ["AI_PROVIDER"],
               "AI_MODEL":       os.environ["AI_MODEL"],
+
+              # ── GitHub Actions auto-collector (pulls agent metrics) ──
+              "GITHUB_TOKEN_METRICS": os.environ.get("GH_METRICS_TOKEN", ""),
+              "GITHUB_METRICS_REPO":          os.environ.get("GH_METRICS_REPO",  ""),
+              "GITHUB_POLL_INTERVAL": "60",
           }
           options = [{
               "Namespace":  "aws:elasticbeanstalk:application:environment",
@@ -346,6 +351,8 @@ jobs:
           GEMINI_API_KEY:         ${{ secrets.GEMINI_API_KEY }}
           AI_PROVIDER:            ${{ vars.AI_PROVIDER || 'gemini' }}
           AI_MODEL:               ${{ vars.AI_MODEL || 'gemini-2.5-flash' }}
+          GH_METRICS_TOKEN:       ${{ secrets.GH_METRICS_TOKEN }}
+          GH_METRICS_REPO:        ${{ vars.GH_METRICS_REPO }}
         run: |
           test -f Dockerrun.aws.json || { echo "Missing Dockerrun.aws.json"; exit 1; }
           touch .ebignore
@@ -384,6 +391,10 @@ jobs:
                   "GOOGLE_API_KEY":   os.environ.get("GEMINI_API_KEY", ""),
                   "AI_PROVIDER":      os.environ.get("AI_PROVIDER",    "gemini"),
                   "AI_MODEL":         os.environ.get("AI_MODEL",        "gemini-2.5-flash"),
+                  #-----ai metric --------
+                  "GITHUB_TOKEN_METRICS": os.environ.get("GH_METRICS_TOKEN", ""),
+                  "GITHUB_REPO":          os.environ.get("GH_METRICS_REPO",  ""),
+                  "GITHUB_POLL_INTERVAL": "60",
               },
               "grafana": {
                   "GF_SECURITY_ADMIN_USER":        "admin",
@@ -713,7 +724,7 @@ jobs:
           python -m pip install python-docx lxml
 
       - name: Generate documentation
-        run: python generate_docs.py
+        run: python generate_docx.py
 
       - name: Upload documentation artifact
         uses: actions/upload-artifact@v4

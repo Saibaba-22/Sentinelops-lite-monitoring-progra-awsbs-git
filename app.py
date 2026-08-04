@@ -767,6 +767,14 @@ try:
 except Exception:
     pass
 
+#=======================================================================
+# GITHUB ACTIONS AUTO-COLLECTOR — pulls agent metrics from workflow runs
+# ══════════════════════════════════════════════════════════════════════
+try:
+    from agent.github_collector import start as start_gh_collector
+    start_gh_collector()
+except Exception as e:
+    print(f"[app] github_collector failed to start: {e}")
 
 # ══════════════════════════════════════════════════════════════════════
 # BLOCK 11 — ENTRY
