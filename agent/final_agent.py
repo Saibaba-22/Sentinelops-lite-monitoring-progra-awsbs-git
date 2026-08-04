@@ -1851,15 +1851,20 @@ if __name__ == "__main__":
     try:
         from agent.monitor_client import report
         report(
-            agent_name="final_agent",
-            stage="post_deploy",
-            state="passed" if _rc == 0 else "failed",
-            decision="pass" if _rc == 0 else "fail",
-            status="success" if _rc == 0 else "failed",
-            total_tokens=0,
-            api_calls=1,
-            execution_time_seconds=round(time.perf_counter() - _t0, 3),
-            api_key_count=1,
+            agent_name        = "final_agent",
+            stage             = "post_deploy",
+            state             = "passed" if _rc == 0 else "failed",
+            decision          = "pass"   if _rc == 0 else "fail",
+            status            = "success" if _rc == 0 else "failed",
+            provider          = PROVIDER,
+            model             = MODEL,
+            prompt_tokens     = _ai_stats.get("prompt_tokens", 0),
+            completion_tokens = _ai_stats.get("completion_tokens", 0),
+            total_tokens      = _ai_stats.get("total_tokens", 0),
+            api_calls         = _ai_stats.get("requests", 0) or 1,
+            api_response_time_seconds = round(_ai_stats.get("response_time", 0.0), 4),
+            execution_time_seconds    = round(time.perf_counter() - _t0, 3),
+            api_key_count     = 1,
         )
     except Exception as e:
         print(f"[final_agent] monitor report error: {e}", flush=True)
