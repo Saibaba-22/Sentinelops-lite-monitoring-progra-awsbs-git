@@ -334,7 +334,6 @@ try:
     print(f"[app] Seeded 3 CI agents into metrics")
 except Exception as e:
     print(f"[app] Seed failed: {e}")
-```
 
 # ══════════════════════════════════════════════════════════════════════
 # BLOCK 5 — REQUEST HOOKS + HELPERS
