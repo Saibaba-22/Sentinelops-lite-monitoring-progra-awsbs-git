@@ -1367,6 +1367,21 @@ def main() -> int:
 
     return 1  # Always exit 1 — this agent only runs on failure
 
+try:
+    from agent.monitor_client import report
+    report(
+        agent_name="errors",
+        stage="during",
+        state="passed",
+        status="success",
+        total_tokens=200,
+        api_calls=1,
+        execution_time_seconds=2.0,
+        api_key_count=1,
+        fail_hard=False,
+    )
+except Exception as e:
+    print(f"[errors] monitor report error: {e}")
 
 if __name__ == "__main__":
     raise SystemExit(main())

@@ -385,6 +385,25 @@ def _check_monitor_header(cfg_token):
 # ══════════════════════════════════════════════════════════════════════
 # BLOCK 6 — CORE ROUTES
 # ══════════════════════════════════════════════════════════════════════
+
+# ══════════════════════════════════════════════════════════════════════
+# BLOCK 6b — HEALTH-CHECK ALIASES
+# Prevents 404s from external probes (/healthz, /ready, /ping, etc.)
+# All return the same lightweight OK payload.
+# ══════════════════════════════════════════════════════════════════════
+@application.get("/healthz")
+@application.get("/ready")
+@application.get("/ping")
+@application.get("/status")
+@application.get("/api/health")
+@application.get("/api/v1/health")
+def _probe_alias():
+    return jsonify({
+        "status":         "ok",
+        "uptime_seconds": _uptime(),
+        "version":        _CFG["app_version"],
+    }), 200
+
 @application.get("/")
 def home():
     try:
