@@ -290,6 +290,8 @@ jobs:
         env:
           CNAME:    ${{ steps.aws-host.outputs.cname }}
           BASE_URL: ${{ steps.aws-host.outputs.app_url }}
+          GH_METRICS_TOKEN:  ${{ secrets.GH_METRICS_TOKEN }}
+          GH_METRICS_REPO:   ${{ vars.GH_METRICS_REPO }}
         run: |
           python - <<'PY'
           import json, os
@@ -311,7 +313,7 @@ jobs:
 
               # ── GitHub Actions auto-collector (pulls agent metrics) ──
               "GITHUB_TOKEN_METRICS": os.environ.get("GH_METRICS_TOKEN", ""),
-              "GITHUB_METRICS_REPO":          os.environ.get("GH_METRICS_REPO",  ""),
+              "GITHUB_REPO":          os.environ.get("GH_METRICS_REPO",  ""),
               "GITHUB_POLL_INTERVAL": "60",
           }
           options = [{
