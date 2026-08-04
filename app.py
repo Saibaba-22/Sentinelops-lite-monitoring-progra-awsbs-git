@@ -11,13 +11,18 @@ import threading
 from pathlib import Path
 
 import psutil
-from flask import (
-    Flask, Blueprint, render_template, Response, request, jsonify,
-)
-from prometheus_client import (
-    CONTENT_TYPE_LATEST, generate_latest,
-    Counter, Gauge, Histogram, REGISTRY,
-)
+
+from agent_metrics import init_agent, set_agent_state, record_agent_run
+import time
+
+# ── Initialize your 3 agents on startup ─────────────────────
+# These match your dashboard panel names exactly!
+from flask import ( Flask, Blueprint, render_template, Response, request, jsonify )
+from prometheus_client import ( CONTENT_TYPE_LATEST, generate_latest, Counter, Gauge, Histogram, REGISTRY )
+
+init_agent("test_agent",  api_key_count=1)
+init_agent("errors",      api_key_count=1)
+init_agent("final_agent", api_key_count=1)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -223,6 +228,56 @@ agent_api_key_count = _safe(
     ["agent_name"]
 )
 
+# ── Example: Wrap your Gemini API call ──────────────────────
+def run_agent(agent_name: str, prompt: str):
+    
+    exec_start = time.time()
+    set_agent_state(agent_name, "running")
+
+    prompt_tokens = 0
+    completion_tokens = 0
+    api_success = False
+    task_success = False
+    api_duration = 0.0
+
+    try:
+        api_start = time.time()
+
+        # ── Your actual Gemini call here ─────────────────
+        response = your_gemini_client.generate_content(prompt)
+        # ─────────────────────────────────────────────────
+
+        api_duration = time.time() - api_start
+        api_success = True
+        task_success = True
+
+        # Extract token counts from Gemini response
+        prompt_tokens     = response.usage_metadata.prompt_token_count
+        completion_tokens = response.usage_metadata.candidates_token_count
+
+    except Exception as e:
+        api_duration = time.time() - api_start
+        set_agent_state(agent_name, "error")
+        print(f"❌ Agent {agent_name} error: {e}")
+
+    finally:
+        exec_duration = time.time() - exec_start
+
+        # ── Record all metrics ───────────────────────────
+        record_agent_run(
+            agent_name        = agent_name,
+            prompt_tokens     = prompt_tokens,
+            completion_tokens = completion_tokens,
+            api_success       = api_success,
+            task_success      = task_success,
+            api_duration      = api_duration,
+            execution_duration= exec_duration,
+            decision          = "respond"
+        )
+
+        # Back to idle if no error
+        if api_success:
+            set_agent_state(agent_name, "idle")
 
 APP_STATS = {
     "total_requests": 0, "success_requests": 0, "failed_requests": 0,

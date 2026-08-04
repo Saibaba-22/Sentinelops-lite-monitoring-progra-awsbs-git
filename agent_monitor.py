@@ -18,7 +18,7 @@ import datetime
 import random
 from pathlib import Path
 from collections import defaultdict
-
+from prometheus_client import Gauge, Counter, Histogram
 
 # ══════════════════════════════════════════════════════════════
 # ENVIRONMENT & MODEL CONFIGURATION
@@ -220,6 +220,178 @@ MODEL_REGISTRY = {
     },
 }
 
+# ─────────────────────────────────────────────
+#  Agent Metrics with correct labels
+# ─────────────────────────────────────────────
+
+# State: idle | running | error
+agent_state = Gauge(
+    'agent_state',
+    '1 when agent is in this state, 0 otherwise',
+    ['agent_name', 'state']
+)
+
+# Last run timestamp
+agent_last_run = Gauge(
+    'agent_last_run_timestamp_seconds',
+    'Unix timestamp of most recent report',
+    ['agent_name']
+)
+
+# Token metrics
+agent_prompt_tokens = Counter(
+    'agent_prompt_tokens_total',
+    'Prompt tokens consumed',
+    ['agent_name']
+)
+
+agent_completion_tokens = Counter(
+    'agent_completion_tokens_total',
+    'Completion tokens generated',
+    ['agent_name']
+)
+
+agent_token_usage = Counter(
+    'agent_token_usage_total',
+    'Total tokens (prompt + completion)',
+    ['agent_name']
+)
+
+# API calls with status label
+agent_api_calls = Counter(
+    'agent_api_calls_total',
+    'API calls made by an agent',
+    ['agent_name', 'status']   # status = success | failed
+)
+
+# Tasks with result label
+agent_tasks = Counter(
+    'agent_tasks_total',
+    'Tasks executed',
+    ['agent_name', 'result']   # result = success | failed
+)
+
+# API response time histogram
+agent_api_response_time = Histogram(
+    'agent_api_response_time_seconds',
+    'API response time',
+    ['agent_name'],
+    buckets=[0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0]
+)
+
+# Execution duration histogram
+agent_execution_duration = Histogram(
+    'agent_execution_duration_seconds',
+    'Total agent execution duration',
+    ['agent_name'],
+    buckets=[0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0]
+)
+
+# Latest execution time gauge
+agent_execution_time = Gauge(
+    'agent_execution_time_seconds',
+    'Latest execution time reported',
+    ['agent_name']
+)
+
+# Last decision
+agent_last_decision = Gauge(
+    'agent_last_decision',
+    '1 for the most recent decision, 0 for old ones',
+    ['agent_name', 'decision']
+)
+
+# API key count
+agent_api_key_count = Gauge(
+    'agent_api_key_count',
+    'Number of API keys configured',
+    ['agent_name']
+)
+
+
+# ─────────────────────────────────────────────
+#  Helper: Initialize Agent
+# ─────────────────────────────────────────────
+
+def init_agent(agent_name: str, api_key_count: int = 1):
+    """
+    Call this once when your agent starts.
+    Sets initial state so Grafana shows data immediately.
+    """
+    # Initialize all states to 0 first
+    for state in ['idle', 'running', 'error']:
+        agent_state.labels(agent_name=agent_name, state=state).set(0)
+
+    # Set idle as default
+    agent_state.labels(agent_name=agent_name, state='idle').set(1)
+
+    # Set last run to now
+    agent_last_run.labels(agent_name=agent_name).set(time.time())
+
+    # Set API key count
+    agent_api_key_count.labels(agent_name=agent_name).set(api_key_count)
+
+    print(f"✅ Metrics initialized for agent: {agent_name}")
+
+
+# ─────────────────────────────────────────────
+#  Helper: Set Agent State
+# ─────────────────────────────────────────────
+
+def set_agent_state(agent_name: str, new_state: str):
+    """
+    Switch agent state.
+    new_state: 'idle' | 'running' | 'error'
+    """
+    for state in ['idle', 'running', 'error']:
+        agent_state.labels(agent_name=agent_name, state=state).set(
+            1 if state == new_state else 0
+        )
+
+
+# ─────────────────────────────────────────────
+#  Helper: Record Agent Run
+# ─────────────────────────────────────────────
+
+def record_agent_run(
+    agent_name: str,
+    prompt_tokens: int,
+    completion_tokens: int,
+    api_success: bool,
+    task_success: bool,
+    api_duration: float,
+    execution_duration: float,
+    decision: str = "respond"
+):
+    """
+    Call this after every agent execution to update all metrics.
+    """
+    status = "success" if api_success else "failed"
+    result = "success" if task_success else "failed"
+
+    # Token tracking
+    agent_prompt_tokens.labels(agent_name=agent_name).inc(prompt_tokens)
+    agent_completion_tokens.labels(agent_name=agent_name).inc(completion_tokens)
+    agent_token_usage.labels(agent_name=agent_name).inc(
+        prompt_tokens + completion_tokens
+    )
+
+    # API call tracking
+    agent_api_calls.labels(agent_name=agent_name, status=status).inc()
+
+    # Task tracking
+    agent_tasks.labels(agent_name=agent_name, result=result).inc()
+
+    # Timing
+    agent_api_response_time.labels(agent_name=agent_name).observe(api_duration)
+    agent_execution_duration.labels(agent_name=agent_name).observe(execution_duration)
+    agent_execution_time.labels(agent_name=agent_name).set(execution_duration)
+
+    # Decision
+    agent_last_decision.labels(agent_name=agent_name, decision=decision).set(1)
+
+    # Timestamp
+    agent_last_run.labels(agent_name=agent_name).set(time.time())
 
 # ══════════════════════════════════════════════════════════════
 # ACTIVE CONFIG
