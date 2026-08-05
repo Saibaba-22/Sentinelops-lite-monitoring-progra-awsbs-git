@@ -14,7 +14,7 @@ from pathlib import Path
 # ═════════════════════════════════════════════════════════════════
 # CONFIG
 # ═════════════════════════════════════════════════════════════════
-MODEL         = os.getenv("AI_MODEL",    "gemini-2.0-flash")
+MODEL         = os.getenv("AI_MODEL",    "gemini-3.5-flash")
 PROVIDER      = os.getenv("AI_PROVIDER", "gemini")
 MAX_FILE_READ = 4_000
 MAX_CONTEXT   = 30_000
@@ -474,7 +474,6 @@ def extract_dependency_issues(text: str) -> list[Issue]:
             ))
     return issues
 
-
 def extract_config_issues(text: str) -> list[Issue]:
     issues: list[Issue] = []
     pats = [
@@ -483,13 +482,19 @@ def extract_config_issues(text: str) -> list[Issue]:
          "Code expects an env var or config key that isn't set."),
         (r"Environment variable (\S+) not set",
          "Missing env variable",
-         "Required env var not injected. Check CI/CD secrets."),
+         "Required env var not injected."),
+        (r"([A-Z][A-Z0-9_]{2,})\s+(?:is not set|is empty|is undefined|missing)",
+         "Env var validation failure",
+         "Startup check reported an env var as missing."),
+        (r"os\.environ\[['\"]([A-Z_]+)['\"]\].*KeyError",
+         "os.environ KeyError",
+         "Code accessed os.environ[X] where X wasn't set."),
         (r"Invalid configuration.*?([^\n]+)",
          "Invalid config value",
          "Config value doesn't match expected format/schema."),
         (r"permission denied.*?([^\n]+)",
          "Permission denied",
-         "OS-level access denied. Check chmod, chown, or Docker user."),
+         "OS-level access denied."),
         (r"EACCES.*?([^\n]+)",
          "EACCES access denied",
          "Insufficient file permissions."),
@@ -507,32 +512,67 @@ def extract_config_issues(text: str) -> list[Issue]:
          "Credentials rejected by the target service."),
         (r"401 unauthorized",
          "HTTP 401",
-         "Missing/invalid credentials for the request."),
+         "Missing/invalid credentials."),
         (r"403 forbidden",
          "HTTP 403",
-         "Authenticated but lacks permission to access resource."),
+         "Authenticated but lacks permission."),
         (r"port.*?already in use",
          "Port conflict",
          "Another process is using the port."),
         (r"EADDRINUSE",
          "EADDRINUSE",
          "Bind failed — port taken."),
+        # ── NEW: catch Azure/AWS CLI-specific errors ──────────
+        (r"Operation returned an invalid status '([^']+)'",
+         "Azure API error",
+         "Azure CLI request rejected by Azure API. See status."),
+        (r"Bad Request",
+         "HTTP 400 Bad Request",
+         "API rejected the request. Usually invalid payload, unsupported feature, or plan tier limitation."),
+        (r"multicontainer.*not.*support",
+         "Multi-container not supported",
+         "Azure App Service tier/region does not support multi-container compose."),
+        (r"SKU.*not.*support",
+         "SKU tier limitation",
+         "Your App Service Plan tier is too low for this feature. Upgrade to B1 or higher."),
+        (r"password.*(?:too short|minimum|must be at least)",
+         "Password too short",
+         "A password field doesn't meet minimum length requirements."),
     ]
     for pat, cat, why in pats:
         for m in re.finditer(pat, text, re.IGNORECASE):
             ctx = text[max(0, m.start()-300):m.end()+300]
             f, l, b = _nearest_file_line(ctx)
+
+            # ── Extract captured variable/value name (if any) ──
+            captured = m.group(1) if m.lastindex else ""
+
+            # ── Build informative description ──
+            if captured:
+                desc = f"{cat}: '{captured}' — {m.group(0)[:150]}"
+            else:
+                desc = f"{cat}: {m.group(0)[:200]}"
+
+            # ── Build informative root cause ──
+            if captured and "env" in cat.lower():
+                rc = (f"Env var '{captured}' is expected by the code/CLI "
+                      f"but was NOT injected by the CI/CD pipeline. "
+                      f"Add '{captured}' to GitHub Secrets or the deploy step's env: block.")
+            elif captured:
+                rc = f"{why} Specifically: '{captured}'."
+            else:
+                rc = why
+
             issues.append(Issue(
                 severity="HIGH", category="CONFIG",
                 file=f, line=l, block=b,
-                description=f"{cat}: {m.group(0)[:200]}",
+                description=desc,
                 expected="Configuration valid and accessible.",
-                root_cause=why,
-                solution=_config_solution(cat),
+                root_cause=rc,
+                solution=_config_solution_specific(cat, captured),
                 affected_files=_find_affected_files(text, m.group(0)),
             ))
     return issues
-
 
 def extract_network_issues(text: str) -> list[Issue]:
     issues: list[Issue] = []
@@ -723,6 +763,48 @@ def _config_solution(cat: str) -> str:
             "2. Validate against schema before deploy.\n"
             "3. Check CI/CD secret injection.")
 
+def _config_solution_specific(cat: str, captured: str) -> str:
+    """Solution that references the actual missing variable name."""
+    base = _config_solution(cat)
+    if not captured:
+        return base
+
+    c = cat.lower()
+
+    if "azure api" in c or "bad request" in c or "multicontainer" in c:
+        return (
+            "1. Check your App Service Plan tier:\n"
+            "   az appservice plan list --resource-group $RG -o table\n"
+            "2. Multi-container requires B1 or higher (not F1/Free/Shared).\n"
+            "3. Upgrade if needed:\n"
+            "   az appservice plan update --name $PLAN --resource-group $RG --sku B1\n"
+            "4. Note: Azure deprecated multi-container in June 2024.\n"
+            "   If plan is already B1+, migrate to Azure Container Apps."
+        )
+
+    if "sku" in c:
+        return (
+            "1. Check current SKU: az appservice plan list --resource-group $RG\n"
+            "2. Upgrade to B1: az appservice plan update --sku B1 --name $PLAN --resource-group $RG"
+        )
+
+    if "password" in c:
+        return (
+            f"1. Increase '{captured}' or the affected password to at least 12 characters.\n"
+            "2. Update the GitHub Secret with the new value.\n"
+            "3. Re-run the pipeline."
+        )
+
+    if "env" in c or "variable" in c:
+        return (
+            f"1. Missing env var: '{captured}'\n"
+            f"2. Add '{captured}' as a GitHub Secret (if sensitive) or Variable (if not).\n"
+            f"3. Verify the deploy step's env: block passes it through.\n"
+            f"4. If it's used inside deploy-*.sh, ensure the script env: also declares it.\n"
+            f"5. Check .env.example includes '{captured}' for documentation."
+        )
+
+    return base
 
 def _docker_solution(cat: str) -> str:
     c = cat.lower()
@@ -835,6 +917,7 @@ def deep_scan(context: str, sysinfo: dict) -> list[Issue]:
     all_issues += extract_docker_issues(context)
 
     # Dedup across categories (file + line + first 100 chars of description)
+    # Dedup across categories
     seen: set = set()
     unique: list[Issue] = []
     for iss in all_issues:
@@ -844,6 +927,24 @@ def deep_scan(context: str, sysinfo: dict) -> list[Issue]:
         seen.add(key)
         unique.append(iss)
 
+    # Drop generic "unknown file / N/A line / CONFIG" issues if we have
+    # more specific issues (Azure API errors, tracebacks, etc.)
+    has_specific = any(
+        iss.file != "unknown" or iss.line != "N/A"
+        or iss.category in ("SYNTAX", "DOCKER", "RAM")
+        or "azure" in iss.description.lower()
+        or "bad request" in iss.description.lower()
+        for iss in unique
+    )
+    if has_specific:
+        unique = [
+            iss for iss in unique
+            if not (iss.file == "unknown"
+                    and iss.line == "N/A"
+                    and iss.category == "CONFIG"
+                    and "not set" in iss.description.lower())
+        ]
+        
     order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
     unique.sort(key=lambda i: order.get(i.severity, 9))
     return unique
