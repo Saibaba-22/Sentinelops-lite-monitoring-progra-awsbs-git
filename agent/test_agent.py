@@ -3,15 +3,17 @@ test_agent.py - UNIVERSAL PRE-DEPLOY CHECKER
 Phase 1: Checks complete application for errors before deployment.
 """
 
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 import os
 import re
-import sys
 import ast
 import glob
 import time
 import subprocess
 import py_compile
-from pathlib import Path
 
 try:
     from agent.monitor_client import report as send_agent_status

@@ -1,15 +1,16 @@
-from __future__ import annotations
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from __future__ import annotations
 import glob
 import json
 import os
 import platform
 import re
 import subprocess
-import sys
 import time
 from dataclasses import dataclass, field
-from pathlib import Path
 
 # ═════════════════════════════════════════════════════════════════
 # CONFIG
@@ -944,7 +945,7 @@ def deep_scan(context: str, sysinfo: dict) -> list[Issue]:
                     and iss.category == "CONFIG"
                     and "not set" in iss.description.lower())
         ]
-        
+
     order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
     unique.sort(key=lambda i: order.get(i.severity, 9))
     return unique

@@ -25,6 +25,10 @@ Environment Variables:
   AI_MODEL         - Gemini model (default: gemini-2.5-flash)
 """
 
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 from __future__ import annotations
 
 import glob
@@ -35,12 +39,10 @@ import re
 import socket
 import ssl
 import subprocess
-import sys
 import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Optional
 
 # ──────────────────────────────────────────────────────────────
