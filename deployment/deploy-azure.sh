@@ -196,9 +196,98 @@ echo "✅ Old sitecontainers cleaned"
 
 # Create all 5
 create_sitecontainer "nginx"         "${NGINX_IMAGE}"      "80"   "true"  "true"  "[]"
-create_sitecontainer "app"           "${APP_IMAGE}"        "5000" "false" "true"  "${APP_ENV}"
+
+echo "==> Creating app sitecontainer (with full env vars)"
+
+cat > /tmp/app-sitecontainer.json <<EOF
+{
+  "properties": {
+    "image": "${APP_IMAGE}",
+    "targetPort": "5000",
+    "isMain": false,
+    "authType": "UserCredentials",
+    "userName": "${DOCKERHUB_USERNAME}",
+    "passwordSecret": "${DOCKERHUB_TOKEN}",
+    "environmentVariables": [
+      {"name": "PORT",                     "value": "5000"},
+      {"name": "APP_VERSION",              "value": "1.0.0"},
+      {"name": "BUILD_NUMBER",             "value": "${IMAGE_TAG}"},
+      {"name": "ENVIRONMENT",              "value": "production"},
+      {"name": "METRICS_INTERVAL",         "value": "5"},
+      {"name": "PYTHONPATH",               "value": "/app"},
+      {"name": "TARGET_CLOUD",             "value": "azure"},
+      {"name": "MONITOR_TOKEN",            "value": "${MONITOR_TOKEN}"},
+      {"name": "GEMINI_API_KEY",           "value": "${GEMINI_API_KEY}"},
+      {"name": "GOOGLE_API_KEY",           "value": "${GEMINI_API_KEY}"},
+      {"name": "AI_PROVIDER",              "value": "${AI_PROVIDER}"},
+      {"name": "AI_MODEL",                 "value": "${AI_MODEL}"},
+      {"name": "GITHUB_TOKEN_METRICS",     "value": "${GH_METRICS_TOKEN}"},
+      {"name": "GITHUB_REPO",              "value": "${GH_METRICS_REPO}"},
+      {"name": "GITHUB_POLL_INTERVAL",     "value": "60"}
+    ]
+  }
+}
+EOF
+
+if command -v jq >/dev/null 2>&1; then
+  jq empty /tmp/app-sitecontainer.json || { echo "❌ Invalid JSON"; cat /tmp/app-sitecontainer.json; exit 1; }
+fi
+
+az rest \
+  --method PUT \
+  --uri "${BASE_URI}/app?api-version=2023-12-01" \
+  --body @/tmp/app-sitecontainer.json \
+  --output none
+
+echo "   ✅ app sitecontainer created with 15 env vars"
+
 create_sitecontainer "prometheus"    "${PROMETHEUS_IMAGE}" "9090" "false" "true"  "[]"
-create_sitecontainer "grafana"       "${GRAFANA_IMAGE}"    "3000" "false" "true"  "${GRAFANA_ENV}"
+
+# ─── GRAFANA — write JSON to file to avoid bash quoting bugs ───
+echo "==> Creating grafana sitecontainer (with full env vars)"
+
+cat > /tmp/grafana-sitecontainer.json <<EOF
+{
+  "properties": {
+    "image": "${GRAFANA_IMAGE}",
+    "targetPort": "3000",
+    "isMain": false,
+    "authType": "UserCredentials",
+    "userName": "${DOCKERHUB_USERNAME}",
+    "passwordSecret": "${DOCKERHUB_TOKEN}",
+    "environmentVariables": [
+      {"name": "GF_SECURITY_ADMIN_USER",           "value": "admin"},
+      {"name": "GF_SECURITY_ADMIN_PASSWORD",       "value": "${GRAFANA_ADMIN_PASSWORD}"},
+      {"name": "GF_USERS_ALLOW_SIGN_UP",           "value": "false"},
+      {"name": "GF_SERVER_DOMAIN",                 "value": "${GF_DOMAIN}"},
+      {"name": "GF_SERVER_ROOT_URL",               "value": "${GF_ROOT_URL}"},
+      {"name": "GF_SERVER_SUB_PATH",               "value": "/grafana/"},
+      {"name": "GF_SERVER_SERVE_FROM_SUB_PATH",    "value": "true"},
+      {"name": "GF_SERVER_ENABLE_GZIP",            "value": "true"},
+      {"name": "GF_SECURITY_ALLOW_EMBEDDING",      "value": "true"},
+      {"name": "GF_SECURITY_COOKIE_SECURE",        "value": "false"},
+      {"name": "GF_SECURITY_COOKIE_SAMESITE",      "value": "disabled"},
+      {"name": "GF_LIVE_ALLOWED_ORIGINS",          "value": "*"},
+      {"name": "GF_AUTH_ANONYMOUS_ENABLED",        "value": "false"},
+      {"name": "PROMETHEUS_URL",                   "value": "http://localhost:9090/prometheus/"}
+    ]
+  }
+}
+EOF
+
+# Validate JSON before sending
+if command -v jq >/dev/null 2>&1; then
+  jq empty /tmp/grafana-sitecontainer.json || { echo "❌ Invalid JSON"; cat /tmp/grafana-sitecontainer.json; exit 1; }
+fi
+
+az rest \
+  --method PUT \
+  --uri "${BASE_URI}/grafana?api-version=2023-12-01" \
+  --body @/tmp/grafana-sitecontainer.json \
+  --output none
+
+echo "   ✅ grafana sitecontainer created with 14 env vars"
+
 create_sitecontainer "node-exporter" "prom/node-exporter:v1.8.0" "9100" "false" "false" "[]"
 
 echo "✅ All 5 sitecontainers created with auth + env"
