@@ -181,6 +181,7 @@ jobs:
           push: true
           platforms: linux/amd64
           provenance: false
+          no-cache: true
           tags: docker.io/${{ env.DOCKERHUB_USERNAME }}/${{ env.DOCKERHUB_REPOSITORY }}:grafana-${{ github.sha }}
           cache-from: type=gha,scope=grafana
           cache-to:   type=gha,mode=max,scope=grafana
@@ -439,7 +440,7 @@ jobs:
             exit 1
           fi
           echo "✅ Route verification passed."
-          
+
       - name: Run post-deploy agent (agent/final_agent.py)
         env:
           DEPLOY_URL:       ${{ env.APP_URL }}
