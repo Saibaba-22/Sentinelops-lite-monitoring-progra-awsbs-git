@@ -143,9 +143,11 @@ jobs:
 
           cat > docker/grafana/Dockerfile <<'DEOF'
           FROM grafana/grafana:11.1.0
+          COPY --chown=472:0 docker/grafana/grafana.ini /etc/grafana/grafana.ini
           COPY --chown=472:0 monitoring/grafana/provisioning/ /etc/grafana/provisioning/
           COPY --chown=472:0 monitoring/grafana/dashboards/ /var/lib/grafana/dashboards/
           DEOF
+          test -f docker/grafana/grafana.ini || { echo "Missing docker/grafana/grafana.ini"; exit 1; }
 
       - name: Build and push nginx monitoring image
         uses: docker/build-push-action@v6
@@ -408,8 +410,6 @@ jobs:
           echo "====================================================="
           PASS=0
           FAIL=0
-          for path in /health / /metrics /monitor/status /prometheus/-/ready /grafana/api/health /node-exporter/metrics; do
-            code=$(curl -ksS -o /tmp/route.out -w '%{http_code}' --max-time 30 "${APP_URL}${path}" || true)
             echo "$path -> HTTP $code"
             case "$path" in
               /health|/|/metrics|/monitor/status)

@@ -28,3 +28,4 @@ gitpython
 openai 
 tiktoken 
 colorama
+pyyaml
