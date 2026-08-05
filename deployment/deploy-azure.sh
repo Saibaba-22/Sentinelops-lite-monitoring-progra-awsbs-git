@@ -99,80 +99,109 @@ az webapp config container set \
   --output none
 echo "✅ Registry credentials set."
 
-# ─── Deploy sitecontainers ───
-echo "==> Deploying via sitecontainers API"
+# ─── Deploy sitecontainers via REST API (works around CLI flag bugs) ───
+echo "==> Getting subscription ID"
+SUB_ID=$(az account show --query id -o tsv)
+BASE_URI="https://management.azure.com/subscriptions/${SUB_ID}/resourceGroups/${AZURE_RESOURCE_GROUP}/providers/Microsoft.Web/sites/${AZURE_WEBAPP_NAME}/sitecontainers"
 
-# Cleanup old
+# Helper function to create a sitecontainer with proper auth
+create_sitecontainer() {
+  local NAME="$1"
+  local IMAGE="$2"
+  local PORT="$3"
+  local IS_MAIN="$4"
+  local USE_AUTH="${5:-true}"
+  local ENV_JSON="${6:-[]}"
+
+  echo "==> Creating ${NAME} sitecontainer (auth=${USE_AUTH})"
+
+  if [ "$USE_AUTH" = "true" ]; then
+    AUTH_BLOCK="\"authType\": \"UserCredentials\", \"userName\": \"${DOCKERHUB_USERNAME}\", \"passwordSecret\": \"${DOCKERHUB_TOKEN}\","
+  else
+    AUTH_BLOCK="\"authType\": \"Anonymous\","
+  fi
+
+  cat > /tmp/sitecontainer.json <<EOF
+{
+  "properties": {
+    "image": "${IMAGE}",
+    "targetPort": "${PORT}",
+    "isMain": ${IS_MAIN},
+    ${AUTH_BLOCK}
+    "environmentVariables": ${ENV_JSON}
+  }
+}
+EOF
+
+  az rest \
+    --method PUT \
+    --uri "${BASE_URI}/${NAME}?api-version=2023-12-01" \
+    --body @/tmp/sitecontainer.json \
+    --output none
+
+  echo "   ✅ ${NAME} created"
+}
+
+# Env vars for app container
+APP_ENV=$(cat <<EOF
+[
+  {"name": "PORT", "value": "5000"},
+  {"name": "APP_VERSION", "value": "1.0.0"},
+  {"name": "BUILD_NUMBER", "value": "${IMAGE_TAG}"},
+  {"name": "ENVIRONMENT", "value": "production"},
+  {"name": "METRICS_INTERVAL", "value": "5"},
+  {"name": "PYTHONPATH", "value": "/app"},
+  {"name": "TARGET_CLOUD", "value": "azure"},
+  {"name": "MONITOR_TOKEN", "value": "${MONITOR_TOKEN}"},
+  {"name": "GEMINI_API_KEY", "value": "${GEMINI_API_KEY}"},
+  {"name": "GOOGLE_API_KEY", "value": "${GEMINI_API_KEY}"},
+  {"name": "AI_PROVIDER", "value": "${AI_PROVIDER}"},
+  {"name": "AI_MODEL", "value": "${AI_MODEL}"},
+  {"name": "GITHUB_TOKEN_METRICS", "value": "${GH_METRICS_TOKEN}"},
+  {"name": "GITHUB_REPO", "value": "${GH_METRICS_REPO}"},
+  {"name": "GITHUB_POLL_INTERVAL", "value": "60"}
+]
+EOF
+)
+
+# Env vars for grafana container
+GRAFANA_ENV=$(cat <<EOF
+[
+  {"name": "GF_SECURITY_ADMIN_USER", "value": "admin"},
+  {"name": "GF_SECURITY_ADMIN_PASSWORD", "value": "${GRAFANA_ADMIN_PASSWORD}"},
+  {"name": "GF_USERS_ALLOW_SIGN_UP", "value": "false"},
+  {"name": "GF_SERVER_DOMAIN", "value": "${GF_DOMAIN}"},
+  {"name": "GF_SERVER_ROOT_URL", "value": "${GF_ROOT_URL}"},
+  {"name": "GF_SERVER_SUB_PATH", "value": "/grafana/"},
+  {"name": "GF_SERVER_SERVE_FROM_SUB_PATH", "value": "true"},
+  {"name": "GF_SERVER_ENABLE_GZIP", "value": "true"},
+  {"name": "GF_SECURITY_ALLOW_EMBEDDING", "value": "true"},
+  {"name": "GF_SECURITY_COOKIE_SECURE", "value": "false"},
+  {"name": "GF_SECURITY_COOKIE_SAMESITE", "value": "disabled"},
+  {"name": "GF_LIVE_ALLOWED_ORIGINS", "value": "*"},
+  {"name": "GF_AUTH_ANONYMOUS_ENABLED", "value": "false"},
+  {"name": "PROMETHEUS_URL", "value": "http://prometheus:9090/prometheus/"}
+]
+EOF
+)
+
+# Cleanup (include 'main')
 for CN in main nginx app prometheus grafana node-exporter; do
-  az webapp sitecontainers delete \
-    --name "${AZURE_WEBAPP_NAME}" \
-    --resource-group "${AZURE_RESOURCE_GROUP}" \
-    --container-name "${CN}" \
+  az rest \
+    --method DELETE \
+    --uri "${BASE_URI}/${CN}?api-version=2023-12-01" \
     --output none 2>/dev/null || true
 done
 echo "✅ Old sitecontainers cleaned"
 
-# 1. NGINX
-echo "==> Creating nginx sitecontainer"
-az webapp sitecontainers create \
-  --name "${AZURE_WEBAPP_NAME}" \
-  --resource-group "${AZURE_RESOURCE_GROUP}" \
-  --container-name "nginx" \
-  --image "${NGINX_IMAGE}" \
-  --target-port 80 \
-  --is-main true \
-  --output none
-echo "   ✅ nginx created"
+# Create all 5
+create_sitecontainer "nginx"         "${NGINX_IMAGE}"      "80"   "true"  "true"  "[]"
+create_sitecontainer "app"           "${APP_IMAGE}"        "5000" "false" "true"  "${APP_ENV}"
+create_sitecontainer "prometheus"    "${PROMETHEUS_IMAGE}" "9090" "false" "true"  "[]"
+create_sitecontainer "grafana"       "${GRAFANA_IMAGE}"    "3000" "false" "true"  "${GRAFANA_ENV}"
+create_sitecontainer "node-exporter" "prom/node-exporter:v1.8.0" "9100" "false" "false" "[]"
 
-# 2. APP
-echo "==> Creating app sitecontainer"
-az webapp sitecontainers create \
-  --name "${AZURE_WEBAPP_NAME}" \
-  --resource-group "${AZURE_RESOURCE_GROUP}" \
-  --container-name "app" \
-  --image "${APP_IMAGE}" \
-  --target-port 5000 \
-  --is-main false \
-  --output none
-echo "   ✅ app created"
-
-# 3. PROMETHEUS
-echo "==> Creating prometheus sitecontainer"
-az webapp sitecontainers create \
-  --name "${AZURE_WEBAPP_NAME}" \
-  --resource-group "${AZURE_RESOURCE_GROUP}" \
-  --container-name "prometheus" \
-  --image "${PROMETHEUS_IMAGE}" \
-  --target-port 9090 \
-  --is-main false \
-  --output none
-echo "   ✅ prometheus created"
-
-# 4. GRAFANA
-echo "==> Creating grafana sitecontainer"
-az webapp sitecontainers create \
-  --name "${AZURE_WEBAPP_NAME}" \
-  --resource-group "${AZURE_RESOURCE_GROUP}" \
-  --container-name "grafana" \
-  --image "${GRAFANA_IMAGE}" \
-  --target-port 3000 \
-  --is-main false \
-  --output none
-echo "   ✅ grafana created"
-
-# 5. NODE-EXPORTER (public image)
-echo "==> Creating node-exporter sitecontainer"
-az webapp sitecontainers create \
-  --name "${AZURE_WEBAPP_NAME}" \
-  --resource-group "${AZURE_RESOURCE_GROUP}" \
-  --container-name "node-exporter" \
-  --image "prom/node-exporter:v1.8.0" \
-  --target-port 9100 \
-  --is-main false \
-  --output none
-echo "   ✅ node-exporter created"
-
-echo "✅ All 5 sitecontainers created"
+echo "✅ All 5 sitecontainers created with auth + env"
 
 echo "==> Listing deployed sitecontainers"
 az webapp sitecontainers list \
