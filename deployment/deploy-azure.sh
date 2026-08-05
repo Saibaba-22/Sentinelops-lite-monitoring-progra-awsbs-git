@@ -229,7 +229,133 @@ for CN in nginx app prometheus grafana node-exporter; do
 done
 echo "✅ Old sitecontainers cleaned up"
 
-# ── 1. NGINX (main container, receives external port 80) ──
+#!/usr/bin/env bash
+set -euo pipefail
+
+AZURE_WEBAPP_NAME="${AZURE_WEBAPP_NAME:?Set AZURE_WEBAPP_NAME}"
+AZURE_RESOURCE_GROUP="${AZURE_RESOURCE_GROUP:?Set AZURE_RESOURCE_GROUP}"
+IMAGE_NAME="${DOCKERHUB_REPOSITORY:-${REPOSITORY:?Set DOCKERHUB_REPOSITORY or REPOSITORY}}"
+IMAGE_TAG="${GITHUB_SHA:?Set GITHUB_SHA}"
+DOCKERHUB_USERNAME="${DOCKERHUB_USERNAME:?Set DOCKERHUB_USERNAME}"
+DOCKERHUB_TOKEN="${DOCKERHUB_TOKEN:?Set DOCKERHUB_TOKEN}"
+GRAFANA_ADMIN_PASSWORD="${GRAFANA_ADMIN_PASSWORD:?Set GRAFANA_ADMIN_PASSWORD}"
+MONITOR_TOKEN="${MONITOR_TOKEN_AZURE:-${MONITOR_TOKEN:-}}"
+
+# ─── AI Agent Monitor + GitHub collector ───
+GEMINI_API_KEY="${GEMINI_API_KEY:-}"
+AI_PROVIDER="${AI_PROVIDER:-gemini}"
+AI_MODEL="${AI_MODEL:-gemini-2.5-flash}"
+GH_METRICS_TOKEN="${GH_METRICS_TOKEN:-}"
+GH_METRICS_REPO="${GH_METRICS_REPO:-}"
+
+if [ -z "${MONITOR_TOKEN}" ]; then
+  echo "ERROR: Set MONITOR_TOKEN_AZURE or MONITOR_TOKEN"
+  exit 1
+fi
+
+# ─── Validate secrets ───
+echo "==> Validating secrets are present"
+SECRETS_FAILED=0
+[ -z "${DOCKERHUB_TOKEN}" ]        && { echo "ERROR: DOCKERHUB_TOKEN is empty";        SECRETS_FAILED=1; }
+[ -z "${GRAFANA_ADMIN_PASSWORD}" ] && { echo "ERROR: GRAFANA_ADMIN_PASSWORD is empty"; SECRETS_FAILED=1; }
+[ -z "${MONITOR_TOKEN}" ]          && { echo "ERROR: MONITOR_TOKEN is empty";          SECRETS_FAILED=1; }
+
+echo "   DOCKERHUB_TOKEN length        : ${#DOCKERHUB_TOKEN}"
+echo "   GRAFANA_ADMIN_PASSWORD length : ${#GRAFANA_ADMIN_PASSWORD}"
+echo "   MONITOR_TOKEN length          : ${#MONITOR_TOKEN}"
+echo "   GEMINI_API_KEY length         : ${#GEMINI_API_KEY}"
+echo "   GH_METRICS_TOKEN length       : ${#GH_METRICS_TOKEN}"
+echo "   GH_METRICS_REPO               : ${GH_METRICS_REPO}"
+
+[ "${SECRETS_FAILED}" = "1" ] && { echo "ERROR: One or more required secrets are empty."; exit 1; }
+echo "✅ All secrets are present."
+
+[ -z "${GEMINI_API_KEY}" ] && echo "⚠️  GEMINI_API_KEY empty — AI features disabled."
+{ [ -z "${GH_METRICS_TOKEN}" ] || [ -z "${GH_METRICS_REPO}" ]; } && \
+  echo "⚠️  GH_METRICS_TOKEN/REPO empty — auto-collector disabled."
+
+# ─── Image URIs ───
+APP_IMAGE="docker.io/${DOCKERHUB_USERNAME}/${IMAGE_NAME}:${IMAGE_TAG}"
+NGINX_IMAGE="docker.io/${DOCKERHUB_USERNAME}/${IMAGE_NAME}:nginx-${IMAGE_TAG}"
+PROMETHEUS_IMAGE="docker.io/${DOCKERHUB_USERNAME}/${IMAGE_NAME}:prometheus-${IMAGE_TAG}"
+GRAFANA_IMAGE="docker.io/${DOCKERHUB_USERNAME}/${IMAGE_NAME}:grafana-${IMAGE_TAG}"
+
+echo "====================================================="
+echo " SentinelOps-Lite — Azure Deployment (sitecontainers)"
+echo "====================================================="
+echo "APP_IMAGE            = ${APP_IMAGE}"
+echo "NGINX_IMAGE          = ${NGINX_IMAGE}"
+echo "PROMETHEUS_IMAGE     = ${PROMETHEUS_IMAGE}"
+echo "GRAFANA_IMAGE        = ${GRAFANA_IMAGE}"
+echo "AZURE_WEBAPP_NAME    = ${AZURE_WEBAPP_NAME}"
+echo "AZURE_RESOURCE_GROUP = ${AZURE_RESOURCE_GROUP}"
+echo "AI_MODEL             = ${AI_MODEL}"
+echo "AI_PROVIDER          = ${AI_PROVIDER}"
+echo "GH_METRICS_REPO      = ${GH_METRICS_REPO}"
+echo "====================================================="
+
+# ─── Resolve Azure hostname ───
+echo "==> Resolving Azure App Service hostname"
+AZURE_HOSTNAME=$(az webapp show \
+  --name "${AZURE_WEBAPP_NAME}" \
+  --resource-group "${AZURE_RESOURCE_GROUP}" \
+  --query defaultHostName \
+  -o tsv 2>/dev/null || echo "")
+
+[ -z "${AZURE_HOSTNAME}" ] && { echo "ERROR: Could not resolve Azure hostname."; exit 1; }
+
+APP_URL="https://${AZURE_HOSTNAME}"
+GF_DOMAIN="${AZURE_HOSTNAME}"
+GF_ROOT_URL="https://${AZURE_HOSTNAME}/grafana/"
+
+echo "   Hostname           : ${AZURE_HOSTNAME}"
+echo "   App URL            : ${APP_URL}"
+echo "   GF_SERVER_DOMAIN   : ${GF_DOMAIN}"
+echo "   GF_SERVER_ROOT_URL : ${GF_ROOT_URL}"
+
+# ─── Configure Azure App Settings (baseline for all containers) ───
+echo "==> Setting Azure App Service app settings"
+az webapp config appsettings set \
+  --name "${AZURE_WEBAPP_NAME}" \
+  --resource-group "${AZURE_RESOURCE_GROUP}" \
+  --settings \
+    "WEBSITES_PORT=80" \
+    "WEBSITES_CONTAINER_START_TIME_LIMIT=1800" \
+    "DOCKER_REGISTRY_SERVER_URL=https://index.docker.io" \
+    "DOCKER_REGISTRY_SERVER_USERNAME=${DOCKERHUB_USERNAME}" \
+    "DOCKER_REGISTRY_SERVER_PASSWORD=${DOCKERHUB_TOKEN}" \
+    "BUILD_NUMBER=${IMAGE_TAG}" \
+    "ENVIRONMENT=production" \
+    "MONITOR_TOKEN=${MONITOR_TOKEN}" \
+    "GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD}" \
+    "GF_SERVER_DOMAIN=${GF_DOMAIN}" \
+    "GF_SERVER_ROOT_URL=${GF_ROOT_URL}" \
+    "GEMINI_API_KEY=${GEMINI_API_KEY}" \
+    "GOOGLE_API_KEY=${GEMINI_API_KEY}" \
+    "AI_PROVIDER=${AI_PROVIDER}" \
+    "AI_MODEL=${AI_MODEL}" \
+    "GITHUB_TOKEN_METRICS=${GH_METRICS_TOKEN}" \
+    "GITHUB_REPO=${GH_METRICS_REPO}" \
+    "GITHUB_POLL_INTERVAL=60" \
+    "TARGET_CLOUD=azure" \
+  --output none
+
+echo "✅ App settings configured."
+
+# ─── Deploy using sitecontainers API ───
+echo "==> Deploying via sitecontainers API"
+
+# Clean up existing sitecontainers first (idempotent)
+for CN in nginx app prometheus grafana node-exporter; do
+  az webapp sitecontainers delete \
+    --name "${AZURE_WEBAPP_NAME}" \
+    --resource-group "${AZURE_RESOURCE_GROUP}" \
+    --container-name "${CN}" \
+    --output none 2>/dev/null || true
+done
+echo "✅ Old sitecontainers cleaned up"
+
+# ─── 1. NGINX (main container, receives external port 80) ───
 echo "==> Creating nginx sitecontainer"
 az webapp sitecontainers create \
   --name "${AZURE_WEBAPP_NAME}" \
@@ -242,8 +368,9 @@ az webapp sitecontainers create \
   --registry-username "${DOCKERHUB_USERNAME}" \
   --registry-password "${DOCKERHUB_TOKEN}" \
   --output none
+echo "   ✅ nginx sitecontainer created"
 
-# ── 2. APP (Flask) ──
+# ─── 2. APP (Flask backend) ───
 echo "==> Creating app sitecontainer"
 az webapp sitecontainers create \
   --name "${AZURE_WEBAPP_NAME}" \
@@ -272,8 +399,9 @@ az webapp sitecontainers create \
     "GITHUB_REPO=${GH_METRICS_REPO}" \
     GITHUB_POLL_INTERVAL=60 \
   --output none
+echo "   ✅ app sitecontainer created"
 
-# ── 3. PROMETHEUS ──
+# ─── 3. PROMETHEUS ───
 echo "==> Creating prometheus sitecontainer"
 az webapp sitecontainers create \
   --name "${AZURE_WEBAPP_NAME}" \
@@ -286,8 +414,9 @@ az webapp sitecontainers create \
   --registry-username "${DOCKERHUB_USERNAME}" \
   --registry-password "${DOCKERHUB_TOKEN}" \
   --output none
+echo "   ✅ prometheus sitecontainer created"
 
-# ── 4. GRAFANA ──
+# ─── 4. GRAFANA ───
 echo "==> Creating grafana sitecontainer"
 az webapp sitecontainers create \
   --name "${AZURE_WEBAPP_NAME}" \
@@ -315,8 +444,9 @@ az webapp sitecontainers create \
     GF_AUTH_ANONYMOUS_ENABLED=false \
     "PROMETHEUS_URL=http://prometheus:9090/prometheus/" \
   --output none
+echo "   ✅ grafana sitecontainer created"
 
-# ── 5. NODE-EXPORTER (public image, no registry auth) ──
+# ─── 5. NODE-EXPORTER (public image, no registry auth needed) ───
 echo "==> Creating node-exporter sitecontainer"
 az webapp sitecontainers create \
   --name "${AZURE_WEBAPP_NAME}" \
@@ -326,16 +456,24 @@ az webapp sitecontainers create \
   --target-port 9100 \
   --is-main false \
   --output none
+echo "   ✅ node-exporter sitecontainer created"
 
 echo "✅ All 5 sitecontainers created"
 
-# Restart to ensure clean state
+# ─── List deployed sitecontainers for verification ───
+echo "==> Listing deployed sitecontainers"
+az webapp sitecontainers list \
+  --name "${AZURE_WEBAPP_NAME}" \
+  --resource-group "${AZURE_RESOURCE_GROUP}" \
+  -o table
+
+# ─── Restart to ensure clean state ───
 echo "==> Restarting Azure App Service"
 az webapp restart \
   --name "${AZURE_WEBAPP_NAME}" \
   --resource-group "${AZURE_RESOURCE_GROUP}"
 
-echo "==> Waiting 90 seconds for containers to start and pull images..."
+echo "==> Waiting 90 seconds for containers to pull and start..."
 sleep 90
 
 # ─── Health Check ───
@@ -352,11 +490,10 @@ for attempt in $(seq 1 30); do
   if [ "${attempt}" = "30" ]; then
     echo "❌ App not healthy after 30 attempts."
     echo ""
-    echo "==> Fetching recent Azure logs for diagnosis:"
+    echo "==> Fetching Azure logs for diagnosis:"
     az webapp log tail \
       --name "${AZURE_WEBAPP_NAME}" \
-      --resource-group "${AZURE_RESOURCE_GROUP}" \
-      --timeout 30 2>/dev/null || true
+      --resource-group "${AZURE_RESOURCE_GROUP}" 2>/dev/null | head -100 || true
     exit 1
   fi
   sleep 10
