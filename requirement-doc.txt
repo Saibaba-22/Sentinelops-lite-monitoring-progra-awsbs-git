@@ -1,0 +1,7 @@
+#---- For Documentation --------------------------------
+python-docx 
+gitpython 
+openai 
+tiktoken 
+colorama
+pyyaml

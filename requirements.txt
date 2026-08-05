@@ -21,11 +21,3 @@ pyyaml==6.0.1
 # ── Prometheus monitoring ──────────────────────────────────────
 prometheus_client==0.20.0
 prometheus-flask-exporter==0.23.1
-
-#---- For Documentation --------------------------------
-python-docx 
-gitpython 
-openai 
-tiktoken 
-colorama
-pyyaml

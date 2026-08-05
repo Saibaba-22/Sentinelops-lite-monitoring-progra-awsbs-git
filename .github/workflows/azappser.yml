@@ -143,9 +143,12 @@ jobs:
 
           cat > docker/grafana/Dockerfile <<'DEOF'
           FROM grafana/grafana:11.1.0
-          COPY --chown=472:0 docker/grafana/grafana.ini /etc/grafana/grafana.ini
+          COPY --chown=472:0 docker/grafana/grafana.ini /etc/grafana/custom.ini
           COPY --chown=472:0 monitoring/grafana/provisioning/ /etc/grafana/provisioning/
           COPY --chown=472:0 monitoring/grafana/dashboards/ /var/lib/grafana/dashboards/
+
+          # Tell Grafana to load our custom.ini
+          ENV GF_PATHS_CONFIG=/etc/grafana/custom.ini
           DEOF
           test -f docker/grafana/grafana.ini || { echo "Missing docker/grafana/grafana.ini"; exit 1; }
 
@@ -183,8 +186,8 @@ jobs:
           provenance: false
           no-cache: true
           tags: docker.io/${{ env.DOCKERHUB_USERNAME }}/${{ env.DOCKERHUB_REPOSITORY }}:grafana-${{ github.sha }}
-          cache-from: type=gha,scope=grafana
-          cache-to:   type=gha,mode=max,scope=grafana
+          #cache-from: type=gha,scope=grafana
+          #cache-to:   type=gha,mode=max,scope=grafana
 
       - name: Scan application image
         uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1
@@ -501,7 +504,7 @@ jobs:
       - name: Install doc generation dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install python-docx lxml
+          python -m pip install requirement-doc.txt
 
       - name: Generate documentation
         run: python generate_docx.py
