@@ -216,15 +216,120 @@ else
   echo "✅ DOCKER_REGISTRY_SERVER_PASSWORD is saved in Azure."
 fi
 
-# ─── Deploy Compose ───
-echo "==> Deploying to Azure App Service"
-az webapp config container set \
+# ─── Deploy using sitecontainers API (Azure's new multi-container) ───
+echo "==> Deploying via sitecontainers API"
+
+# Clean up any existing sitecontainers first (idempotent)
+for CN in nginx app prometheus grafana node-exporter; do
+  az webapp sitecontainers delete \
+    --name "${AZURE_WEBAPP_NAME}" \
+    --resource-group "${AZURE_RESOURCE_GROUP}" \
+    --container-name "${CN}" \
+    --output none 2>/dev/null || true
+done
+echo "✅ Old sitecontainers cleaned up"
+
+# ── 1. NGINX (main container, receives external port 80) ──
+echo "==> Creating nginx sitecontainer"
+az webapp sitecontainers create \
   --name "${AZURE_WEBAPP_NAME}" \
   --resource-group "${AZURE_RESOURCE_GROUP}" \
-  --multicontainer-config-type COMPOSE \
-  --multicontainer-config-file "${COMPOSE_TMP}" \
+  --container-name "nginx" \
+  --image "${NGINX_IMAGE}" \
+  --target-port 80 \
+  --is-main true \
+  --registry-url "https://index.docker.io" \
+  --registry-username "${DOCKERHUB_USERNAME}" \
+  --registry-password "${DOCKERHUB_TOKEN}" \
   --output none
 
+# ── 2. APP (Flask) ──
+echo "==> Creating app sitecontainer"
+az webapp sitecontainers create \
+  --name "${AZURE_WEBAPP_NAME}" \
+  --resource-group "${AZURE_RESOURCE_GROUP}" \
+  --container-name "app" \
+  --image "${APP_IMAGE}" \
+  --target-port 5000 \
+  --is-main false \
+  --registry-url "https://index.docker.io" \
+  --registry-username "${DOCKERHUB_USERNAME}" \
+  --registry-password "${DOCKERHUB_TOKEN}" \
+  --environment-variables \
+    PORT=5000 \
+    APP_VERSION=1.0.0 \
+    "BUILD_NUMBER=${IMAGE_TAG}" \
+    ENVIRONMENT=production \
+    METRICS_INTERVAL=5 \
+    PYTHONPATH=/app \
+    TARGET_CLOUD=azure \
+    "MONITOR_TOKEN=${MONITOR_TOKEN}" \
+    "GEMINI_API_KEY=${GEMINI_API_KEY}" \
+    "GOOGLE_API_KEY=${GEMINI_API_KEY}" \
+    "AI_PROVIDER=${AI_PROVIDER}" \
+    "AI_MODEL=${AI_MODEL}" \
+    "GITHUB_TOKEN_METRICS=${GH_METRICS_TOKEN}" \
+    "GITHUB_REPO=${GH_METRICS_REPO}" \
+    GITHUB_POLL_INTERVAL=60 \
+  --output none
+
+# ── 3. PROMETHEUS ──
+echo "==> Creating prometheus sitecontainer"
+az webapp sitecontainers create \
+  --name "${AZURE_WEBAPP_NAME}" \
+  --resource-group "${AZURE_RESOURCE_GROUP}" \
+  --container-name "prometheus" \
+  --image "${PROMETHEUS_IMAGE}" \
+  --target-port 9090 \
+  --is-main false \
+  --registry-url "https://index.docker.io" \
+  --registry-username "${DOCKERHUB_USERNAME}" \
+  --registry-password "${DOCKERHUB_TOKEN}" \
+  --output none
+
+# ── 4. GRAFANA ──
+echo "==> Creating grafana sitecontainer"
+az webapp sitecontainers create \
+  --name "${AZURE_WEBAPP_NAME}" \
+  --resource-group "${AZURE_RESOURCE_GROUP}" \
+  --container-name "grafana" \
+  --image "${GRAFANA_IMAGE}" \
+  --target-port 3000 \
+  --is-main false \
+  --registry-url "https://index.docker.io" \
+  --registry-username "${DOCKERHUB_USERNAME}" \
+  --registry-password "${DOCKERHUB_TOKEN}" \
+  --environment-variables \
+    GF_SECURITY_ADMIN_USER=admin \
+    "GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD}" \
+    GF_USERS_ALLOW_SIGN_UP=false \
+    "GF_SERVER_DOMAIN=${GF_DOMAIN}" \
+    "GF_SERVER_ROOT_URL=${GF_ROOT_URL}" \
+    GF_SERVER_SUB_PATH=/grafana/ \
+    GF_SERVER_SERVE_FROM_SUB_PATH=true \
+    GF_SERVER_ENABLE_GZIP=true \
+    GF_SECURITY_ALLOW_EMBEDDING=true \
+    GF_SECURITY_COOKIE_SECURE=false \
+    GF_SECURITY_COOKIE_SAMESITE=disabled \
+    "GF_LIVE_ALLOWED_ORIGINS=*" \
+    GF_AUTH_ANONYMOUS_ENABLED=false \
+    "PROMETHEUS_URL=http://prometheus:9090/prometheus/" \
+  --output none
+
+# ── 5. NODE-EXPORTER (public image, no registry auth) ──
+echo "==> Creating node-exporter sitecontainer"
+az webapp sitecontainers create \
+  --name "${AZURE_WEBAPP_NAME}" \
+  --resource-group "${AZURE_RESOURCE_GROUP}" \
+  --container-name "node-exporter" \
+  --image "prom/node-exporter:v1.8.0" \
+  --target-port 9100 \
+  --is-main false \
+  --output none
+
+echo "✅ All 5 sitecontainers created"
+
+# Restart to ensure clean state
 echo "==> Restarting Azure App Service"
 az webapp restart \
   --name "${AZURE_WEBAPP_NAME}" \

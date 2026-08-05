@@ -1,3 +1,15 @@
+# ═══════════════════════════════════════════════════════════════════
+# docker/docker-compose.azure.yml
+#
+# REFERENCE ONLY as of Aug 2026 — Azure App Service deprecated
+# multi-container COMPOSE deployment. Actual deploy now uses
+# sitecontainers CLI (see deployment/deploy-azure.sh).
+#
+# Use this file for:
+#   - Documentation of the 5-container architecture
+#   - Local testing: docker-compose -f docker/docker-compose.azure.yml up
+#   - Future migration to Container Apps / Kubernetes
+# ═══════════════════════════════════════════════════════════════════
 version: "3.8"
 
 services:
