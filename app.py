@@ -36,7 +36,7 @@ _CFG = {
     "app_version":   os.environ.get("APP_VERSION",   "1.0.0"),
     "build_number":  os.environ.get("BUILD_NUMBER",  "0"),
     "environment":   os.environ.get("ENVIRONMENT",   "development"),
-    "port":          int(os.environ.get("PORT",      "5000")),
+    "port":          int(os.environ.get("PORT",      "5000") or "5000"),
     "flask_debug":   os.environ.get("FLASK_DEBUG",   "0") == "1",
     "ai_provider":   os.environ.get("AI_PROVIDER",   "gemini"),
     "ai_model":      os.environ.get("AI_MODEL",      "gemini-2.5-flash"),
