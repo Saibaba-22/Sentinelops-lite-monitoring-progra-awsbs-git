@@ -1,4 +1,4 @@
-name: SentinelOps-Lite Azure pipeline
+name: SentinelOps-Lite Azure Cloud Pipeline
 
 on:
   workflow_dispatch:
@@ -410,9 +410,11 @@ jobs:
           echo "====================================================="
           PASS=0
           FAIL=0
+          for path in /health / /metrics /prometheus/-/ready /grafana/api/health /node-exporter/metrics; do
+            code=$(curl -ksS -o /tmp/route.out -w '%{http_code}' --max-time 30 "${APP_URL}${path}" || true)
             echo "$path -> HTTP $code"
             case "$path" in
-              /health|/|/metrics|/monitor/status)
+              /health|/|/metrics)
                 if [ "$code" = "200" ]; then
                   PASS=$((PASS+1))
                 else
@@ -437,7 +439,7 @@ jobs:
             exit 1
           fi
           echo "✅ Route verification passed."
-
+          
       - name: Run post-deploy agent (agent/final_agent.py)
         env:
           DEPLOY_URL:       ${{ env.APP_URL }}
