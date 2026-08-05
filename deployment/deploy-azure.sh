@@ -103,7 +103,7 @@ echo "✅ Registry credentials set."
 echo "==> Deploying via sitecontainers API"
 
 # Cleanup old
-for CN in nginx app prometheus grafana node-exporter; do
+for CN in main nginx app prometheus grafana node-exporter; do
   az webapp sitecontainers delete \
     --name "${AZURE_WEBAPP_NAME}" \
     --resource-group "${AZURE_RESOURCE_GROUP}" \

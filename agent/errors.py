@@ -794,8 +794,86 @@ def extract_network_issues(text: str) -> list[Issue]:
 
 
 def extract_docker_issues(text: str) -> list[Issue]:
+    """Detect Docker AND Azure sitecontainers errors."""
     issues: list[Issue] = []
-    pats = [
+
+    # ── Azure sitecontainers errors (new API) ─────────────────
+    azure_patterns = [
+        (r"SiteContainer '(\S+)' with isMain=true already exists\.?\s*Cannot add SiteContainer '(\S+)'",
+         "Azure sitecontainer conflict — 'main' container blocks new deploy",
+         "Azure auto-creates a container named 'main' when App Service is in Container mode. "
+         "Delete it before creating your custom containers.",
+         "Add 'main' to the cleanup loop in deploy-azure.sh:\n"
+         "  for CN in main nginx app prometheus grafana node-exporter; do\n"
+         "    az webapp sitecontainers delete --container-name \"$CN\" ...\n"
+         "  done"),
+
+        (r"unrecognized arguments: --registry-url",
+         "Azure CLI too old for sitecontainers registry flags",
+         "Your Azure CLI version doesn't support --registry-url on sitecontainers create. "
+         "Registry creds must be set via app-level settings instead.",
+         "Remove --registry-url / --registry-username / --registry-password from "
+         "'az webapp sitecontainers create' commands. Set them via "
+         "'az webapp config appsettings set' with DOCKER_REGISTRY_SERVER_* keys."),
+
+        (r"az: '(\S+)' is not in the '\S+' command group",
+         "Azure CLI command not found",
+         "The az CLI subcommand doesn't exist. Either it's deprecated or your CLI version is outdated.",
+         "1. Upgrade Azure CLI: pip install --upgrade azure-cli\n"
+         "2. OR in GitHub Actions runner: az upgrade --yes\n"
+         "3. Verify command exists in Microsoft docs for your CLI version."),
+
+        (r"Operation returned an invalid status '(\S+ ?\S*)'",
+         "Azure API error",
+         "Azure API rejected the request. Usually invalid config, unsupported feature, "
+         "or SKU tier limitation.",
+         "1. Check App Service Plan tier (must be B1+ for sitecontainers).\n"
+         "2. Verify all required env vars are set.\n"
+         "3. Check Azure region supports the feature."),
+
+        (r"multicontainer.*(?:not.*support|deprecated)",
+         "Multi-container COMPOSE deprecated",
+         "Azure deprecated the COMPOSE multi-container deployment method in June 2024.",
+         "Migrate to sitecontainers API (az webapp sitecontainers create) OR Azure Container Apps."),
+
+        (r"BadRequest.*container",
+         "Azure container config invalid",
+         "Container configuration rejected by Azure API.",
+         "Check the exact 'BadRequest' message above for details. Common: image name malformed, "
+         "port conflict, or unsupported flag."),
+
+        (r"pull access denied for (\S+)",
+         "Docker Hub image pull denied",
+         "Azure cannot pull the image — either wrong image name, missing registry credentials, "
+         "or image is in a private repo without auth.",
+         "1. Verify image exists: docker pull <image>\n"
+         "2. Set DOCKERHUB_TOKEN in Azure App Settings\n"
+         "3. Ensure DOCKER_REGISTRY_SERVER_PASSWORD is set at app level."),
+    ]
+
+    for pat, cat, why, sol in azure_patterns:
+        for m in re.finditer(pat, text, re.IGNORECASE):
+            ctx = text[max(0, m.start() - 400):m.end() + 400]
+            f, l, b = _nearest_file_line(ctx)
+
+            # Try to extract exact Azure error line
+            error_line = m.group(0)[:250]
+
+            issues.append(Issue(
+                severity="CRITICAL",
+                category="DOCKER",
+                file=f if f != "unknown" else "deployment/deploy-azure.sh",
+                line=l,
+                block=b,
+                description=f"{cat}: {error_line}",
+                expected="Azure deploy command completes successfully.",
+                root_cause=why,
+                solution=sol,
+                affected_files=["deployment/deploy-azure.sh"],
+            ))
+
+    # ── Regular Docker errors (existing) ─────────────────────
+    docker_patterns = [
         (r"failed to pull.*image", "Docker image pull failure",
          "Registry unreachable, image tag missing, or auth failed."),
         (r"manifest unknown", "Docker manifest not found",
@@ -805,32 +883,31 @@ def extract_docker_issues(text: str) -> list[Issue]:
         (r"container.*exited.*code (\d+)", "Container exited",
          "Container process ended with non-zero exit code."),
         (r"OCI runtime.*error", "OCI runtime error",
-         "Container runtime rejected the spec — often exec bit or entrypoint."),
+         "Container runtime rejected the spec."),
         (r"permission denied.*docker.sock", "Docker socket denied",
          "User lacks access to /var/run/docker.sock."),
         (r"Dockerfile.*line (\d+)", "Dockerfile build error",
          "Instruction failed during image build."),
         (r"docker build.*error", "Docker build failed",
-         "Build stage failed. Check preceding output."),
+         "Build stage failed."),
         (r"docker.*push.*error", "Docker push failed",
-         "Push rejected. Check auth and repo permissions."),
+         "Push rejected."),
         (r"registry.*unauthorized", "Registry unauthorized",
          "Missing/invalid registry credentials."),
     ]
-    for pat, cat, why in pats:
-        for m in re.finditer(pat, text, re.IGNORECASE):
+    for pat, cat, why in docker_patterns:
+        for m in re.finditer(pat, cat, re.IGNORECASE):
             line = m.group(1) if m.lastindex else "N/A"
             issues.append(Issue(
                 severity="CRITICAL", category="DOCKER",
                 file="Dockerfile", line=line, block="N/A",
                 description=f"{cat}: {m.group(0)[:200]}",
-                expected="Docker build/push completes successfully.",
+                expected="Docker build/push completes.",
                 root_cause=why,
                 solution=_docker_solution(cat),
                 affected_files=["Dockerfile", "docker-compose.yml"],
             ))
     return issues
-
 
 # ═════════════════════════════════════════════════════════════════
 # SOLUTION HELPERS
@@ -1329,7 +1406,7 @@ def main() -> int:
 
     # AI diagnosis — DEFAULT ON when key is present
     ai_diag = ""
-    if os.getenv("RUN_AI_REVIEW", "1") != "0" and os.getenv("GEMINI_API_KEY"):
+    if os.getenv("RUN_AI_REVIEW", "0") != "1" and os.getenv("GEMINI_API_KEY"):
         print("  Running AI deep diagnosis...")
         try:
             ai_diag = ai_deep_diagnosis(context, issues)
