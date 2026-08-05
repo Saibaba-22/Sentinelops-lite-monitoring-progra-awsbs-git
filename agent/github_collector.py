@@ -32,12 +32,12 @@ AGENT_MAP = {
 
 # ── SPECIAL CASE: errors.py always exits 1 by design ─────────
 # If we detected this is errors.py running, treat successful run as passed
-if agent_key == "errors":
+#if agent_key == "errors":
     # errors.py wrote its reports = it succeeded
-    if "Reports written to" in log_text or "reports written to" in lower:
-        stats["state"]    = "passed"
-        stats["decision"] = "pass"
-        return stats
+#    if "Reports written to" in log_text or "reports written to" in lower:
+#        stats["state"]    = "passed"
+#        stats["decision"] = "pass"
+#        return stats
     # else fall through to normal detection
 
 def _headers() -> dict:

@@ -10,6 +10,13 @@ DOCKERHUB_TOKEN="${DOCKERHUB_TOKEN:?Set DOCKERHUB_TOKEN}"
 GRAFANA_ADMIN_PASSWORD="${GRAFANA_ADMIN_PASSWORD:?Set GRAFANA_ADMIN_PASSWORD}"
 MONITOR_TOKEN="${MONITOR_TOKEN_AZURE:-${MONITOR_TOKEN:-}}"
 
+# ─── AI Agent Monitor + GitHub collector ───
+GEMINI_API_KEY="${GEMINI_API_KEY:-}"
+AI_PROVIDER="${AI_PROVIDER:-gemini}"
+AI_MODEL="${AI_MODEL:-gemini-2.5-flash}"
+GH_METRICS_TOKEN="${GH_METRICS_TOKEN:-}"
+GH_METRICS_REPO="${GH_METRICS_REPO:-}"
+
 if [ -z "${MONITOR_TOKEN}" ]; then
   echo "ERROR: Set MONITOR_TOKEN_AZURE or MONITOR_TOKEN"
   exit 1
@@ -33,15 +40,26 @@ if [ -z "${MONITOR_TOKEN}" ]; then
 fi
 
 # Show lengths only (not values) for security
-echo "   DOCKERHUB_TOKEN length     : ${#DOCKERHUB_TOKEN}"
+echo "   DOCKERHUB_TOKEN length        : ${#DOCKERHUB_TOKEN}"
 echo "   GRAFANA_ADMIN_PASSWORD length : ${#GRAFANA_ADMIN_PASSWORD}"
-echo "   MONITOR_TOKEN length       : ${#MONITOR_TOKEN}"
+echo "   MONITOR_TOKEN length          : ${#MONITOR_TOKEN}"
+echo "   GEMINI_API_KEY length         : ${#GEMINI_API_KEY}"
+echo "   GH_METRICS_TOKEN length       : ${#GH_METRICS_TOKEN}"
+echo "   GH_METRICS_REPO               : ${GH_METRICS_REPO}"
 
 if [ "${SECRETS_FAILED}" = "1" ]; then
   echo "ERROR: One or more required secrets are empty. Aborting."
   exit 1
 fi
 echo "✅ All secrets are present."
+
+# ─── Warn if optional AI/collector vars are missing (non-fatal) ───
+if [ -z "${GEMINI_API_KEY}" ]; then
+  echo "⚠️  GEMINI_API_KEY is empty — AI features will be disabled."
+fi
+if [ -z "${GH_METRICS_TOKEN}" ] || [ -z "${GH_METRICS_REPO}" ]; then
+  echo "⚠️  GH_METRICS_TOKEN or GH_METRICS_REPO empty — GitHub auto-collector will be disabled."
+fi
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 COMPOSE_SRC="${ROOT_DIR}/docker/docker-compose.azure.yml"
@@ -61,6 +79,9 @@ echo "PROMETHEUS_IMAGE     = ${PROMETHEUS_IMAGE}"
 echo "GRAFANA_IMAGE        = ${GRAFANA_IMAGE}"
 echo "AZURE_WEBAPP_NAME    = ${AZURE_WEBAPP_NAME}"
 echo "AZURE_RESOURCE_GROUP = ${AZURE_RESOURCE_GROUP}"
+echo "AI_MODEL             = ${AI_MODEL}"
+echo "AI_PROVIDER          = ${AI_PROVIDER}"
+echo "GH_METRICS_REPO      = ${GH_METRICS_REPO}"
 echo "====================================================="
 
 if [ ! -f "${COMPOSE_SRC}" ]; then
@@ -105,6 +126,11 @@ sed -i \
   -e "s|__GF_SERVER_ROOT_URL__|${GF_ROOT_URL}|g" \
   -e "s|__MONITOR_TOKEN__|${MONITOR_TOKEN}|g" \
   -e "s|__GRAFANA_ADMIN_PASSWORD__|${GRAFANA_ADMIN_PASSWORD}|g" \
+  -e "s|__GEMINI_API_KEY__|${GEMINI_API_KEY}|g" \
+  -e "s|__AI_PROVIDER__|${AI_PROVIDER}|g" \
+  -e "s|__AI_MODEL__|${AI_MODEL}|g" \
+  -e "s|__GH_METRICS_TOKEN__|${GH_METRICS_TOKEN}|g" \
+  -e "s|__GH_METRICS_REPO__|${GH_METRICS_REPO}|g" \
   "${COMPOSE_TMP}"
 
 sed -i \
@@ -115,9 +141,13 @@ sed -i \
 # ─── Verify no placeholders remain ───
 echo "==> Verifying all placeholders resolved"
 FAILED=0
-for marker in "__APP_IMAGE__" "__NGINX_IMAGE__" "__PROMETHEUS_IMAGE__" "__GRAFANA_IMAGE__" \
+for marker in \
+  "__APP_IMAGE__" "__NGINX_IMAGE__" "__PROMETHEUS_IMAGE__" "__GRAFANA_IMAGE__" \
   "__BUILD_NUMBER__" "__ENVIRONMENT__" "__GF_SERVER_DOMAIN__" "__GF_SERVER_ROOT_URL__" \
-  "__MONITOR_TOKEN__" "__GRAFANA_ADMIN_PASSWORD__" "replace_with_"; do
+  "__MONITOR_TOKEN__" "__GRAFANA_ADMIN_PASSWORD__" \
+  "__GEMINI_API_KEY__" "__AI_PROVIDER__" "__AI_MODEL__" \
+  "__GH_METRICS_TOKEN__" "__GH_METRICS_REPO__" \
+  "replace_with_"; do
   if grep -q "${marker}" "${COMPOSE_TMP}" 2>/dev/null; then
     echo "ERROR: Unresolved placeholder '${marker}'"
     FAILED=1
@@ -151,6 +181,14 @@ az webapp config appsettings set \
     "GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD}" \
     "GF_SERVER_DOMAIN=${GF_DOMAIN}" \
     "GF_SERVER_ROOT_URL=${GF_ROOT_URL}" \
+    "GEMINI_API_KEY=${GEMINI_API_KEY}" \
+    "GOOGLE_API_KEY=${GEMINI_API_KEY}" \
+    "AI_PROVIDER=${AI_PROVIDER}" \
+    "AI_MODEL=${AI_MODEL}" \
+    "GITHUB_TOKEN_METRICS=${GH_METRICS_TOKEN}" \
+    "GITHUB_REPO=${GH_METRICS_REPO}" \
+    "GITHUB_POLL_INTERVAL=60" \
+    "TARGET_CLOUD=azure" \
   --output none
 
 echo "✅ App settings configured."

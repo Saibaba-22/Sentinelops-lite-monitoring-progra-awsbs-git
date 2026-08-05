@@ -2,6 +2,23 @@ version: "3.8"
 
 services:
 
+  # ═════════════════════════════════════════════════════════════
+  # NGINX — Public entrypoint (port 80)
+  # Routes: /, /metrics, /prometheus/, /grafana/, /node-exporter/metrics
+  # ═════════════════════════════════════════════════════════════
+  nginx:
+    image: __NGINX_IMAGE__
+    ports:
+      - "80:80"
+    depends_on:
+      - app
+      - prometheus
+      - grafana
+      - node-exporter
+
+  # ═════════════════════════════════════════════════════════════
+  # APP — Flask + Prometheus metrics + GitHub auto-collector
+  # ═════════════════════════════════════════════════════════════
   app:
     image: __APP_IMAGE__
     expose:
@@ -12,14 +29,23 @@ services:
       - BUILD_NUMBER=__BUILD_NUMBER__
       - ENVIRONMENT=__ENVIRONMENT__
       - METRICS_INTERVAL=5
-      - MONITOR_TOKEN=__MONITOR_TOKEN__
       - PYTHONPATH=/app
+      - TARGET_CLOUD=azure
+      # ── Auth for /monitor/status and /metrics ─────────────────
+      - MONITOR_TOKEN=__MONITOR_TOKEN__
+      # ── AI Agent Monitor (Gemini) ─────────────────────────────
+      - GEMINI_API_KEY=__GEMINI_API_KEY__
+      - GOOGLE_API_KEY=__GEMINI_API_KEY__
+      - AI_PROVIDER=__AI_PROVIDER__
+      - AI_MODEL=__AI_MODEL__
+      # ── GitHub Actions auto-collector ─────────────────────────
+      - GITHUB_TOKEN_METRICS=__GH_METRICS_TOKEN__
+      - GITHUB_REPO=__GH_METRICS_REPO__
+      - GITHUB_POLL_INTERVAL=60
 
-  nginx:
-    image: __NGINX_IMAGE__
-    ports:
-      - "80:80"
-
+  # ═════════════════════════════════════════════════════════════
+  # PROMETHEUS — Scrapes app + node-exporter, served at /prometheus/
+  # ═════════════════════════════════════════════════════════════
   prometheus:
     image: __PROMETHEUS_IMAGE__
     expose:
@@ -28,7 +54,13 @@ services:
       - "--config.file=/etc/prometheus/prometheus.yml"
       - "--web.external-url=/prometheus/"
       - "--web.route-prefix=/prometheus/"
+    depends_on:
+      - app
+      - node-exporter
 
+  # ═════════════════════════════════════════════════════════════
+  # GRAFANA — Dashboards, served at /grafana/
+  # ═════════════════════════════════════════════════════════════
   grafana:
     image: __GRAFANA_IMAGE__
     expose:
@@ -48,7 +80,12 @@ services:
       - GF_LIVE_ALLOWED_ORIGINS=*
       - GF_AUTH_ANONYMOUS_ENABLED=false
       - PROMETHEUS_URL=http://prometheus:9090/prometheus/
+    depends_on:
+      - prometheus
 
+  # ═════════════════════════════════════════════════════════════
+  # NODE-EXPORTER — Host system metrics for Prometheus
+  # ═════════════════════════════════════════════════════════════
   node-exporter:
     image: prom/node-exporter:v1.8.0
     expose:
