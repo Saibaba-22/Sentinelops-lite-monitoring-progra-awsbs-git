@@ -706,12 +706,18 @@ def main():
         
         # If in CI, try to upload artifact
         if ci_env == 'GitHub Actions':
-            print(f"::set-output name=documentation_file::{output_file}")
+            gh_output = os.environ.get("GITHUB_OUTPUT")
+            if gh_output:
+                with open(gh_output, "a", encoding="utf-8") as fh:
+                    fh.write(f"documentation_file={output_file}\n")
+            else:
+                # Fallback for older runners
+                print(f"::set-output name=documentation_file::{output_file}")
         
         print("\n" + "=" * 60)
         print("✨ Documentation generation completed successfully!")
         print("=" * 60)
-        
+                
         return 0
     
     except Exception as e:
