@@ -30,6 +30,15 @@ AGENT_MAP = {
     "final_agent": ("final_agent", "post_deploy"),
 }
 
+# ── SPECIAL CASE: errors.py always exits 1 by design ─────────
+# If we detected this is errors.py running, treat successful run as passed
+if agent_key == "errors":
+    # errors.py wrote its reports = it succeeded
+    if "Reports written to" in log_text or "reports written to" in lower:
+        stats["state"]    = "passed"
+        stats["decision"] = "pass"
+        return stats
+    # else fall through to normal detection
 
 def _headers() -> dict:
     return {
@@ -62,16 +71,6 @@ def _get(path: str, params: dict = None) -> Optional[dict]:
 def _parse_job_log(log_text: str, agent_key: str) -> dict:
     """
     Extract agent metrics from a job's log output.
-
-    Looks for patterns like:
-      [test_agent] tokens: 165
-      [test_agent] prompt_tokens: 120
-      [test_agent] completion_tokens: 45
-      [test_agent] api_calls: 1
-      [test_agent] state: passed
-      [test_agent] execution_time: 1.2
-
-    Also parses AI stats from errors.py/final_agent.py output.
     """
     stats = {
         "prompt_tokens":     0,
@@ -83,51 +82,70 @@ def _parse_job_log(log_text: str, agent_key: str) -> dict:
         "decision":          "unknown",
     }
 
-    # Try direct patterns
-    for line in log_text.splitlines():
-        # test_agent format: [test_agent] key: value
-        # errors/final_agent print AI Stats block
-        # Also parse pipeline-neutral formats
+    lower = log_text.lower()
 
-        # Prompt / Completion / Total tokens
-        m = re.search(r"[Pp]rompt.{0,10}tokens?[:\s=]+(\d+)", line)
+    # ── Extract numeric metrics ──────────────────────────────
+    for line in log_text.splitlines():
+        m = re.search(r"[Pp]rompt.{0,10}[Tt]okens?[:\s=]+(\d+)", line)
         if m:
             stats["prompt_tokens"] = max(stats["prompt_tokens"], int(m.group(1)))
-        m = re.search(r"[Cc]ompletion.{0,10}tokens?[:\s=]+(\d+)", line)
+        m = re.search(r"[Cc]ompletion.{0,10}[Tt]okens?[:\s=]+(\d+)", line)
         if m:
             stats["completion_tokens"] = max(stats["completion_tokens"], int(m.group(1)))
         m = re.search(r"[Tt]otal[_ ]?[Tt]ok(?:en)?s?[:\s=]+(\d+)", line)
         if m:
             stats["total_tokens"] = max(stats["total_tokens"], int(m.group(1)))
-
-        # API calls / Requests
         m = re.search(r"(?:api[_ ]?calls?|[Rr]equests?)[:\s=]+(\d+)", line)
         if m:
             stats["api_calls"] = max(stats["api_calls"], int(m.group(1)))
-
-        # Execution time
         m = re.search(r"(?:execution[_ ]?time|[Aa]i[_ ]?[Tt]ime|Total execution)[:\s=]+([\d.]+)", line)
         if m:
             stats["execution_time"] = max(stats["execution_time"], float(m.group(1)))
 
-    # Detect state/decision from log content
-    lower = log_text.lower()
-    if "approved" in lower or "no errors found - ready to deploy" in lower or "no issues found" in lower:
-        stats["state"]    = "passed"
-        stats["decision"] = "pass"
-    elif "blocking deploy" in lower or "rejected" in lower or "found" in lower and "issues" in lower:
-        stats["state"]    = "failed"
-        stats["decision"] = "fail"
-    elif "completed in" in lower or "reports written" in lower:
-        stats["state"]    = "passed"
-        stats["decision"] = "pass"
-
-    # Fallback: if total_tokens is 0 but prompt+completion have values
     if stats["total_tokens"] == 0:
         stats["total_tokens"] = stats["prompt_tokens"] + stats["completion_tokens"]
 
-    return stats
+    # ── State detection — per-agent logic ────────────────────
 
+    # SPECIAL CASE: errors.py always exits 1 by design.
+    # If reports were written, the agent ran successfully.
+    if agent_key == "errors":
+        if ("reports written to" in lower
+                or "END OF REPORT" in log_text
+                or "DEPLOYMENT FAILURE DIAGNOSTIC REPORT" in log_text):
+            stats["state"]    = "passed"
+            stats["decision"] = "pass"
+            return stats
+
+    # test_agent success/failure markers
+    if agent_key == "test_agent":
+        if "no errors found - ready to deploy" in lower:
+            stats["state"]    = "passed"
+            stats["decision"] = "pass"
+            return stats
+        if "blocking deploy" in lower or "❌ found" in lower.replace("❌", "❌"):
+            stats["state"]    = "failed"
+            stats["decision"] = "fail"
+            return stats
+
+    # final_agent success/failure markers
+    if agent_key == "final_agent":
+        if ("completed in" in lower
+                or "no issues found" in lower
+                or "post-deploy health" in lower):
+            stats["state"]    = "passed"
+            stats["decision"] = "pass"
+            return stats
+
+    # ── Generic fallback ─────────────────────────────────────
+    if "Error: Process completed with exit code 1" in log_text:
+        stats["state"]    = "failed"
+        stats["decision"] = "fail"
+    else:
+        stats["state"]    = "passed"
+        stats["decision"] = "pass"
+
+    return stats
 
 def _update_metrics(agent_name: str, stage: str, stats: dict,
                     run_id: int, timestamp: float):
