@@ -135,7 +135,9 @@ jobs:
 
           cat > docker/prometheus/Dockerfile <<'DEOF'
           FROM prom/prometheus:v2.53.0
-          COPY monitoring/prometheus/ /etc/prometheus/
+          COPY monitoring/prometheus/prometheus-azure.yml /etc/prometheus/prometheus.yml
+          COPY monitoring/prometheus/alert.rules.yml /etc/prometheus/alert.rules.yml
+          COPY monitoring/prometheus/recording.rules.yml /etc/prometheus/recording.rules.yml
           CMD ["--config.file=/etc/prometheus/prometheus.yml", "--web.external-url=/prometheus/", "--web.route-prefix=/prometheus/"]
           DEOF
 
