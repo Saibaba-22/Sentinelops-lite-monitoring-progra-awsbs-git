@@ -180,7 +180,7 @@ GRAFANA_ENV=$(cat <<EOF
   {"name": "GF_SECURITY_COOKIE_SAMESITE", "value": "disabled"},
   {"name": "GF_LIVE_ALLOWED_ORIGINS", "value": "*"},
   {"name": "GF_AUTH_ANONYMOUS_ENABLED", "value": "false"},
-  {"name": "PROMETHEUS_URL", "value": "http://prometheus:9090/prometheus/"}
+  {"name": "PROMETHEUS_URL", "value": "http://localhost:9090/prometheus/"}
 ]
 EOF
 )

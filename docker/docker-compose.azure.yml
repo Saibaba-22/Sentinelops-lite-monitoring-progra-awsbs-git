@@ -91,7 +91,7 @@ services:
       - GF_SECURITY_COOKIE_SAMESITE=disabled
       - GF_LIVE_ALLOWED_ORIGINS=*
       - GF_AUTH_ANONYMOUS_ENABLED=false
-      - PROMETHEUS_URL=http://prometheus:9090/prometheus/
+      - PROMETHEUS_URL=http://localhost:9090/prometheus/
     depends_on:
       - prometheus
 
