@@ -475,104 +475,272 @@ def extract_dependency_issues(text: str) -> list[Issue]:
     return issues
 
 def extract_config_issues(text: str) -> list[Issue]:
+    """
+    Detect real config/env-var errors with case-SENSITIVE matching.
+    Only flags UPPERCASE_ENV_VARS, not English words.
+    """
     issues: list[Issue] = []
-    pats = [
-        (r"KeyError: '([^']+)'",
-         "Missing dict key / env var",
-         "Code expects an env var or config key that isn't set."),
-        (r"Environment variable (\S+) not set",
-         "Missing env variable",
-         "Required env var not injected."),
-        (r"([A-Z][A-Z0-9_]{2,})\s+(?:is not set|is empty|is undefined|missing)",
-         "Env var validation failure",
-         "Startup check reported an env var as missing."),
-        (r"os\.environ\[['\"]([A-Z_]+)['\"]\].*KeyError",
-         "os.environ KeyError",
-         "Code accessed os.environ[X] where X wasn't set."),
-        (r"Invalid configuration.*?([^\n]+)",
-         "Invalid config value",
-         "Config value doesn't match expected format/schema."),
-        (r"permission denied.*?([^\n]+)",
-         "Permission denied",
-         "OS-level access denied."),
-        (r"EACCES.*?([^\n]+)",
-         "EACCES access denied",
-         "Insufficient file permissions."),
-        (r"certificate.*?expired",
-         "TLS certificate expired",
-         "SSL/TLS cert past its expiry date."),
-        (r"SSL.*?error",
-         "SSL/TLS error",
-         "Certificate validation or handshake failure."),
-        (r"invalid.*?token",
-         "Invalid auth token",
-         "API token wrong, expired, or malformed."),
-        (r"authentication.*?failed",
-         "Authentication failure",
-         "Credentials rejected by the target service."),
-        (r"401 unauthorized",
-         "HTTP 401",
-         "Missing/invalid credentials."),
-        (r"403 forbidden",
-         "HTTP 403",
-         "Authenticated but lacks permission."),
-        (r"port.*?already in use",
-         "Port conflict",
-         "Another process is using the port."),
-        (r"EADDRINUSE",
-         "EADDRINUSE",
-         "Bind failed — port taken."),
-        # ── NEW: catch Azure/AWS CLI-specific errors ──────────
-        (r"Operation returned an invalid status '([^']+)'",
-         "Azure API error",
-         "Azure CLI request rejected by Azure API. See status."),
-        (r"Bad Request",
-         "HTTP 400 Bad Request",
-         "API rejected the request. Usually invalid payload, unsupported feature, or plan tier limitation."),
-        (r"multicontainer.*not.*support",
-         "Multi-container not supported",
-         "Azure App Service tier/region does not support multi-container compose."),
-        (r"SKU.*not.*support",
-         "SKU tier limitation",
-         "Your App Service Plan tier is too low for this feature. Upgrade to B1 or higher."),
-        (r"password.*(?:too short|minimum|must be at least)",
-         "Password too short",
-         "A password field doesn't meet minimum length requirements."),
+
+    # ── Patterns use case-SENSITIVE flag (no IGNORECASE!) ──
+    # This is critical: [A-Z] must ONLY match uppercase.
+    pats_case_sensitive = [
+        # KeyError with actual env var name (uppercase, 3+ chars)
+        (r"KeyError: '([A-Z][A-Z0-9_]{2,})'",
+         "Missing dict key / env var"),
+
+        # Explicit "Environment variable NAME not set"
+        (r"Environment variable ([A-Z][A-Z0-9_]{2,}) (?:not set|is not set|missing|is empty)",
+         "Missing env variable"),
+
+        # NAME_VAR is not set / must be set — uppercase word only
+        (r"\b([A-Z][A-Z0-9_]{3,})\s+(?:is not set|is empty|is undefined|must be set)\b",
+         "Env var validation failure"),
+
+        # os.environ['NAME'] KeyError
+        (r"os\.environ\[['\"]([A-Z][A-Z0-9_]+)['\"]\].*KeyError",
+         "os.environ KeyError"),
+
+        # Set X or Y — bash pattern "Set MONITOR_TOKEN"
+        (r"\bSet ([A-Z][A-Z0-9_]{2,})\b",
+         "Bash script expected env var"),
     ]
-    for pat, cat, why in pats:
+
+    # ── These patterns are case-insensitive (real error strings) ──
+    pats_case_insensitive = [
+        (r"Operation returned an invalid status '([^']+)'",
+         "Azure API error"),
+
+        (r"multicontainer.*not.*support",
+         "Multi-container not supported"),
+
+        (r"SKU.*(?:not.*support|too low|insufficient|does not support)",
+         "SKU tier limitation"),
+
+        (r"password.*(?:too short|must be at least \d+|minimum length \d+)",
+         "Credential too short"),
+
+        (r"permission denied[:\s]",
+         "Permission denied"),
+
+        (r"\bEACCES\b",
+         "EACCES access denied"),
+
+        (r"certificate.*expired",
+         "TLS certificate expired"),
+
+        (r"\bSSL.*(?:handshake|verification).*fail",
+         "SSL/TLS error"),
+
+        (r"authentication.*failed",
+         "Authentication failure"),
+
+        (r"HTTP 401\b",
+         "HTTP 401 Unauthorized"),
+
+        (r"HTTP 403\b",
+         "HTTP 403 Forbidden"),
+
+        (r"port.*already in use",
+         "Port conflict"),
+
+        (r"\bEADDRINUSE\b",
+         "Port already in use"),
+    ]
+
+    # Process case-sensitive patterns
+    for pat, cat in pats_case_sensitive:
+        for m in re.finditer(pat, text):  # NO re.IGNORECASE
+            _add_config_issue(issues, text, m, cat)
+
+    # Process case-insensitive patterns
+    for pat, cat in pats_case_insensitive:
         for m in re.finditer(pat, text, re.IGNORECASE):
-            ctx = text[max(0, m.start()-300):m.end()+300]
-            f, l, b = _nearest_file_line(ctx)
+            _add_config_issue(issues, text, m, cat)
 
-            # ── Extract captured variable/value name (if any) ──
-            captured = m.group(1) if m.lastindex else ""
-
-            # ── Build informative description ──
-            if captured:
-                desc = f"{cat}: '{captured}' — {m.group(0)[:150]}"
-            else:
-                desc = f"{cat}: {m.group(0)[:200]}"
-
-            # ── Build informative root cause ──
-            if captured and "env" in cat.lower():
-                rc = (f"Env var '{captured}' is expected by the code/CLI "
-                      f"but was NOT injected by the CI/CD pipeline. "
-                      f"Add '{captured}' to GitHub Secrets or the deploy step's env: block.")
-            elif captured:
-                rc = f"{why} Specifically: '{captured}'."
-            else:
-                rc = why
-
-            issues.append(Issue(
-                severity="HIGH", category="CONFIG",
-                file=f, line=l, block=b,
-                description=desc,
-                expected="Configuration valid and accessible.",
-                root_cause=rc,
-                solution=_config_solution_specific(cat, captured),
-                affected_files=_find_affected_files(text, m.group(0)),
-            ))
     return issues
+
+
+def _add_config_issue(issues: list[Issue], text: str, m: re.Match, cat: str):
+    """Build an Issue from a regex match with clear description."""
+    ctx = text[max(0, m.start() - 300):m.end() + 300]
+    f, l, b = _nearest_file_line(ctx)
+
+    # Extract captured group (env var name or error detail)
+    captured = m.group(1) if m.lastindex else ""
+
+    # ── Build clear description ──
+    if captured:
+        # Skip if captured is clearly not an env var (too short, has lowercase)
+        if cat.lower().startswith(("missing", "env var", "os.environ", "bash")):
+            if not re.match(r"^[A-Z][A-Z0-9_]{2,}$", captured):
+                return  # Skip — not a real env var name
+        desc = f"{cat}: {captured} — {m.group(0)[:150]}"
+    else:
+        desc = f"{cat}: {m.group(0)[:200]}"
+
+    # ── Build actionable root cause ──
+    root_cause = _build_root_cause(cat, captured, m.group(0))
+
+    # ── Build specific solution ──
+    solution = _build_solution(cat, captured)
+
+    # ── Severity: Azure/deploy errors are CRITICAL ──
+    severity = "CRITICAL" if cat in (
+        "Azure API error",
+        "Multi-container not supported",
+        "SKU tier limitation",
+    ) else "HIGH"
+
+    issues.append(Issue(
+        severity=severity,
+        category="CONFIG",
+        file=f,
+        line=l,
+        block=b,
+        description=desc,
+        expected="Configuration valid and accessible.",
+        root_cause=root_cause,
+        solution=solution,
+        affected_files=_find_affected_files(text, m.group(0)),
+    ))
+
+
+def _build_root_cause(cat: str, captured: str, full_match: str) -> str:
+    """Return specific root cause based on category."""
+    c = cat.lower()
+
+    if "azure api" in c:
+        return (
+            f"Azure API rejected request with '{captured}'. "
+            "Most common causes: (1) App Service Plan tier too low for multi-container "
+            "— requires B1 or higher, not F1/Free. (2) Multi-container compose is "
+            "deprecated by Microsoft since June 2024 — migrate to Container Apps. "
+            "(3) Compose YAML has invalid syntax Azure doesn't accept."
+        )
+
+    if "multi-container" in c:
+        return (
+            "Azure App Service tier doesn't support multi-container deployment, "
+            "OR multi-container is deprecated in your region. "
+            "Fix: upgrade Plan to B1+, or migrate to Azure Container Apps."
+        )
+
+    if "sku" in c:
+        return (
+            "Your App Service Plan tier is too low. "
+            "Multi-container needs B1 minimum. Free/F1/Shared tiers cannot run multi-container apps."
+        )
+
+    if "credential too short" in c:
+        return (
+            "A password or token is shorter than the service's minimum. "
+            "Grafana requires 12+ chars. Increase in GitHub Secrets."
+        )
+
+    if "missing" in c or "env var" in c or "bash script" in c:
+        if captured:
+            return (
+                f"Environment variable '{captured}' is REQUIRED by the code/script but "
+                f"was NOT set. Add '{captured}' to GitHub Secrets (if sensitive) or "
+                f"Variables (if not), then ensure the pipeline step's env: block passes it through."
+            )
+        return "A required environment variable is missing."
+
+    if "os.environ" in c:
+        return f"Python code accessed os.environ['{captured}'] but that variable was never set."
+
+    if "permission" in c or "eacces" in c:
+        return "OS-level access denied. Check file permissions (chmod), ownership (chown), or Docker container user."
+
+    if "certificate" in c or "ssl" in c:
+        return "TLS/SSL error. Check cert expiration, system CA bundle, or clock skew."
+
+    if "authentication" in c or "http 401" in c:
+        return "Credentials rejected. Check token/password validity in secrets."
+
+    if "http 403" in c:
+        return "Authenticated but lacks permission. Check IAM/RBAC role."
+
+    if "port" in c or "eaddrinuse" in c:
+        return f"Port already bound by another process. Free the port or use different one."
+
+    return "Configuration error detected."
+
+
+def _build_solution(cat: str, captured: str) -> str:
+    """Return step-by-step fix based on category."""
+    c = cat.lower()
+
+    if "azure api" in c or "multi-container" in c or "sku" in c:
+        return (
+            "1. Check current App Service Plan tier:\n"
+            "   az appservice plan list --resource-group <RG> -o table\n"
+            "\n"
+            "2. If tier is F1/FREE/SHARED, upgrade to B1:\n"
+            "   az appservice plan update --name <PLAN> --resource-group <RG> --sku B1\n"
+            "\n"
+            "3. If tier is already B1+, Azure has deprecated multi-container.\n"
+            "   Migrate to Azure Container Apps:\n"
+            "   https://learn.microsoft.com/azure/container-apps/\n"
+            "\n"
+            "4. Retry the deployment after upgrading or migrating."
+        )
+
+    if "credential too short" in c:
+        return (
+            "1. Open GitHub → Settings → Secrets and variables → Actions.\n"
+            "2. Edit the affected secret (e.g., GRAFANA_ADMIN_PASSWORD).\n"
+            "3. Set value to 12+ characters (mix letters, digits, symbols).\n"
+            "4. Re-run the pipeline."
+        )
+
+    if "missing" in c or "env var" in c or "bash script" in c or "os.environ" in c:
+        if captured:
+            return (
+                f"1. Add '{captured}' as a GitHub Secret (sensitive) or Variable (public):\n"
+                f"   GitHub → Settings → Secrets and variables → Actions → New\n"
+                f"\n"
+                f"2. Pass it through the pipeline step's env: block:\n"
+                f"   env:\n"
+                f"     {captured}: ${{{{ secrets.{captured} }}}}\n"
+                f"\n"
+                f"3. If used inside deploy-*.sh, ensure the script's env: also declares it.\n"
+                f"\n"
+                f"4. Verify in .env.example (should list '{captured}' for documentation)."
+            )
+        return "Set the missing environment variable in GitHub Secrets or pipeline env: block."
+
+    if "permission" in c:
+        return (
+            "1. Check permissions: ls -la <path>\n"
+            "2. Fix with chmod/chown as needed.\n"
+            "3. Verify Docker container user (avoid running as root)."
+        )
+
+    if "http 401" in c or "authentication" in c:
+        return (
+            "1. Verify the token/password in GitHub Secrets is correct.\n"
+            "2. Check for expired credentials.\n"
+            "3. Regenerate if needed."
+        )
+
+    if "http 403" in c:
+        return (
+            "1. Check IAM role / RBAC permissions for the caller.\n"
+            "2. Verify resource path and access rights."
+        )
+
+    if "port" in c or "eaddrinuse" in c:
+        return (
+            "1. Find blocking process: lsof -i :<port>\n"
+            "2. Kill it or use a different port.\n"
+            "3. Update Docker port mappings if applicable."
+        )
+
+    return (
+        "1. Review the configuration file for the reported issue.\n"
+        "2. Fix and retry deployment."
+    )
 
 def extract_network_issues(text: str) -> list[Issue]:
     issues: list[Issue] = []
