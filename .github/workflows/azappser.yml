@@ -152,7 +152,6 @@ jobs:
           COPY --chown=472:0 monitoring/grafana/provisioning/ /etc/grafana/provisioning/
           COPY --chown=472:0 monitoring/grafana/dashboards/ /var/lib/grafana/dashboards/
           USER 472
-          ENTRYPOINT ["/entrypoint.sh"]
           DEOF
 
       - name: Build and push nginx monitoring image

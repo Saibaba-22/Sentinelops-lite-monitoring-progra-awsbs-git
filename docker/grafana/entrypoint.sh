@@ -5,8 +5,10 @@
 
 set -e
 
-: "${GF_SERVER_DOMAIN:?ERROR: GF_SERVER_DOMAIN env var not set}"
-: "${GF_SERVER_ROOT_URL:?ERROR: GF_SERVER_ROOT_URL env var not set}"
+#: "${GF_SERVER_DOMAIN:?ERROR: GF_SERVER_DOMAIN env var not set}"
+#: "${GF_SERVER_ROOT_URL:?ERROR: GF_SERVER_ROOT_URL env var not set}"
+GF_SERVER_DOMAIN="${GF_SERVER_DOMAIN:-localhost}"
+GF_SERVER_ROOT_URL="${GF_SERVER_ROOT_URL:-http://localhost:3000/grafana/}"
 
 cat > /etc/grafana/grafana.ini <<EOF
 [server]
