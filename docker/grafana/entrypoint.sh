@@ -1,4 +1,4 @@
-cat > docker/grafana/entrypoint.sh <<'ENDOFFILE'
+#cat > docker/grafana/entrypoint.sh <<'ENDOFFILE'
 #!/bin/sh
 # Generates /etc/grafana/grafana.ini at container startup using env vars.
 # No hardcoded hostnames — Azure passes them via GF_SERVER_DOMAIN and GF_SERVER_ROOT_URL.
@@ -52,6 +52,6 @@ echo "  serve_from_sub_path = true"
 
 # Hand off to Grafana's real entrypoint (starts grafana-server)
 exec /run.sh "$@"
-ENDOFFILE
+#ENDOFFILE
 
-chmod +x docker/grafana/entrypoint.sh
+#chmod +x docker/grafana/entrypoint.sh
