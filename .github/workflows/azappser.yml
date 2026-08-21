@@ -117,14 +117,17 @@ jobs:
 
       - name: Prepare monitoring sidecar Dockerfiles
         run: |
-          test -f docker/nginx/nginx-azure.conf                                     || { echo "Missing docker/nginx/nginx-azure.conf"; exit 1; }
-          test -f monitoring/prometheus/prometheus.yml                              || { echo "Missing monitoring/prometheus/prometheus.yml"; exit 1; }
-          test -f monitoring/grafana/provisioning/datasources/datasource.yml        || { echo "Missing Grafana datasource provisioning"; exit 1; }
-          test -f monitoring/grafana/provisioning/dashboards/dashboard.yml          || { echo "Missing Grafana dashboard provisioning"; exit 1; }
-          test -f monitoring/grafana/dashboards/ai-agent-dashboard.json             || { echo "Missing ai-agent-dashboard.json"; exit 1; }
+          test -f docker/nginx/nginx-azure.conf                              || { echo "Missing docker/nginx/nginx-azure.conf"; exit 1; }
+          test -f monitoring/prometheus/prometheus-azure.yml                 || { echo "Missing monitoring/prometheus/prometheus-azure.yml"; exit 1; }
+          test -f monitoring/grafana/provisioning/datasources/datasource.yml || { echo "Missing Grafana datasource provisioning"; exit 1; }
+          test -f monitoring/grafana/provisioning/dashboards/dashboard.yml   || { echo "Missing Grafana dashboard provisioning"; exit 1; }
+          test -f monitoring/grafana/dashboards/ai-agent-dashboard.json      || { echo "Missing ai-agent-dashboard.json"; exit 1; }
+          test -f docker/grafana/entrypoint.sh                               || { echo "Missing docker/grafana/entrypoint.sh"; exit 1; }
           if grep -qE 'url: *\[' monitoring/grafana/provisioning/datasources/datasource.yml; then
-            echo "Grafana datasource URL contains Markdown link syntax; use url: http://prometheus:9090/prometheus/"; exit 1
+            echo "Grafana datasource URL contains Markdown link syntax; use url: http://localhost:9090/prometheus/"; exit 1
           fi
+
+          chmod +x docker/grafana/entrypoint.sh
 
           mkdir -p docker/nginx docker/prometheus docker/grafana
 
@@ -144,43 +147,13 @@ jobs:
           cat > docker/grafana/Dockerfile <<'DEOF'
           FROM grafana/grafana:11.1.0
           USER root
-          RUN cat > /etc/grafana/grafana.ini <<'INIEOF'
-          [server]
-          protocol = http
-          http_port = 3000
-          domain = saiwebapp2026-c4cke9chgwedhzch.southafricanorth-01.azurewebsites.net
-          root_url = https://saiwebapp2026-c4cke9chgwedhzch.southafricanorth-01.azurewebsites.net/grafana/
-          serve_from_sub_path = true
-          enable_gzip = true
-
-          [security]
-          admin_user = admin
-          allow_embedding = true
-          cookie_secure = false
-          cookie_samesite = disabled
-
-          [users]
-          allow_sign_up = false
-
-          [auth.anonymous]
-          enabled = false
-
-          [live]
-          allowed_origins = *
-
-          [log]
-          mode = console
-          level = info
-
-          [dataproxy]
-          timeout = 300
-          INIEOF
-          RUN chown 472:0 /etc/grafana/grafana.ini && chmod 644 /etc/grafana/grafana.ini
+          COPY --chown=472:0 docker/grafana/entrypoint.sh /entrypoint.sh
+          RUN chmod +x /entrypoint.sh
           COPY --chown=472:0 monitoring/grafana/provisioning/ /etc/grafana/provisioning/
           COPY --chown=472:0 monitoring/grafana/dashboards/ /var/lib/grafana/dashboards/
           USER 472
+          ENTRYPOINT ["/entrypoint.sh"]
           DEOF
-          test -f docker/grafana/grafana.ini || { echo "Missing docker/grafana/grafana.ini"; exit 1; }
 
       - name: Build and push nginx monitoring image
         uses: docker/build-push-action@v6
@@ -553,7 +526,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: project-documentation-azure
-          path: "*Documentation*.docx"
+          path: "*.docx"
           retention-days: 90
           if-no-files-found: error
 

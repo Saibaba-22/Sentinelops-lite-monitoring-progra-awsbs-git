@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 # ═════════════════════════════════════════════════════════════════
 # CONFIG
 # ═════════════════════════════════════════════════════════════════
-MODEL         = os.getenv("AI_MODEL",    "gemini-3.5-flash")
+MODEL         = os.getenv("AI_MODEL",    "gemini-2.5-flash")
 PROVIDER      = os.getenv("AI_PROVIDER", "gemini")
 MAX_FILE_READ = 4_000
 MAX_CONTEXT   = 30_000
