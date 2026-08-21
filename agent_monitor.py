@@ -75,43 +75,206 @@ MODEL_REGISTRY = {
     "google": {
         "api_key":  GOOGLE_API_KEY,
         "base_url": "https://generativelanguage.googleapis.com/v1beta",
-        "models": {
-            "gemini-2.5-flash": {
-                "tpm_limit": 1_000_000, "tph_limit": 60_000_000,
-                "tpd_limit": 1_000_000_000, "rpm_limit": 10_000,
-                "rph_limit": 600_000, "rpd_limit": 10_000_000,
-                "cost_input_per_1k": 0.00015, "cost_output_per_1k": 0.00060,
-                "context_window": 1_048_576,
-            },
-            "gemini-2.5-pro": {
-                "tpm_limit": 800_000, "tph_limit": 48_000_000,
-                "tpd_limit": 800_000_000, "rpm_limit": 2_000,
-                "rph_limit": 120_000, "rpd_limit": 2_000_000,
-                "cost_input_per_1k": 0.00125, "cost_output_per_1k": 0.01000,
-                "context_window": 1_048_576,
-            },
-            "gemini-1.5-flash": {
-                "tpm_limit": 1_000_000, "tph_limit": 60_000_000,
-                "tpd_limit": 1_000_000_000, "rpm_limit": 2_000,
-                "rph_limit": 120_000, "rpd_limit": 2_000_000,
-                "cost_input_per_1k": 0.000075, "cost_output_per_1k": 0.000300,
-                "context_window": 1_048_576,
-            },
-            "gemini-1.5-pro": {
-                "tpm_limit": 32_000, "tph_limit": 1_920_000,
-                "tpd_limit": 32_000_000, "rpm_limit": 1_000,
-                "rph_limit": 60_000, "rpd_limit": 1_000_000,
-                "cost_input_per_1k": 0.00125, "cost_output_per_1k": 0.00375,
-                "context_window": 1_048_576,
-            },
-            "gemini-3.5-flash": {
-                "tpm_limit": 1_000_000, "tph_limit": 60_000_000,
-                "tpd_limit": 1_000_000_000, "rpm_limit": 10_000,
-                "rph_limit": 600_000, "rpd_limit": 10_000_000,
-                "cost_input_per_1k": 0.00015, "cost_output_per_1k": 0.00060,
-                "context_window": 1_048_576,
-            },
+
+    "models": {
+        # Gemini 2.0 Series
+        "gemini-2.0-flash": {
+            "tpm_limit": 1_000_000, "tph_limit": 60_000_000,
+            "tpd_limit": 1_000_000_000, "rpm_limit": 2_000,
+            "rph_limit": 120_000, "rpd_limit": 2_000_000,
+            "cost_input_per_1k": 0.00015, "cost_output_per_1k": 0.00060,
+            "context_window": 1_048_576,
         },
+        "gemini-2.0-flash-001": {
+            "tpm_limit": 1_000_000, "tph_limit": 60_000_000,
+            "tpd_limit": 1_000_000_000, "rpm_limit": 2_000,
+            "rph_limit": 120_000, "rpd_limit": 2_000_000,
+            "cost_input_per_1k": 0.00015, "cost_output_per_1k": 0.00060,
+            "context_window": 1_048_576,
+        },
+        "gemini-2.0-flash-lite": {
+            "tpm_limit": 1_000_000, "tph_limit": 60_000_000,
+            "tpd_limit": 1_000_000_000, "rpm_limit": 2_000,
+            "rph_limit": 120_000, "rpd_limit": 2_000_000,
+            "cost_input_per_1k": 0.000075, "cost_output_per_1k": 0.00030,
+            "context_window": 1_048_576,
+        },
+        "gemini-2.0-flash-lite-001": {
+            "tpm_limit": 1_000_000, "tph_limit": 60_000_000,
+            "tpd_limit": 1_000_000_000, "rpm_limit": 2_000,
+            "rph_limit": 120_000, "rpd_limit": 2_000_000,
+            "cost_input_per_1k": 0.000075, "cost_output_per_1k": 0.00030,
+            "context_window": 1_048_576,
+        },
+
+        # Gemini 2.5 Series
+        "gemini-2.5-flash": {
+            "tpm_limit": 1_000_000, "tph_limit": 60_000_000,
+            "tpd_limit": 1_000_000_000, "rpm_limit": 10_000,
+            "rph_limit": 600_000, "rpd_limit": 10_000_000,
+            "cost_input_per_1k": 0.00015, "cost_output_per_1k": 0.00060,
+            "context_window": 1_048_576,
+        },
+        "gemini-2.5-flash-lite": {
+            "tpm_limit": 1_000_000, "tph_limit": 60_000_000,
+            "tpd_limit": 1_000_000_000, "rpm_limit": 10_000,
+            "rph_limit": 600_000, "rpd_limit": 10_000_000,
+            "cost_input_per_1k": 0.00000, "cost_output_per_1k": 0.00000,
+            "context_window": 1_048_576,
+        },
+        # Free but in limit
+        "gemini-2.5-flash-image": {      
+            "tpm_limit": 1_000_000, "tph_limit": 60_000_000,
+            "tpd_limit": 1_000_000_000, "rpm_limit": 2_000,
+            "rph_limit": 120_000, "rpd_limit": 2_000_000,
+            "cost_input_per_1k": 0.00015, "cost_output_per_1k": 0.00060,
+            "context_window": 32_768,
+        },
+        # Free but in Limit
+        "gemini-2.5-flash-preview-tts": {
+            "tpm_limit": 1_000_000, "tph_limit": 60_000_000,
+            "tpd_limit": 1_000_000_000, "rpm_limit": 2_000,
+            "rph_limit": 120_000, "rpd_limit": 2_000_000,
+            "cost_input_per_1k": 0.00015, "cost_output_per_1k": 0.00060,
+            "context_window": 8_192,
+        },
+
+        # Gemini 3 Series
+        "gemini-3-flash-preview": {
+            "tpm_limit": 1_000_000, "tph_limit": 60_000_000,
+            "tpd_limit": 1_000_000_000, "rpm_limit": 2_000,
+            "rph_limit": 120_000, "rpd_limit": 2_000_000,
+            "cost_input_per_1k": 0.00000, "cost_output_per_1k": 0.00000,
+            "context_window": 1_048_576,
+        },
+        "gemini-3.1-flash-lite": {
+            "tpm_limit": 1_000_000, "tph_limit": 60_000_000,
+            "tpd_limit": 1_000_000_000, "rpm_limit": 2_000,
+            "rph_limit": 120_000, "rpd_limit": 2_000_000,
+            "cost_input_per_1k": 0.00000, "cost_output_per_1k": 0.00000,
+            "context_window": 1_048_576,
+        },
+        "gemini-3.1-flash-lite-preview": {
+            "tpm_limit": 1_000_000, "tph_limit": 60_000_000,
+            "tpd_limit": 1_000_000_000, "rpm_limit": 2_000,
+            "rph_limit": 120_000, "rpd_limit": 2_000_000,
+            "cost_input_per_1k": 0.00000, "cost_output_per_1k": 0.00000,
+            "context_window": 1_048_576,
+        },
+        "gemini-3.1-flash-image-preview": {
+            "tpm_limit": 1_000_000, "tph_limit": 60_000_000,
+            "tpd_limit": 1_000_000_000, "rpm_limit": 2_000,
+            "rph_limit": 120_000, "rpd_limit": 2_000_000,
+            "cost_input_per_1k": 0.00000, "cost_output_per_1k": 0.00000,
+            "context_window": 65_536,
+        },
+        # Free but in limit
+        "gemini-3.1-flash-image": {
+            "tpm_limit": 1_000_000, "tph_limit": 60_000_000,
+            "tpd_limit": 1_000_000_000, "rpm_limit": 2_000,
+            "rph_limit": 120_000, "rpd_limit": 2_000_000,
+            "cost_input_per_1k": 0.00000, "cost_output_per_1k": 0.00000,
+            "context_window": 65_536,
+        },
+        "gemini-3.1-flash-lite-image": {
+            "tpm_limit": 1_000_000, "tph_limit": 60_000_000,
+            "tpd_limit": 1_000_000_000, "rpm_limit": 2_000,
+            "rph_limit": 120_000, "rpd_limit": 2_000_000,
+            "cost_input_per_1k": 0.00000, "cost_output_per_1k": 0.00000,
+            "context_window": 65_536,
+        },
+        "gemini-3.1-flash-tts-preview": {
+            "tpm_limit": 1_000_000, "tph_limit": 60_000_000,
+            "tpd_limit": 1_000_000_000, "rpm_limit": 2_000,
+            "rph_limit": 120_000, "rpd_limit": 2_000_000,
+            "cost_input_per_1k": 0.00000, "cost_output_per_1k": 0.00000,
+            "context_window": 8_192,
+        },
+        "gemini-3.5-flash": {
+            "tpm_limit": 1_000_000, "tph_limit": 60_000_000,
+            "tpd_limit": 1_000_000_000, "rpm_limit": 10_000,
+            "rph_limit": 600_000, "rpd_limit": 10_000_000,
+            "cost_input_per_1k": 0.00015, "cost_output_per_1k": 0.00060,
+            "context_window": 1_048_576,
+        },
+        "gemini-3.5-flash-lite": {
+            "tpm_limit": 1_000_000, "tph_limit": 60_000_000,
+            "tpd_limit": 1_000_000_000, "rpm_limit": 10_000,
+            "rph_limit": 600_000, "rpd_limit": 10_000_000,
+            "cost_input_per_1k": 0.00000, "cost_output_per_1k": 0.00000,
+            "context_window": 1_048_576,
+        },
+        "gemini-3.6-flash": {
+            "tpm_limit": 1_000_000, "tph_limit": 60_000_000,
+            "tpd_limit": 1_000_000_000, "rpm_limit": 10_000,
+            "rph_limit": 600_000, "rpd_limit": 10_000_000,
+            "cost_input_per_1k": 0.00015, "cost_output_per_1k": 0.00060,
+            "context_window": 1_048_576,
+        },
+        "gemini-omni-flash-preview": {
+            "tpm_limit": 1_000_000, "tph_limit": 60_000_000,
+            "tpd_limit": 1_000_000_000, "rpm_limit": 2_000,
+            "rph_limit": 120_000, "rpd_limit": 2_000_000,
+            "cost_input_per_1k": 0.00000, "cost_output_per_1k": 0.00000,
+            "context_window": 131_072,
+        },
+
+        # Latest Pointers
+        "gemini-flash-latest": {
+            "tpm_limit": 1_000_000, "tph_limit": 60_000_000,
+            "tpd_limit": 1_000_000_000, "rpm_limit": 10_000,
+            "rph_limit": 600_000, "rpd_limit": 10_000_000,
+            "cost_input_per_1k": 0.00015, "cost_output_per_1k": 0.00060,
+            "context_window": 1_048_576,
+        },
+        "gemini-flash-lite-latest": {
+            "tpm_limit": 1_000_000, "tph_limit": 60_000_000,
+            "tpd_limit": 1_000_000_000, "rpm_limit": 10_000,
+            "rph_limit": 600_000, "rpd_limit": 10_000_000,
+            "cost_input_per_1k": 0.00000, "cost_output_per_1k": 0.00000,
+            "context_window": 1_048_576,
+        },
+
+        # Gemma Open Models
+        "gemma-4-26b-a4b-it": {
+            "tpm_limit": 1_000_000, "tph_limit": 60_000_000,
+            "tpd_limit": 1_000_000_000, "rpm_limit": 2_000,
+            "rph_limit": 120_000, "rpd_limit": 2_000_000,
+            "cost_input_per_1k": 0.00000, "cost_output_per_1k": 0.00000,
+            "context_window": 262_144,
+        },
+        "gemma-4-31b-it": {
+            "tpm_limit": 1_000_000, "tph_limit": 60_000_000,
+            "tpd_limit": 1_000_000_000, "rpm_limit": 2_000,
+            "rph_limit": 120_000, "rpd_limit": 2_000_000,
+            "cost_input_per_1k": 0.00000, "cost_output_per_1k": 0.00000,
+            "context_window": 262_144,
+        },
+
+        # Embedding Models
+        "gemini-embedding-001": {
+            "tpm_limit": 1_000_000, "tph_limit": 60_000_000,
+            "tpd_limit": 1_000_000_000, "rpm_limit": 2_000,
+            "rph_limit": 120_000, "rpd_limit": 2_000_000,
+            "cost_input_per_1k": 0.000025, "cost_output_per_1k": 0.00000,
+            "context_window": 2_048,
+        },
+        "gemini-embedding-2-preview": {
+            "tpm_limit": 1_000_000, "tph_limit": 60_000_000,
+            "tpd_limit": 1_000_000_000, "rpm_limit": 2_000,
+            "rph_limit": 120_000, "rpd_limit": 2_000_000,
+            "cost_input_per_1k": 0.00000, "cost_output_per_1k": 0.00000,
+            "context_window": 8_192,
+        },
+        "gemini-embedding-2": {
+            "tpm_limit": 1_000_000, "tph_limit": 60_000_000,
+            "tpd_limit": 1_000_000_000, "rpm_limit": 2_000,
+            "rph_limit": 120_000, "rpd_limit": 2_000_000,
+            "cost_input_per_1k": 0.000025, "cost_output_per_1k": 0.00000,
+            "context_window": 8_192,
+        },
+    },
+
     },
     "openai": {
         "api_key":  OPENAI_API_KEY,

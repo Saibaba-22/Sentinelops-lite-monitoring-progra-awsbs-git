@@ -256,6 +256,7 @@ cat > /tmp/grafana-sitecontainer.json <<EOF
     "userName": "${DOCKERHUB_USERNAME}",
     "passwordSecret": "${DOCKERHUB_TOKEN}",
     "environmentVariables": [
+      {"name": "GF_PATHS_CONFIG",                  "value": "/etc/grafana/custom.ini"},
       {"name": "GF_SECURITY_ADMIN_USER",           "value": "admin"},
       {"name": "GF_SECURITY_ADMIN_PASSWORD",       "value": "${GRAFANA_ADMIN_PASSWORD}"},
       {"name": "GF_USERS_ALLOW_SIGN_UP",           "value": "false"},

@@ -143,12 +143,42 @@ jobs:
 
           cat > docker/grafana/Dockerfile <<'DEOF'
           FROM grafana/grafana:11.1.0
-          COPY --chown=472:0 docker/grafana/grafana.ini /etc/grafana/custom.ini
+          USER root
+          RUN cat > /etc/grafana/grafana.ini <<'INIEOF'
+          [server]
+          protocol = http
+          http_port = 3000
+          domain = saiwebapp2026-c4cke9chgwedhzch.southafricanorth-01.azurewebsites.net
+          root_url = https://saiwebapp2026-c4cke9chgwedhzch.southafricanorth-01.azurewebsites.net/grafana/
+          serve_from_sub_path = true
+          enable_gzip = true
+
+          [security]
+          admin_user = admin
+          allow_embedding = true
+          cookie_secure = false
+          cookie_samesite = disabled
+
+          [users]
+          allow_sign_up = false
+
+          [auth.anonymous]
+          enabled = false
+
+          [live]
+          allowed_origins = *
+
+          [log]
+          mode = console
+          level = info
+
+          [dataproxy]
+          timeout = 300
+          INIEOF
+          RUN chown 472:0 /etc/grafana/grafana.ini && chmod 644 /etc/grafana/grafana.ini
           COPY --chown=472:0 monitoring/grafana/provisioning/ /etc/grafana/provisioning/
           COPY --chown=472:0 monitoring/grafana/dashboards/ /var/lib/grafana/dashboards/
-
-          # Tell Grafana to load our custom.ini
-          ENV GF_PATHS_CONFIG=/etc/grafana/custom.ini
+          USER 472
           DEOF
           test -f docker/grafana/grafana.ini || { echo "Missing docker/grafana/grafana.ini"; exit 1; }
 
@@ -486,36 +516,46 @@ jobs:
   # ═══════════════════════════════════════════════════════════════
   # 5. GENERATE PROJECT DOCUMENTATION
   # ═══════════════════════════════════════════════════════════════
-  generate_docs:
-    name: Generate Project Documentation
-    if: ${{ always() && needs.verify_azure.result == 'success' }}
-    needs: verify_azure
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+generate_docs:
+  name: Generate Project Documentation
+  if: ${{ always() && needs.verify_azure.result == 'success' }}
+  needs: verify_azure
+  runs-on: ubuntu-latest
+  steps:
+    - name: Checkout
+      uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-          cache: pip
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+        cache: pip
 
-      - name: Install doc generation dependencies
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install requirement-doc.txt
+    - name: Debug - List files
+      run: ls -la  # Verify requirement-doc.txt exists
 
-      - name: Generate documentation
-        run: python generate_docx.py
+    - name: Debug - Show file contents
+      run: cat requirement-doc.txt  # Verify file contents
 
-      - name: Upload documentation artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: project-documentation-azure
-          path: "*Documentation*.docx"
-          retention-days: 90
-          if-no-files-found: error
+    - name: Install doc generation dependencies
+      run: |
+        python -m pip install --upgrade pip
+        python -m pip install -r requirement-doc.txt --verbose  # Add --verbose for debugging
+        python -m pip install python-docx pyyaml gitpython openai tiktoken colorama
+
+    - name: Debug - Show installed packages
+      run: pip list  # Verify packages were installed
+
+    - name: Generate documentation
+      run: python generate_docx.py
+
+    - name: Upload documentation artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: project-documentation-azure
+        path: "*Documentation*.docx"
+        retention-days: 90
+        if-no-files-found: error
 
   # ═══════════════════════════════════════════════════════════════
   # 6. PIPELINE SUMMARY
